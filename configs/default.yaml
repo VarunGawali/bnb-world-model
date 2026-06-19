@@ -4,17 +4,23 @@
 model:
   hidden_dim: 128
   n_gnn_layers: 3
+  n_gnn_heads: 4          # GATv2Conv attention heads (head_dim = hidden_dim // n_gnn_heads)
+  n_dyn_layers: 4         # Transformer dynamics depth
+  n_dyn_heads: 4          # Transformer attention heads
+  max_seq: 512            # maximum B&B trajectory length
 
 training:
   epochs_phase1: 8      # policy head
   epochs_phase2: 8      # value head
-  epochs_phase3: 8      # dynamics
+  epochs_phase3: 8      # dynamics Transformer
   epochs_phase4: 8      # joint fine-tuning
+  epochs_phase5: 8      # cut selection head
   batch_size: 64
   lr_phase1: 1.0e-3
   lr_phase2: 5.0e-4
   lr_phase3: 5.0e-4
   lr_phase4: 1.0e-4
+  lr_phase5: 5.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0
   amp: true             # automatic mixed precision (GPU only)
@@ -35,7 +41,16 @@ paths:
   checkpoint_dir: checkpoints/
   results_dir: results/
 
+solver:
+  time_limit: 300       # seconds per instance
+  node_limit: 100000
+  gap_tolerance: 1.0e-4
+  max_cuts_per_node: 10
+  cut_score_threshold: 0.3   # sigmoid threshold for cut acceptance
+  lookahead_k: 3             # candidates evaluated with dynamics lookahead
+
 benchmark:
   n_instances: 10
   time_limit: 60        # seconds per instance
   problem: set_cover
+  lookahead_k: 5             # candidates for dynamics lookahead in benchmark
