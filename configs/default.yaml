@@ -4,6 +4,10 @@
 model:
   hidden_dim: 128
   n_gnn_layers: 3
+  n_gnn_heads: 4          # GATv2Conv attention heads (head_dim = hidden_dim // n_gnn_heads)
+  n_dyn_layers: 4         # Transformer dynamics depth
+  n_dyn_heads: 4          # Transformer attention heads
+  max_seq: 512            # maximum B&B trajectory length
 
 training:
   epochs_phase1: 8      # policy head

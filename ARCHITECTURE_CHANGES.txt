@@ -1,0 +1,380 @@
+================================================================================
+BnB WORLD MODEL — ARCHITECTURE CHANGES
+================================================================================
+
+This document records every architectural change made to the model, explaining
+what was changed, why, and what the expected impact is. File locations are
+given relative to the repository root.
+
+--------------------------------------------------------------------------------
+CHANGE 1: SAGEConv → GATv2Conv  (bnb_wm/model/encoder.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    The two bipartite message-passing layers (constraints→variables and
+    variables→constraints) previously used SAGEConv (Hamilton et al., 2017).
+    They now use GATv2Conv (Brody et al., 2022) with n_heads=4 attention heads.
+
+WHY
+    SAGEConv aggregates neighbour embeddings by computing a simple mean (or
+    max, depending on the aggregator). Every neighbouring constraint contributes
+    equally to a variable's updated embedding, regardless of how much that
+    constraint actually constrains the variable.
+
+    In a MIP, constraints vary enormously in how "tight" they are at a given
+    B&B node. A constraint that is near its RHS (almost binding) has far more
+    branching relevance than one with large slack. Attention allows the GNN to
+    learn which constraints to focus on for each variable, rather than treating
+    them all equally.
+
+    GATv2 specifically fixes a representational limitation in the original GAT
+    (Veličković et al., 2018): GAT's attention scores can only express a
+    monotone (linear) relationship between query and key, while GATv2 uses a
+    joint transformation before the scoring linear layer, making it strictly
+    more expressive.
+
+TECHNICAL DETAILS
+    - n_heads = 4; each head operates on hidden_dim // n_heads = 32 dimensions
+    - concat=True so the output dim remains hidden_dim (same as before)
+    - add_self_loops=False (bipartite graph; self-loops don't make sense)
+    - edge_dim=3 passed so edge features are injected into the attention
+      computation (see Change 2 below)
+
+EXPECTED IMPACT
+    Medium–High. The encoder is the backbone of all downstream predictions;
+    attention-weighted aggregation should directly improve policy Top-1 accuracy
+    and value head Spearman ρ.
+
+--------------------------------------------------------------------------------
+CHANGE 2: Edge Features Added  (bnb_wm/model/encoder.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    The encoder now accepts an optional edge_attr tensor of shape [E, 3].
+    When provided, each edge feature is injected into the GATv2 attention
+    computation. The three edge features are:
+
+        dim 0 : constraint coefficient  A_{ij}
+        dim 1 : normalised coefficient  A_{ij} / (|RHS_i| + 1e-8)
+        dim 2 : sign of coefficient     sign(A_{ij}) ∈ {-1, 0, +1}
+
+    If edge_attr is not provided (e.g. during testing), it defaults to zeros
+    so the model remains backward-compatible.
+
+WHY
+    The constraint matrix A is the core structure of a MIP. Two constraints
+    with the same number of variables can have wildly different coefficients;
+    those coefficients directly determine the LP relaxation and thus the
+    branching importance of each variable. Without edge features, the GNN
+    treats all edges identically and has no way to distinguish A_{ij} = 0.001
+    from A_{ij} = 1000. Adding A_{ij} as an edge feature gives the GNN the raw
+    information it needs to reason about constraint tightness.
+
+    The normalised version A_{ij} / RHS_i measures the variable's relative
+    contribution to the constraint's capacity, which is scale-invariant.
+    The sign feature helps distinguish covering constraints (≥, positive
+    coefficients) from other constraint types.
+
+TECHNICAL DETAILS
+    - Edge features are split by direction (c2v / v2c) alongside edge indices
+    - GATv2Conv uses edge features in the attention score: the edge embedding
+      is added to the key before the tanh + linear scoring step
+    - The data generation pipeline (bnb_wm/data/generate.py) should populate
+      edge_attr when constructing PyG Data objects
+
+EXPECTED IMPACT
+    High. Constraint coefficients are the most information-dense signal in a
+    MIP; making them available to the GNN substantially increases the model's
+    theoretical expressivity.
+
+--------------------------------------------------------------------------------
+CHANGE 3: global_mean_pool → CrossAttentionPool  (bnb_wm/model/encoder.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    The graph-level embedding z was previously computed by
+    global_mean_pool(h_vars, batch), which takes the unweighted average of
+    all variable embeddings. It is now computed by CrossAttentionPool, a
+    learned readout that uses a single trainable query vector to attend over
+    all variable embeddings in a graph.
+
+    The mechanism is identical to the [CLS] token in BERT:
+        keys   = W_k(h_vars)          # [n_vars, H]
+        values = W_v(h_vars)          # [n_vars, H]
+        attn   = softmax(q · keys^T / sqrt(H))
+        z      = attn · values         # [H]
+
+    where q is the single learnable query vector.
+
+WHY
+    Mean pooling treats all variable nodes as equally important for the
+    graph-level summary. In practice, the dual bound and leaf probability
+    are dominated by a small subset of structurally critical variables
+    (highly fractional, high objective coefficient, tightly constrained).
+
+    CrossAttentionPool can learn to focus its query on those variables,
+    producing a graph embedding that better summarises the "difficulty" of the
+    current B&B node. This directly benefits the value head and integrality
+    head, both of which consume z.
+
+TECHNICAL DETAILS
+    - query : nn.Parameter of shape [1, H] (one learnable token)
+    - W_k, W_v : Linear(H, H, bias=False)
+    - Softmax over the variable dimension (not batch dimension)
+    - Loops over batch indices; can be replaced with scatter_softmax for
+      GPU efficiency if batch sizes are large
+
+EXPECTED IMPACT
+    Medium. The value head Spearman ρ and integrality head accuracy are most
+    likely to benefit. The policy head benefits indirectly via the Pointer
+    Network (Change 4) which also uses z.
+
+--------------------------------------------------------------------------------
+CHANGE 4: MLP PolicyHead → Pointer Network  (bnb_wm/model/heads.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    The policy head previously scored each variable independently:
+        score_i = MLP(h_var_i)
+
+    It now uses a Pointer Network (Vinyals et al., 2015) that scores each
+    variable in the context of the global graph embedding z:
+
+        query  = W_q(z_per_var)                       # global context
+        key_i  = tanh(W_k(h_var_i) + W_z(z_per_var)) # local + global mix
+        score_i = v^T (query_i ⊙ key_i) / sqrt(H)
+
+    where z_per_var is z broadcast to each variable node in the same graph.
+
+    The forward signature changed:
+        old: forward(h_vars)
+        new: forward(h_vars, z_per_var)
+
+WHY
+    Strong branching evaluates all candidate variables jointly by solving
+    an LP for each and comparing the resulting bound improvements. The
+    original independent MLP has no way to compare candidates to each other —
+    it assigns an absolute score to each variable in isolation.
+
+    The Pointer Network introduces a coupling: the global embedding z
+    summarises the full B&B state, and each variable is scored relative to
+    that global context. This is a soft form of "all candidates are considered
+    simultaneously," which is much closer to how the expert (strong branching)
+    actually works.
+
+    The attention-weighted scoring also naturally handles variable-length
+    candidate sets and is permutation-equivariant (same as the MLP version).
+
+TECHNICAL DETAILS
+    - W_q, W_k, W_z : Linear(H, H, bias=False)
+    - v              : Linear(H, 1, bias=False)
+    - z_per_var is computed in BnBWorldModel.forward() as z[batch.batch[var_mask]]
+    - During Phase 1 training, the loss masking over the candidate action set
+      is applied after this forward pass, same as before
+
+EXPECTED IMPACT
+    Medium. Policy Top-1 accuracy should improve because the head can express
+    relative importance. The effect may be subtle on Set Cover (a structured
+    problem) but should be more pronounced on harder, heterogeneous instances.
+
+--------------------------------------------------------------------------------
+CHANGE 5: ValueHead with Fractional Variable Mean  (bnb_wm/model/heads.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    The value head previously computed:
+        v = MLP(z)    [z is graph-level embedding, H-dim]
+
+    It now computes:
+        frac_mean = mean(h_vars[fractional_variables])   # [H]
+        v = MLP(concat(z, frac_mean))                    # input is 2H
+
+    If no fractional mask is available, frac_mean falls back to z (safe).
+
+    The forward signature changed:
+        old: forward(z)
+        new: forward(z, h_vars, batch_vec, frac_mask=None)
+
+WHY
+    The LP dual bound at a B&B node is determined by the fractional variables —
+    which variables are not yet fixed to integer values and by how much they
+    deviate from integrality. The global mean pool z captures the overall
+    graph structure but may average away the fractional structure if most
+    variables are already integer.
+
+    Explicitly computing the mean embedding of fractional variables gives the
+    value head a direct signal about the current fractional state, which is the
+    most predictive feature for the dual bound. This is a cheap, targeted
+    enrichment that adds no extra GNN computation.
+
+TECHNICAL DETAILS
+    - frac_mask : boolean tensor [total_vars], True = variable is fractional
+    - The fractional mean is computed per graph using batch_vec
+    - MLP depth increased slightly: Linear(2H, H) → ReLU → Linear(H, H//2)
+      → ReLU → Linear(H//2, 1) to handle the richer 2H input
+
+EXPECTED IMPACT
+    Medium. Target: lift Spearman ρ from 0.682 toward 0.80+.
+
+--------------------------------------------------------------------------------
+CHANGE 6: IntegralityHead with Auxiliary Scalars  (bnb_wm/model/heads.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    The integrality head previously computed:
+        logit = MLP(z)   [bottleneck: H → H//2 → 1]
+
+    It now computes:
+        logit = MLP(concat(z, depth, n_frac))   [input: H + 2]
+
+    where:
+        depth  : integer depth of the current node in the B&B tree
+        n_frac : number of fractional variables at this node
+
+    Both scalars are normalised to float and concatenated as [batch, 1] each.
+    If not provided, they default to zeros (backward-compatible).
+
+    The forward signature changed:
+        old: forward(z)
+        new: forward(z, depth=None, n_frac=None)
+
+WHY
+    A leaf node is one where all variables are integer (n_frac == 0) or the
+    node is pruned. Both depth and n_frac are among the strongest predictors
+    of whether a node is a leaf:
+        - n_frac: if n_frac == 0, the node IS a leaf by definition
+        - depth:  leaf nodes cluster at large depths; shallow nodes almost
+                  never are leaves
+
+    The GNN embedding z cannot reliably infer these quantities. Depth is not
+    encoded in any node feature and would require special positional encoding.
+    n_frac requires counting across all variable nodes, which mean pooling
+    destroys (it averages fractional values, losing the count). Adding them
+    as explicit scalars is a principled and cheap fix.
+
+TECHNICAL DETAILS
+    - Scalars are float-cast and unsqueezed to [batch, 1] before concat
+    - MLP input is H + 2 instead of H; all other dimensions unchanged
+    - Training pipeline should provide these from the B&B node metadata
+      stored in each .npz trajectory file
+
+EXPECTED IMPACT
+    Low–Medium. Integrality head accuracy should improve substantially for
+    near-leaf nodes (high depth, low n_frac), which is exactly where correct
+    prediction matters most for pruning decisions.
+
+--------------------------------------------------------------------------------
+CHANGE 7: DynamicsGRU → DynamicsTransformer  (bnb_wm/model/dynamics.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    The dynamics model previously used a single GRUCell:
+        z_{t+1}, h_{t+1} = GRU([z_t || a_t], h_t)
+
+    It is now a causal Transformer decoder with n_layers=4 and n_heads=4:
+        token_t = Linear([z_t || a_t])         # project to d_model
+        x       = [token_0, ..., token_t]      # causal sequence
+        z_{t+1} = Transformer(x)[-1]           # read last position
+
+    The Transformer uses:
+        - Causal (upper-triangular masked) multi-head self-attention
+        - Pre-norm (LayerNorm before each sub-layer)
+        - GELU activation in the FFN (4× expansion)
+        - Learned positional embeddings (not sinusoidal)
+
+    Two interfaces are provided:
+        forward(z_seq, a_seq)  : parallel training over full trajectories
+        step(z_t, a_t, past)   : single-step inference with explicit KV cache
+
+WHY
+    The GRU compresses the entire trajectory history into a fixed-size hidden
+    vector h_t. By design, the GRU forgets information exponentially as the
+    sequence grows: a branching decision made 20 nodes ago has very small
+    influence on h_t. But in Branch-and-Bound, early decisions constrain the
+    entire subtree — the variable fixed at depth 2 is active at every node
+    below it, making long-range dependencies essential.
+
+    The Transformer has full receptive field: every token can attend to every
+    past token with equal weight if the attention scores warrant it. This allows
+    the dynamics model to reason about the accumulated effect of the entire
+    branching history, not just the last step.
+
+    Additional advantages:
+        (a) Multi-step lookahead: the same Transformer can predict z_{t+k} by
+            unrolling forward k times, enabling planning without LP calls.
+        (b) Parallel training: the full trajectory is processed in one forward
+            pass with teacher forcing, which is much faster than GRU's
+            sequential teacher-forcing (all T steps in O(1) Transformer call
+            vs. T sequential GRU steps).
+        (c) Scaling: Transformers scale predictably with depth and width;
+            GRUs don't benefit from additional layers in the same way.
+
+TECHNICAL DETAILS
+    - d_model = hidden_dim (same as encoder, no bottleneck)
+    - n_layers = 4, n_heads = 4, head_dim = 32
+    - FFN expansion = 4× with GELU + dropout(0.1)
+    - max_seq = 512 (causal mask is pre-allocated; trajectories are typically
+      much shorter than 512 nodes)
+    - Causal mask is registered as a buffer (not a parameter; moves with .to())
+    - step() maintains a token buffer [B, t, H] passed in and returned each
+      call; this avoids re-computing KV pairs from scratch at each step
+
+EXPECTED IMPACT
+    High. This is the largest single architectural improvement. The original
+    GRU was trained in Phase 3 but never used at inference because it couldn't
+    meaningfully capture trajectory context. The Transformer's richer context
+    encoding makes it practical to use dynamics_step() during branching
+    (1-step lookahead) or during tree search (multi-step latent planning).
+
+--------------------------------------------------------------------------------
+CHANGE 8: BnBWorldModel updated interfaces  (bnb_wm/model/world_model.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    world_model.py was updated to:
+        (a) Pass edge_attr from batch to the encoder when available
+        (b) Compute z_per_var (z broadcast to each variable node) and pass
+            it to policy_scores() for the Pointer Network
+        (c) Update value_pred() to pass h_vars, batch_vec, frac_mask
+        (d) Update integrality_logit() to pass depth, n_frac
+        (e) Replace dynamics_step() (GRU interface) with:
+              dynamics_forward() : parallel training forward
+              dynamics_step()    : single-step inference (new signature)
+
+    New constructor arguments:
+        n_gnn_heads  : GATv2 heads in encoder  (default 4)
+        n_dyn_layers : Transformer depth        (default 4)
+        n_dyn_heads  : Transformer heads        (default 4)
+        max_seq      : max trajectory length    (default 512)
+
+EXPECTED IMPACT
+    No direct model capacity change; this change propagates the interface
+    updates cleanly so training, evaluation, and solver code can use the
+    new heads correctly.
+
+--------------------------------------------------------------------------------
+CHANGE 9: configs/default.yaml updated
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    Added new model hyperparameters to configs/default.yaml:
+        model.n_gnn_heads  : 4  (GATv2 attention heads)
+        model.n_dyn_layers : 4  (Transformer depth)
+        model.n_dyn_heads  : 4  (Transformer attention heads)
+        model.max_seq      : 512 (maximum trajectory length)
+
+--------------------------------------------------------------------------------
+SUMMARY TABLE
+--------------------------------------------------------------------------------
+
+Component           Old                    New                        Impact
+-------------------+----------------------+---------------------------+--------
+GNN convolution     SAGEConv (mean agg.)   GATv2Conv (4-head attn.)   High
+Edge information    none                   3-dim edge features         High
+Graph pooling       global_mean_pool       CrossAttentionPool          Medium
+Policy head         Independent MLP        Pointer Network             Medium
+Value head          MLP(z)                 MLP(z || frac_mean)         Medium
+Integrality head    MLP(z)                 MLP(z || depth || n_frac)   Low-Med
+Dynamics model      GRUCell                Causal Transformer (4L/4H)  High
+
+================================================================================
