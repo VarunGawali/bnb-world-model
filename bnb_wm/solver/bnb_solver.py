@@ -380,31 +380,37 @@ class BnBSolver:
         """
         Build a PyG graph from the LP solution and encode with the GNN.
 
-        Variable features (19-dim, matches Ecole NodeBipartite spirit):
-            0  : normalised objective coefficient
-            1  : is_binary (always 1 for Set Cover)
-            2-4: type flags (zero for continuous relaxation)
+        Variable features (19-dim) — exact Ecole NodeBipartite column layout
+        so inference features match the training distribution:
+            see inline comments in the implementation block below
+
+        Constraint features (5-dim) — matches Ecole NodeBipartite row layout:
+            0  : obj_cosine_similarity (zero; not computable without SCIP context)
+            1  : bias / normalised RHS
+            2  : is_tight (|activity - RHS| < 1e-6)
+            3  : dual_solution_value (normalised)
+            4  : age (zero placeholder)
+
+        Variable features (19-dim) — exact Ecole NodeBipartite column layout:
+            0  : obj_coef (normalised)
+            1  : is_type_binary  (always 1 for Set Cover)
+            2  : is_type_integer (0)
+            3  : is_type_implicit_integer (0)
+            4  : is_type_continuous (0)
             5  : has_lower_bound
             6  : has_upper_bound
-            7  : normalised lower bound
-            8  : normalised upper bound
-            9  : LP solution value
-            10 : fractional part |x - round(x)|
-            11 : is_at_lower (x ≈ lb)
-            12 : is_basic (lb < x < ub)
-            13 : is_at_upper (x ≈ ub)
-            14 : normalised reduced cost
-            15 : number of cuts containing this variable (normalised)
-            16 : raw objective coefficient (un-normalised)
-            17 : 0 (reserved)
-            18 : 0 (reserved)
-
-        Constraint features (5-dim):
-            0  : normalised constraint activity
-            1  : activity / RHS  (relative saturation)
-            2  : normalised dual value
-            3  : normalised RHS
-            4  : is_tight (|activity - RHS| < 1e-6)
+            7  : lower_bound (normalised)
+            8  : upper_bound (normalised)
+            9  : basis_lower  (x ≈ lb)
+            10 : basis_basic  (lb < x < ub)
+            11 : basis_upper  (x ≈ ub)
+            12 : basis_zero_free (0)
+            13 : sol_val   — LP solution value  ← key: same index as Ecole
+            14 : sol_frac  — |x - round(x)|    ← key: same index as Ecole
+            15 : sol_at_lb
+            16 : sol_at_ub
+            17 : reduced_cost (normalised)
+            18 : age proxy (log1p of number of cuts containing this variable)
 
         Edge features (3-dim):
             0  : A_{ij}
@@ -415,40 +421,47 @@ class BnBSolver:
         c_max = float(np.abs(c).max()) + 1e-8
         b_max = float(np.abs(b).max()) + 1e-8
 
-        # --- Variable features ---
-        vf = np.zeros((n, 19), dtype=np.float32)
-        vf[:, 0]  = c / c_max
-        vf[:, 1]  = 1.0                                      # is_binary
-        vf[:, 5]  = (var_lb > -1e9).astype(np.float32)
-        vf[:, 6]  = (var_ub <  1e9).astype(np.float32)
-        vf[:, 7]  = np.clip(var_lb, 0, 1)
-        vf[:, 8]  = np.clip(var_ub, 0, 1)
-        vf[:, 9]  = np.clip(x_lp, 0, 1)
-        vf[:, 10] = np.abs(x_lp - np.round(np.clip(x_lp, 0, 1)))
-        vf[:, 11] = (np.abs(x_lp - var_lb) < 1e-6).astype(np.float32)
-        vf[:, 12] = ((x_lp > var_lb + 1e-6) & (x_lp < var_ub - 1e-6)).astype(np.float32)
-        vf[:, 13] = (np.abs(x_lp - var_ub) < 1e-6).astype(np.float32)
-        # Reduced cost approximation: c_j - dual^T A_{:,j}
-        rc = c - A.T @ dual if dual is not None else np.zeros(n)
-        rc_max = float(np.abs(rc).max()) + 1e-8
-        vf[:, 14] = rc / rc_max
-        # Count cuts containing each variable
-        cut_counts = np.zeros(n)
-        for cut in cuts:
-            cut_counts += (cut.lhs > 0.5).astype(float)
-        vf[:, 15] = cut_counts / max(len(cuts), 1)
-        vf[:, 16] = c / c_max
+        # --- Variable features (Ecole-aligned) ---
+        at_lb = np.abs(x_lp - var_lb) < 1e-6
+        at_ub = np.abs(x_lp - var_ub) < 1e-6
+        is_basic = (~at_lb) & (~at_ub)
 
-        # --- Constraint features ---
+        rc = (c - A.T @ dual) if dual is not None else np.zeros(n)
+        rc_max = float(np.abs(rc).max()) + 1e-8
+
+        cut_counts = np.zeros(n, dtype=np.float32)
+        for cut in cuts:
+            cut_counts += (cut.lhs > 0.5).astype(np.float32)
+
+        vf = np.zeros((n, 19), dtype=np.float32)
+        vf[:, 0]  = c / c_max                                        # obj_coef
+        vf[:, 1]  = 1.0                                               # is_type_binary
+        # 2,3,4: integer type flags — 0 (binary is handled via bounds)
+        vf[:, 5]  = (var_lb > -1e9).astype(np.float32)               # has_lower_bound
+        vf[:, 6]  = (var_ub <  1e9).astype(np.float32)               # has_upper_bound
+        vf[:, 7]  = np.clip(var_lb, 0, 1)                            # lower_bound
+        vf[:, 8]  = np.clip(var_ub, 0, 1)                            # upper_bound
+        vf[:, 9]  = at_lb.astype(np.float32)                          # basis_lower
+        vf[:, 10] = is_basic.astype(np.float32)                       # basis_basic
+        vf[:, 11] = at_ub.astype(np.float32)                          # basis_upper
+        # 12: basis_zero_free — 0
+        vf[:, 13] = np.clip(x_lp, 0.0, 1.0)                          # sol_val
+        vf[:, 14] = np.abs(x_lp - np.round(np.clip(x_lp, 0.0, 1.0))) # sol_frac
+        vf[:, 15] = at_lb.astype(np.float32)                          # sol_at_lb
+        vf[:, 16] = at_ub.astype(np.float32)                          # sol_at_ub
+        vf[:, 17] = rc / rc_max                                        # reduced_cost
+        vf[:, 18] = np.log1p(cut_counts)                              # age proxy
+
+        # --- Constraint features (Ecole-aligned, 5-dim) ---
         activity = A @ x_lp
         cf = np.zeros((m, 5), dtype=np.float32)
-        cf[:, 0] = activity / b_max
-        cf[:, 1] = activity / (b + 1e-8)
+        # cf[:, 0] = obj_cosine_similarity — skip (0)
+        cf[:, 1] = b / b_max                                          # bias / normalised RHS
+        cf[:, 2] = (np.abs(activity - b) < 1e-6).astype(np.float32)  # is_tight
         if dual is not None:
             dual_max = float(np.abs(dual).max()) + 1e-8
-            cf[:, 2] = dual / dual_max
-        cf[:, 3] = b / b_max
-        cf[:, 4] = (np.abs(activity - b) < 1e-6).astype(np.float32)
+            cf[:, 3] = dual / dual_max                                 # dual_solution_value
+        # cf[:, 4] = age — 0
 
         # --- Edges: all non-zero entries of A ---
         con_idx, var_idx = np.where(A > 1e-9)    # [E], [E]

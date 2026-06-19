@@ -59,9 +59,12 @@ def _format_obs(obs, device):
     ev_raw = np.nan_to_num(ev_raw.flatten(), nan=0.0, posinf=1e6, neginf=-1e6)
 
     # 3-dim edge features: [coeff, norm_coeff, sign]
-    # Constraint source RHS is cf[ei[0], 3] (index 3 = rhs in Ecole constraint feats)
-    con_src = ei[0]  # constraint indices (before offset)
-    rhs_src = cf[con_src, 3] if cf.shape[1] > 3 else np.ones(len(con_src))
+    # Ecole constraint feature layout (5-dim):
+    #   [0] obj_cosine_similarity  [1] bias/RHS  [2] is_tight
+    #   [3] dual_value             [4] age
+    # Normalise coefficient by constraint RHS (index 1 = bias).
+    con_src = ei[0]  # constraint indices (before node offset)
+    rhs_src = cf[con_src, 1] if cf.shape[1] > 1 else np.ones(len(con_src))
     norm_ev  = ev_raw / (np.abs(rhs_src) + 1e-8)
     sign_ev  = np.sign(ev_raw)
     edge_attr_np = np.stack([ev_raw, norm_ev, sign_ev], axis=1).astype(np.float32)

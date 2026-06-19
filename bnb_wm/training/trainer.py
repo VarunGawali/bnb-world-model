@@ -38,9 +38,20 @@ def _var_mask_and_batch(pyg_batch):
 
 
 def _frac_mask_from_features(x_var: torch.Tensor) -> torch.Tensor | None:
-    """Approximate fractional variable mask from LP value feature (index 9)."""
-    if x_var.size(1) > 9:
-        lp_vals = x_var[:, 9]
+    """
+    Fractional variable mask from Ecole NodeBipartite variable features.
+
+    Ecole feature layout (19-dim):
+        index 13 = sol_val   (LP solution value)
+        index 14 = sol_frac  (|sol_val - round(sol_val)|, pre-computed by Ecole)
+
+    Using sol_frac directly (index 14) is preferred; fall back to computing
+    from sol_val (index 13) if the tensor is narrower than 15 columns.
+    """
+    if x_var.size(1) > 14:
+        return x_var[:, 14] > 0.05          # sol_frac pre-computed by Ecole
+    if x_var.size(1) > 13:
+        lp_vals = x_var[:, 13]              # sol_val
         return (lp_vals - lp_vals.round()).abs() > 0.05
     return None
 
