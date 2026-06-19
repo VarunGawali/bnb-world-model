@@ -1,0 +1,37 @@
+# Data — never commit raw trajectories (too large)
+data/
+*.npz
+
+# Model checkpoints — store on Google Drive / cloud, not git
+checkpoints/
+*.pt
+*.pth
+
+# Results — figures and logs (optional: commit select figures)
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "bnb-world-model"
+version = "0.1.0"
+description = "GNN-based world model for learned branching in Mixed Integer Programs"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "torch-geometric>=2.3",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "tqdm",
+    "pyyaml",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+ecole = ["ecole"]          # required for dataset generation & benchmarking
+highs = ["highspy"]        # required for standalone BnB solver (future)
+dev   = ["pytest", "black", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bnb_wm*"]

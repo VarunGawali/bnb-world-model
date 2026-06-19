@@ -1,0 +1,41 @@
+# default.yaml — BnB World Model default hyperparameters
+# Override any field via CLI: --model.hidden_dim 64
+
+model:
+  hidden_dim: 128
+  n_gnn_layers: 3
+
+training:
+  epochs_phase1: 8      # policy head
+  epochs_phase2: 8      # value head
+  epochs_phase3: 8      # dynamics
+  epochs_phase4: 8      # joint fine-tuning
+  batch_size: 64
+  lr_phase1: 1.0e-3
+  lr_phase2: 5.0e-4
+  lr_phase3: 5.0e-4
+  lr_phase4: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  amp: true             # automatic mixed precision (GPU only)
+
+data:
+  problem: set_cover
+  n_rows: 500
+  n_cols: 1000
+  density: 0.05
+  n_instances: 1000
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  max_train_files: null   # set to integer to cap (e.g. 300 for fast experiments)
+
+paths:
+  data_root: data/
+  checkpoint_dir: checkpoints/
+  results_dir: results/
+
+benchmark:
+  n_instances: 10
+  time_limit: 60        # seconds per instance
+  problem: set_cover

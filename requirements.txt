@@ -1,0 +1,18 @@
+# Core
+torch>=2.0
+torch-geometric>=2.3
+numpy>=1.24
+scipy>=1.10
+tqdm
+pyyaml
+matplotlib
+
+# Dataset generation & benchmarking (requires conda: conda install -c conda-forge ecole)
+# ecole
+# pyscipopt
+
+# Standalone solver (future)
+# highspy
+
+# Development
+pytest
