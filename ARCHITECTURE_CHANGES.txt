@@ -363,18 +363,369 @@ WHAT CHANGED
         model.n_dyn_heads  : 4  (Transformer attention heads)
         model.max_seq      : 512 (maximum trajectory length)
 
+================================================================================
+SECTION 2: BRANCH-AND-CUT PIPELINE
+================================================================================
+
+The changes in this section complete the full pipeline: every model component
+is now wired into training and inference, and a Python-owned Branch-and-Cut
+solver is implemented from scratch.
+
 --------------------------------------------------------------------------------
-SUMMARY TABLE
+CHANGE 10: CuttingPlaneHead  (bnb_wm/model/heads.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    A new prediction head was added: CuttingPlaneHead.
+
+    Architecture: identical to PolicyHead (Pointer Network) but operating on
+    cuts instead of variables.
+
+        cut_emb_k = ReLU(W_in · cut_feat_k)         # project 6-dim → H
+        key_k     = tanh(W_k · cut_emb_k + W_z · z) # local + global mix
+        score_k   = v^T (key_k) / sqrt(H)            # scalar score per cut
+
+    Input  : cut_feats [n_cuts, 6], z [H]  (single node embedding)
+    Output : scores    [n_cuts]
+
+    Cut features (6-dim per candidate cut):
+        0  violation     : rhs - lhs@x*         (how much LP solution violates)
+        1  efficacy      : violation / ||lhs||   (normalised bite)
+        2  density       : nnz(lhs) / n_vars     (sparsity)
+        3  parallelism   : cos(lhs, c)           (alignment with objective)
+        4  obj_cutoff    : estimated bound improvement
+        5  support_frac  : fraction of cut support that is fractional
+
+WHY
+    The choice of which cuts to add in branch-and-cut critically affects
+    solver performance. Adding too many cuts slows LP solving; adding weak
+    cuts wastes time without tightening the bound. Classical heuristics
+    (maximum violation, minimum density) treat each cut independently.
+
+    The Pointer Network allows the head to score all candidate cuts jointly
+    given the current B&B node state z. This means the model can learn
+    context-dependent preferences: preferring dense cuts at the root (where
+    they propagate to many nodes) and sparse cuts at deep nodes (where LP
+    resolve cost matters more).
+
+    The head is trained to imitate SCIP's cut selection decisions (Phase 5):
+    given the same candidate pool, predict which cuts SCIP would choose and
+    which of those actually improved the LP bound. This is a supervised
+    imitation signal that is cheap to generate alongside trajectory data.
+
+TECHNICAL DETAILS
+    - cut_feat_dim = 6 (configurable via BnBWorldModel constructor)
+    - W_in : Linear(6, H)
+    - W_k, W_z : Linear(H, H, bias=False)
+    - v : Linear(H, 1, bias=False)
+    - At inference: sigmoid(score) >= threshold (default 0.3) selects cuts
+    - The head processes one node at a time (z is a single [H] vector, not
+      batched) because the number of candidate cuts varies per node
+
+EXPECTED IMPACT
+    High (at solver level). The CuttingPlaneHead is the key component that
+    makes the system a genuine branch-and-cut solver rather than just a
+    branching policy. It controls the tradeoff between cut tightness and LP
+    solve overhead at every node.
+
+--------------------------------------------------------------------------------
+CHANGE 11: cutting_plane_loss  (bnb_wm/training/losses.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    A new loss function was added: cutting_plane_loss().
+
+    Weighted binary cross-entropy:
+        loss = BCE_with_logits(scores, labels, pos_weight)
+
+    where labels[k] = 1 if cut k was selected by SCIP and improved the LP
+    bound by > threshold, 0 otherwise.
+
+WHY
+    Most candidate cuts are not useful (high class imbalance). pos_weight
+    corrects for this by upweighting positive examples (good cuts) in the
+    loss. This is the same technique used for the integrality head (leaf
+    nodes are also rare).
+
+    The label definition — "selected by SCIP AND improved the bound" — is
+    important. Cuts that SCIP selected but didn't tighten the bound are not
+    labeled positive; this teaches the model to prefer cuts with actual
+    impact rather than mimicking SCIP's selection heuristic blindly.
+
+TECHNICAL DETAILS
+    - pos_weight = n_negative_cuts / n_positive_cuts per batch
+    - Computed from the training data's cut_labels distribution
+    - Identical interface to integrality_loss for consistency
+
+--------------------------------------------------------------------------------
+CHANGE 12: Phase 5 training — train_cuts()  (bnb_wm/training/trainer.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    A new training method train_cuts() was added to the Trainer class.
+
+    Phase 5 freezes the encoder and trains only the CuttingPlaneHead:
+        1. Encode node → z  (encoder frozen, no gradient)
+        2. model.cut_scores(cut_feats, z[b]) → scores per cut
+        3. cutting_plane_loss(scores, cut_labels, pos_weight)
+        4. Backprop through CuttingPlaneHead only
+
+    Loader format: same (pyg_batch, metas) as other phases, with each
+    meta containing:
+        cut_features : Tensor [n_cuts, 6]
+        cut_labels   : Tensor [n_cuts]  binary
+
+    After Phase 5 completes, all parameters are unfrozen so Phase 4
+    joint fine-tuning can include the cut head.
+
+WHY
+    Training the cut head separately (before joint fine-tuning) follows
+    the same staged curriculum as the other heads: learn one prediction
+    target well before coupling all losses together. Joint training from
+    scratch with 4 different loss terms (policy + value + integrality +
+    cut) would require careful hyperparameter tuning of 4 loss weights;
+    staged training avoids this.
+
+TECHNICAL DETAILS
+    - Graphs without any candidate cuts are skipped silently
+    - Validation: per-cut BCE loss (not accuracy, since imbalance is high)
+    - Best checkpoint saved when val_loss improves
+    - All parameters unfrozen at end of phase for subsequent joint training
+    - Training phase ordering: 1 → 2 → 3 → 5 → 4 (cuts before joint)
+
+--------------------------------------------------------------------------------
+CHANGE 13: Trainer call-site fixes  (bnb_wm/training/trainer.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    Three call sites in the existing trainer were broken by the architecture
+    changes (new head signatures). They were fixed:
+
+    (a) _run_value_batch:
+        Old: model.value_pred(z)
+        New: model.encode(pyg_batch) → h_vars, z
+             var_mask, batch_vec computed from pyg_batch.node_type
+             frac_mask derived from LP value feature (index 9 of x[var_mask])
+             model.value_pred(z, h_vars, batch_vec, frac_mask)
+
+    (b) train_joint — value_pred:
+        Same fix as above (h_vars + batch_vec + frac_mask required)
+
+    (c) train_joint — integrality_logit:
+        Old: model.integrality_logit(z)
+        New: depth extracted from meta["depth"] (default 0)
+             n_frac extracted from meta["n_frac"] (default 0)
+             model.integrality_logit(z, depth, n_frac)
+
+    (d) train_joint — policy scores:
+        Old: scores, z = model(pyg_batch) — then scores used directly
+        New: h_vars, z = model.encode(pyg_batch)
+             z_per_var = z[pyg_batch.batch[var_mask]]
+             scores = model.policy(h_vars, z_per_var)
+             (This matches the Pointer Network's actual forward signature)
+
+EXPECTED IMPACT
+    These are correctness fixes. Without them, training phases 2 and 4
+    would raise TypeError at runtime. No model capacity change.
+
+--------------------------------------------------------------------------------
+CHANGE 14: Phase 3 training — train_dynamics()  (bnb_wm/training/trainer.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    The previously missing train_dynamics() method was implemented.
+
+    Phase 3 freezes the encoder and trains the DynamicsTransformer:
+        1. Loader yields (z_seq, a_seq, z_next_seq) pre-computed tensors
+        2. model.dynamics_forward(z_seq, a_seq) → z_pred [B, T, H]
+        3. dynamics_loss(z_pred, z_next_seq) = MSE + 0.1 * cosine
+        4. Backprop through DynamicsTransformer only
+
+    The SequenceDataset (to be implemented in bnb_wm/data/) is responsible
+    for pre-computing z and action embeddings by running the frozen encoder
+    on all graphs in each trajectory.
+
+    The parallel forward pass (full sequence in one call) replaces the
+    sequential GRU teacher-forcing that was implicit in the original design.
+    Training a T-step trajectory now costs 1 Transformer forward pass
+    instead of T sequential GRU steps.
+
+--------------------------------------------------------------------------------
+CHANGE 15: BnBSolver — full branch-and-cut implementation
+           (bnb_wm/solver/bnb_solver.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    All NotImplementedError methods were implemented. New dataclass CutData
+    was added. The solver now runs a complete branch-and-cut loop.
+
+    NODE REPRESENTATION
+        Node.inherited_cuts : list[CutData]
+            Globally-valid cuts propagated from ancestors. This list grows
+            monotonically as we descend the tree (child = parent_cuts + new_cuts).
+            Children of the same parent share the same cut list.
+
+    LP SOLVING: _solve_lp()
+        Uses scipy.optimize.linprog with method='highs' (HiGHS backend, same
+        solver that SCIP/Gurobi use internally). Constraints are converted
+        from Ax >= b to -Ax <= -b for scipy's A_ub convention. Inherited cuts
+        are stacked as additional rows.
+
+        Dual variables are extracted from result.ineqlin.marginals and used
+        for node encoding (reduced costs, constraint activity).
+
+    NODE ENCODING: _encode_node()
+        Builds a 19-dim variable feature matrix and 5-dim constraint feature
+        matrix matching the Ecole NodeBipartite observation format that the
+        model was trained on, then encodes with the GNN.
+
+        Variable features computed from LP solution:
+            LP value, fractional part, basis status (at-lb/basic/at-ub),
+            normalised objective, normalised reduced cost, cut count.
+
+        Constraint features:
+            Activity, relative saturation, dual value, normalised RHS,
+            is-tight indicator.
+
+        Edge features: A_{ij}, A_{ij}/b_i, sign(A_{ij}).
+
+    CUT GENERATION: _generate_cg_cuts()
+        Generates pairwise Chvátal-Gomory intersection cuts:
+            For each pair (i1, i2) of tight constraints:
+                inter = {j : A_{i1,j}=1 AND A_{i2,j}=1}
+                cut  :  ∑_{j ∈ inter} x_j  >=  1
+
+        These cuts are GLOBALLY VALID because they represent a CG round
+        of (row_i1 + row_i2) / 2 with integer coefficients on the
+        intersection support. They remain valid when variable bounds are
+        tightened by branching.
+
+        Enumeration is bounded:
+            - Only tight constraints (activity ∈ [1.0, 1.4]) are paired
+            - At most 30 tight constraints → C(30,2)=435 pairs maximum
+            - Only violated cuts (intersection LP sum < 1 - eps) are kept
+            - Duplicate supports are filtered
+            - Top 50 by violation magnitude are returned as candidates
+
+    CUT SELECTION: _select_cuts_neural()
+        Computes 6-dim cut features, calls model.cut_scores(), applies
+        sigmoid threshold and top-k cap, returns selected CutData list.
+
+    BRANCHING: _select_branch_var()
+        1. PolicyHead scores all variables
+        2. Mask to fractional candidates (0 < x*_j < 1)
+        3. DynamicsTransformer 1-step lookahead over top-k candidates:
+               for each candidate a:
+                   z_next = dynamics_step(z, h_vars[a], past_tokens)
+                   v_next = value_pred(z_next, ...)
+           Select candidate with highest predicted value
+        4. This is the first time DynamicsTransformer is used at inference
+
+    NODE PRIORITY
+        IntegralityHead used to detect near-leaf nodes (leaf_prob > 0.7):
+            - Near-leaf: skip cut generation (unnecessary computation)
+        ValueHead score added to LP-based priority for node ordering:
+            priority = -lp_obj + 0.01 * value_head_score
+        This blends LP-based best-first with learned value estimates.
+
+    BRANCH-AND-CUT (not cut-and-branch)
+        child.inherited_cuts = parent.inherited_cuts + new_cuts
+        Both children of a branch inherit all cuts from the parent plus
+        cuts selected at the parent. This is correct because all generated
+        cuts are globally valid and remain valid under any variable bound
+        restriction.
+
+TECHNICAL DETAILS
+    - LP method: scipy linprog method='highs' (no extra install required)
+    - Cut types: "cg" only (Chvátal-Gomory); Gomory fractional cuts are
+      intentionally excluded (they are node-local and cannot propagate)
+    - Max cuts per node: 10 (configurable in default.yaml)
+    - Cut score threshold: 0.3 sigmoid value (configurable)
+    - Lookahead k: 3 candidates (configurable)
+    - Node ordering: max-heap by priority (higher = processed first)
+    - Pruning: standard lb >= global_ub bound pruning
+    - Termination: optimal gap < gap_tolerance, node_limit, or time_limit
+
+--------------------------------------------------------------------------------
+CHANGE 16: Benchmark — full model at inference  (bnb_wm/evaluate/benchmark.py)
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    The GNN branching loop in run_macro_benchmark() was upgraded to use
+    all model components at inference instead of just the policy head.
+
+    Old loop (used only encoder + policy head):
+        h_vars, _ = model.encode(batch)
+        scores = model.policy_scores(h_vars)   # wrong signature
+        best_action = scores[action_set].argmax()
+
+    New loop (_gnn_pick_action):
+        1. Encode → h_vars, z
+        2. IntegralityHead → leaf_prob
+           If leaf_prob > 0.8: skip lookahead, use policy scores directly
+        3. PolicyHead (Pointer Network) → baseline scores for all candidates
+        4. DynamicsTransformer 1-step lookahead over top-5 candidates:
+               z_next = dynamics_step(z, h_vars[candidate], past_tokens)
+               v_next = value_pred(z_next, ...)
+           Select candidate with highest predicted next-state value
+        5. Advance token buffer: past_tokens updated with chosen action
+           (the buffer persists across all branching decisions in one instance,
+            giving the Transformer full trajectory context)
+
+    _format_obs() was updated to build edge_attr [E, 3] from
+    obs.edge_features.values (constraint coefficients from Ecole).
+
+    policy_scores() call was fixed to use the new 3-argument signature:
+        model.policy_scores(h_vars, z, var_batch)
+
+EXPECTED IMPACT
+    High. The benchmark previously used only 2 of 5 model components. Now
+    all 5 components contribute to inference. The dynamics lookahead is the
+    most significant addition: instead of greedily picking the highest-scored
+    variable, the model simulates one step ahead in latent space and picks
+    the variable whose predicted future is best.
+
+--------------------------------------------------------------------------------
+CHANGE 17: configs/default.yaml — solver and benchmark parameters
+--------------------------------------------------------------------------------
+
+WHAT CHANGED
+    Added two new sections to default.yaml:
+
+    solver:
+        time_limit          : 300s per instance
+        node_limit          : 100,000 nodes
+        gap_tolerance       : 1e-4
+        max_cuts_per_node   : 10
+        cut_score_threshold : 0.3
+        lookahead_k         : 3
+
+    benchmark:
+        lookahead_k         : 5  (more lookahead in benchmark vs solver)
+
+    Also added:
+        training.epochs_phase5 : 8
+        training.lr_phase5     : 5e-4
+
+--------------------------------------------------------------------------------
+SUMMARY TABLE (all changes combined)
 --------------------------------------------------------------------------------
 
 Component           Old                    New                        Impact
 -------------------+----------------------+---------------------------+--------
-GNN convolution     SAGEConv (mean agg.)   GATv2Conv (4-head attn.)   High
+GNN convolution     SAGEConv               GATv2Conv (4-head)         High
 Edge information    none                   3-dim edge features         High
 Graph pooling       global_mean_pool       CrossAttentionPool          Medium
 Policy head         Independent MLP        Pointer Network             Medium
 Value head          MLP(z)                 MLP(z || frac_mean)         Medium
 Integrality head    MLP(z)                 MLP(z || depth || n_frac)   Low-Med
 Dynamics model      GRUCell                Causal Transformer (4L/4H)  High
+Cut selection head  (absent)               CuttingPlaneHead            High
+Cut loss            (absent)               cutting_plane_loss (BCE)    -
+Phase 3 trainer     (placeholder)          train_dynamics() complete   -
+Phase 5 trainer     (absent)               train_cuts() complete       -
+Trainer call sites  broken (old sigs)      fixed (new sigs)            -
+Benchmark           policy only            all 5 heads + lookahead     High
+Solver              all NotImplementedError full branch-and-cut         High
 
 ================================================================================
