@@ -48,9 +48,13 @@ solver:
   max_cuts_per_node: 10
   cut_score_threshold: 0.3   # sigmoid threshold for cut acceptance
   lookahead_k: 3             # candidates evaluated with dynamics lookahead
+  lookahead_depth: 3         # latent rollout steps per candidate
+  lookahead_gamma: 0.95      # discount factor per lookahead step
 
 benchmark:
   n_instances: 10
   time_limit: 60        # seconds per instance
   problem: set_cover
   lookahead_k: 5             # candidates for dynamics lookahead in benchmark
+  lookahead_depth: 3         # latent rollout steps per candidate
+  lookahead_gamma: 0.95      # discount factor per lookahead step

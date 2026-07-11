@@ -59,6 +59,8 @@ class Node:
     priority: float = 0.0                    # for priority queue (negated lb)
     inherited_cuts: list = field(default_factory=list)   # CutData list
     past_tokens: Optional[object] = None    # DynamicsTransformer token buffer
+    # HiGHS basis from parent LP for warmstarting (col_status, row_status arrays)
+    warm_basis: Optional[tuple] = None
 
     def __lt__(self, other):
         # Max-heap by priority (higher priority = processed first)
@@ -105,6 +107,8 @@ class BnBSolver:
         max_cuts_per_node: int = 10,
         cut_score_threshold: float = 0.3,
         lookahead_k: int = 3,
+        lookahead_depth: int = 3,
+        lookahead_gamma: float = 0.95,
     ):
         self.model               = model
         self.device              = device
@@ -114,6 +118,17 @@ class BnBSolver:
         self.max_cuts_per_node   = max_cuts_per_node
         self.cut_score_threshold = cut_score_threshold
         self.lookahead_k         = lookahead_k
+        self.lookahead_depth     = lookahead_depth   # steps of latent rollout
+        self.lookahead_gamma     = lookahead_gamma   # discount per step
+
+        # Detect highspy for LP warmstarting; fall back to scipy linprog
+        try:
+            import highspy
+            self._highs = highspy
+            self._use_highs_direct = True
+        except ImportError:
+            self._highs = None
+            self._use_highs_direct = False
 
     # ------------------------------------------------------------------
     # Public interface
@@ -138,7 +153,7 @@ class BnBSolver:
         # Root LP
         root_lb_arr = np.zeros(n, dtype=np.float64)
         root_ub_arr = np.ones(n,  dtype=np.float64)
-        lp_obj, x_lp, dual, feasible = self._solve_lp(
+        lp_obj, x_lp, dual, feasible, root_basis = self._solve_lp(
             A, b, c, root_lb_arr, root_ub_arr, []
         )
 
@@ -152,11 +167,11 @@ class BnBSolver:
         # Generate and apply cuts at root
         root_cuts = self._select_cuts_neural(A, b, x_lp, c, z, [])
         if root_cuts:
-            lp_obj2, x_lp2, dual2, feas2 = self._solve_lp(
-                A, b, c, root_lb_arr, root_ub_arr, root_cuts
+            lp_obj2, x_lp2, dual2, feas2, root_basis2 = self._solve_lp(
+                A, b, c, root_lb_arr, root_ub_arr, root_cuts, warm_basis=root_basis
             )
             if feas2 and lp_obj2 > lp_obj + 1e-8:
-                lp_obj, x_lp, dual = lp_obj2, x_lp2, dual2
+                lp_obj, x_lp, dual, root_basis = lp_obj2, x_lp2, dual2, root_basis2
                 h_vars, z = self._encode_node(
                     A, b, c, x_lp, dual, root_lb_arr, root_ub_arr, root_cuts
                 )
@@ -173,6 +188,7 @@ class BnBSolver:
             var_lb=root_lb_arr, var_ub=root_ub_arr,
             node_id=0, priority=-lp_obj,
             inherited_cuts=root_cuts,
+            warm_basis=root_basis,
         )
         heap = [root_node]
 
@@ -192,9 +208,10 @@ class BnBSolver:
             if node.lb >= global_ub - 1e-6:
                 continue
 
-            # Solve node LP
-            lp_obj, x_lp, dual, feasible = self._solve_lp(
-                A, b, c, node.var_lb, node.var_ub, node.inherited_cuts
+            # Solve node LP (warmstart from parent basis)
+            lp_obj, x_lp, dual, feasible, node_basis = self._solve_lp(
+                A, b, c, node.var_lb, node.var_ub, node.inherited_cuts,
+                warm_basis=node.warm_basis,
             )
             n_nodes += 1
 
@@ -232,12 +249,13 @@ class BnBSolver:
                     A, b, x_lp, c, z, node.inherited_cuts
                 )
                 if new_cuts:
-                    lp_obj2, x_lp2, dual2, feas2 = self._solve_lp(
+                    lp_obj2, x_lp2, dual2, feas2, node_basis2 = self._solve_lp(
                         A, b, c, node.var_lb, node.var_ub,
                         node.inherited_cuts + new_cuts,
+                        warm_basis=node_basis,
                     )
                     if feas2 and lp_obj2 > lp_obj + 1e-8:
-                        lp_obj, x_lp, dual = lp_obj2, x_lp2, dual2
+                        lp_obj, x_lp, dual, node_basis = lp_obj2, x_lp2, dual2, node_basis2
                         h_vars, z = self._encode_node(
                             A, b, c, x_lp, dual, node.var_lb, node.var_ub,
                             node.inherited_cuts + new_cuts,
@@ -252,19 +270,18 @@ class BnBSolver:
             # Cuts to propagate to children (branch-and-cut: inherited + new)
             child_cuts = node.inherited_cuts + new_cuts
 
-            # Select branching variable
+            # Select branching variable (multi-step lookahead)
             branch_var = self._select_branch_var(
                 h_vars, z, x_lp, node
             )
 
             # Value head for node priority
             with torch.no_grad():
-                var_mask  = torch.zeros(h_vars.size(0), dtype=torch.bool, device=self.device)
-                bvec      = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
-                frac_t    = torch.tensor(
+                bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
+                frac_t = torch.tensor(
                     np.abs(x_lp - np.round(x_lp)) > 1e-4, dtype=torch.bool, device=self.device
                 )
-                v_score   = self.model.value_pred(z, h_vars, bvec, frac_t).item()
+                v_score = self.model.value_pred(z, h_vars, bvec, frac_t).item()
             child_priority = -lp_obj + 0.01 * v_score
 
             # Branch: x[branch_var] <= 0  and  x[branch_var] >= 1
@@ -288,6 +305,7 @@ class BnBSolver:
                     node_id=n_nodes * 2 + int(fix_val),
                     priority=child_priority,
                     inherited_cuts=child_cuts,
+                    warm_basis=node_basis,   # child warmstarts from current node's basis
                 )
                 heapq.heappush(heap, child)
 
@@ -320,6 +338,7 @@ class BnBSolver:
         var_lb: np.ndarray,
         var_ub: np.ndarray,
         cuts: list,
+        warm_basis: Optional[tuple] = None,
     ) -> tuple:
         """
         Solve the LP relaxation at a node.
@@ -329,22 +348,116 @@ class BnBSolver:
              cut.lhs @ x >= cut.rhs  (inherited cuts)
              var_lb <= x <= var_ub
 
-        Uses scipy.optimize.linprog with method='highs' (HiGHS backend).
+        Warmstarting: if highspy is available and warm_basis is provided
+        (col_status, row_status arrays from the parent node), the dual
+        simplex is hot-started from that basis, typically reducing the
+        solve to O(1-10) pivots instead of a full re-solve.
+
+        Falls back to scipy linprog (cold start) if highspy is absent.
 
         Returns:
-            (obj, x, dual, feasible)  or  (None, None, None, False)
+            (obj, x, dual, feasible, basis)
+            basis is (col_status, row_status) or None if highspy unavailable.
         """
-        from scipy.optimize import linprog
-
         n = len(c)
+        m_orig = len(b)
 
-        # Stack original + cut constraints, convert >= to <=
+        # Build stacked constraint matrix (original >= cuts)
         A_rows = [A] + [cut.lhs.reshape(1, n) for cut in cuts]
         b_rows = [b] + [np.array([cut.rhs]) for cut in cuts]
-        A_ineq = -np.vstack(A_rows).astype(np.float64)
-        b_ineq = -np.concatenate(b_rows).astype(np.float64)
+        A_all  = np.vstack(A_rows).astype(np.float64)
+        b_all  = np.concatenate(b_rows).astype(np.float64)
+        m_all  = len(b_all)
 
-        bounds = list(zip(var_lb.tolist(), var_ub.tolist()))
+        if self._use_highs_direct:
+            return self._solve_lp_highs(
+                c, A_all, b_all, var_lb, var_ub, m_orig, warm_basis
+            )
+        else:
+            return self._solve_lp_scipy(
+                c, A_all, b_all, var_lb, var_ub, m_orig
+            )
+
+    def _solve_lp_highs(
+        self,
+        c: np.ndarray,
+        A_all: np.ndarray,
+        b_all: np.ndarray,
+        var_lb: np.ndarray,
+        var_ub: np.ndarray,
+        m_orig: int,
+        warm_basis: Optional[tuple],
+    ) -> tuple:
+        """HiGHS direct API solve with optional basis warmstart."""
+        h = self._highs.Highs()
+        h.silent()
+
+        n    = len(c)
+        m_all = len(b_all)
+
+        # Add variables
+        h.addVars(n, var_lb.tolist(), var_ub.tolist())
+        h.changeColsCostByRange(0, n - 1, c.tolist())
+
+        # Add constraints: A_all x >= b_all  →  b_all <= A_all x <= +inf
+        inf = self._highs.kHighsInf
+        for i in range(m_all):
+            row = A_all[i]
+            nz_idx = np.where(np.abs(row) > 1e-12)[0]
+            h.addRow(
+                float(b_all[i]), inf,
+                len(nz_idx),
+                nz_idx.tolist(),
+                row[nz_idx].tolist(),
+            )
+
+        # Warmstart: inject parent basis (dual simplex will repair it)
+        if warm_basis is not None:
+            col_status, row_status = warm_basis
+            # Extend basis if cuts were added (new rows default to BASIC)
+            n_new_rows = m_all - len(row_status)
+            if n_new_rows > 0:
+                # kBasic = 1 in HiGHS basis enum
+                row_status = list(row_status) + [1] * n_new_rows
+            try:
+                h.setBasis(list(col_status), list(row_status))
+            except Exception:
+                pass   # ignore invalid basis; cold start
+
+        h.run()
+
+        info  = h.getInfoValue("primal_solution_status")[1]
+        if info != self._highs.kSolutionStatusFeasible:
+            return None, None, None, False, None
+
+        sol   = h.getSolution()
+        x     = np.array(sol.col_value[:n])
+        dual  = np.array(sol.row_dual[:m_orig])
+
+        # Extract basis for children to warmstart from
+        basis_obj  = h.getBasis()
+        col_status = list(basis_obj.col_status)
+        row_status = list(basis_obj.row_status)
+
+        obj = float(h.getInfoValue("objective_function_value")[1])
+        return obj, x, dual, True, (col_status, row_status)
+
+    def _solve_lp_scipy(
+        self,
+        c: np.ndarray,
+        A_all: np.ndarray,
+        b_all: np.ndarray,
+        var_lb: np.ndarray,
+        var_ub: np.ndarray,
+        m_orig: int,
+    ) -> tuple:
+        """scipy linprog cold-start fallback (no warmstarting)."""
+        from scipy.optimize import linprog
+
+        # Convert >= to <=
+        A_ineq = -A_all
+        b_ineq = -b_all
+        bounds  = list(zip(var_lb.tolist(), var_ub.tolist()))
 
         result = linprog(
             c.astype(np.float64),
@@ -354,13 +467,16 @@ class BnBSolver:
             options={"disp": False, "presolve": True},
         )
 
-        if result.status == 0:   # optimal
+        if result.status == 0:
             x    = result.x
-            # Dual variables for >= constraints: negate marginals (scipy gives <=)
-            dual = -result.ineqlin.marginals[:len(b)] if hasattr(result, "ineqlin") and result.ineqlin is not None else np.zeros(len(b))
-            return float(result.fun), x, dual, True
+            dual = (
+                -result.ineqlin.marginals[:m_orig]
+                if hasattr(result, "ineqlin") and result.ineqlin is not None
+                else np.zeros(m_orig)
+            )
+            return float(result.fun), x, dual, True, None
 
-        return None, None, None, False
+        return None, None, None, False, None
 
     # ------------------------------------------------------------------
     # Node encoding
@@ -515,47 +631,61 @@ class BnBSolver:
         node: Node,
     ) -> int:
         """
-        Select branching variable using PolicyHead + optional dynamics lookahead.
+        Select branching variable using PolicyHead + multi-step dynamics lookahead.
 
-        Fractional variables (0 < x*_j < 1) are the only valid branch targets.
-        The policy scores all variables; non-fractional ones are masked to -inf.
-        Then 1-step dynamics lookahead is applied over the top-k candidates.
+        For each of the top-k candidates by policy score, the DynamicsTransformer
+        is unrolled for `lookahead_depth` steps in latent space (no LP calls).
+        The value head evaluates each predicted future state; values are summed
+        with a per-step discount of `lookahead_gamma`. The candidate with the
+        highest discounted return is chosen.
+
+        At each lookahead step the action embedding is reused (we don't have
+        a future action to feed, so we use the candidate's embedding as a
+        stand-in — equivalent to "assume the same variable would be chosen
+        repeatedly", which is a reasonable proxy for trajectory continuation).
         """
         frac_mask_np = (x_lp > 1e-4) & (x_lp < 1 - 1e-4)
         frac_indices = np.where(frac_mask_np)[0]
 
         if len(frac_indices) == 0:
-            # Fallback: most fractional variable
             return int(np.argmin(np.abs(x_lp - 0.5)))
 
         with torch.no_grad():
             bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
-            scores = self.model.policy_scores(h_vars, z, bvec)   # [total_vars]
+            scores = self.model.policy_scores(h_vars, z, bvec)
 
-            # Mask to fractional candidates only
             masked = torch.full_like(scores, -1e4)
             frac_t = torch.tensor(frac_indices, dtype=torch.long, device=self.device)
             masked[frac_t] = scores[frac_t]
 
-            k = min(self.lookahead_k, len(frac_indices))
-            top_k = masked.topk(k).indices   # global variable indices
+            k     = min(self.lookahead_k, len(frac_indices))
+            top_k = masked.topk(k).indices
 
-            # Dynamics lookahead: predict value of next state for each candidate
             best_var   = int(top_k[0])
             best_score = -float("inf")
+            bvec1      = torch.zeros(1, dtype=torch.long, device=self.device)
 
             for cand in top_k:
-                a_emb  = h_vars[cand].unsqueeze(0)   # [1, H]
-                z_next, _ = self.model.dynamics_step(
-                    z, a_emb, node.past_tokens
-                )
-                # Value of predicted next state
-                bvec1  = torch.zeros(1, dtype=torch.long, device=self.device)
-                v_next = self.model.value_pred(
-                    z_next, z_next, bvec1, frac_mask=None
-                ).item()
-                if v_next > best_score:
-                    best_score = v_next
+                a_emb = h_vars[cand].unsqueeze(0)   # [1, H]
+
+                # Multi-step latent rollout
+                z_cur      = z
+                tokens_cur = node.past_tokens
+                discounted_return = 0.0
+                gamma = 1.0
+
+                for _ in range(self.lookahead_depth):
+                    z_cur, tokens_cur = self.model.dynamics_step(
+                        z_cur, a_emb, tokens_cur
+                    )
+                    v = self.model.value_pred(
+                        z_cur, z_cur, bvec1, frac_mask=None
+                    ).item()
+                    discounted_return += gamma * v
+                    gamma *= self.lookahead_gamma
+
+                if discounted_return > best_score:
+                    best_score = discounted_return
                     best_var   = int(cand)
 
         return best_var

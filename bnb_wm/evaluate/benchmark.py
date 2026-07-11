@@ -33,6 +33,10 @@ except ImportError:
 
 # Number of top-k candidates to evaluate with dynamics lookahead
 _LOOKAHEAD_K = 5
+# Number of latent steps to unroll per candidate
+_LOOKAHEAD_DEPTH = 3
+# Discount factor per lookahead step
+_LOOKAHEAD_GAMMA = 0.95
 # Integrality probability threshold above which lookahead is skipped
 _LEAF_PROB_SKIP = 0.8
 
@@ -100,13 +104,12 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None):
         1. Encode node → h_vars, z
         2. IntegralityHead → skip lookahead for near-leaf nodes
         3. PolicyHead (Pointer Network) → baseline scores
-        4. DynamicsTransformer 1-step lookahead over top-k candidates:
+        4. DynamicsTransformer multi-step lookahead over top-k candidates:
                for each candidate a in top-k:
-                   a_emb = h_vars[a]
-                   z_next, _ = dynamics_step(z, a_emb, past_tokens)
-                   v_next = value_pred(z_next, ...)
-               pick a with highest v_next
-        5. Return chosen action and updated token buffer
+                   unroll dynamics for LOOKAHEAD_DEPTH steps
+                   accumulate discounted value estimates
+               pick a with highest discounted return
+        5. Advance token buffer with chosen action and return
 
     Returns:
         action      : int
@@ -129,32 +132,35 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None):
     masked[aset_t] = scores_all[aset_t]
 
     if leaf_prob > _LEAF_PROB_SKIP:
-        # Near leaf: skip expensive lookahead, just use policy scores
         best_action = int(masked.argmax())
         return best_action, past_tokens
 
-    # --- dynamics lookahead over top-k candidates ---
-    k = min(_LOOKAHEAD_K, len(action_set))
-    top_k_global = masked.topk(k).indices   # global variable indices
+    # --- multi-step dynamics lookahead over top-k candidates ---
+    k            = min(_LOOKAHEAD_K, len(action_set))
+    top_k_global = masked.topk(k).indices
+    bvec1        = torch.zeros(1, dtype=torch.long, device=device)
 
-    best_action  = int(top_k_global[0])
-    best_v_next  = -float("inf")
+    best_action = int(top_k_global[0])
+    best_return = -float("inf")
 
     for cand_idx in top_k_global:
-        a_emb  = h_vars[cand_idx].unsqueeze(0)   # [1, H]
-        z_next, _ = model.dynamics_step(
-            z, a_emb, past_tokens
-        )
-        # Value head on predicted next state (no h_vars available → frac_mean = z_next)
-        v_next = model.value_pred(
-            z_next,
-            z_next,                          # fallback: use z_next as h_vars surrogate
-            torch.zeros(1, dtype=torch.long, device=device),
-            frac_mask=None,
-        ).item()
+        a_emb = h_vars[cand_idx].unsqueeze(0)   # [1, H]
 
-        if v_next > best_v_next:
-            best_v_next = v_next
+        z_cur      = z
+        tokens_cur = past_tokens
+        discounted_return = 0.0
+        gamma = 1.0
+
+        for _ in range(_LOOKAHEAD_DEPTH):
+            z_cur, tokens_cur = model.dynamics_step(z_cur, a_emb, tokens_cur)
+            v = model.value_pred(
+                z_cur, z_cur, bvec1, frac_mask=None
+            ).item()
+            discounted_return += gamma * v
+            gamma *= _LOOKAHEAD_GAMMA
+
+        if discounted_return > best_return:
+            best_return = discounted_return
             best_action = int(cand_idx)
 
     # Advance the token buffer with the chosen action
