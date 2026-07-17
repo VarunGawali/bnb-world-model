@@ -631,18 +631,18 @@ class BnBSolver:
         node: Node,
     ) -> int:
         """
-        Select branching variable using PolicyHead + multi-step dynamics lookahead.
+        Select branching variable using PolicyHead + a real multi-step
+        latent rollout (learned world-model lookahead).
 
-        For each of the top-k candidates by policy score, the DynamicsTransformer
-        is unrolled for `lookahead_depth` steps in latent space (no LP calls).
-        The value head evaluates each predicted future state; values are summed
-        with a per-step discount of `lookahead_gamma`. The candidate with the
-        highest discounted return is chosen.
-
-        At each lookahead step the action embedding is reused (we don't have
-        a future action to feed, so we use the candidate's embedding as a
-        stand-in — equivalent to "assume the same variable would be chosen
-        repeatedly", which is a reasonable proxy for trajectory continuation).
+        For each of the top-k candidates by policy score, the model rolls the
+        learned dynamics forward `lookahead_depth` steps in latent space (no
+        LP solves). At every rollout step it predicts both the next graph
+        latent z_{t+1} AND the next per-variable embeddings h_vars_{t+1}, then
+        re-runs the policy on the predicted state to choose the *next*
+        branching action — so the rollout simulates a genuine branching
+        sequence rather than replaying the same variable. The value head
+        scores each predicted future state; discounted returns are compared
+        and the best candidate is branched on.
         """
         frac_mask_np = (x_lp > 1e-4) & (x_lp < 1 - 1e-4)
         frac_indices = np.where(frac_mask_np)[0]
@@ -654,8 +654,13 @@ class BnBSolver:
             bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
             scores = self.model.policy_scores(h_vars, z, bvec)
 
-            masked = torch.full_like(scores, -1e4)
             frac_t = torch.tensor(frac_indices, dtype=torch.long, device=self.device)
+            valid_mask = torch.zeros(
+                h_vars.size(0), dtype=torch.bool, device=self.device
+            )
+            valid_mask[frac_t] = True
+
+            masked = torch.full_like(scores, -1e4)
             masked[frac_t] = scores[frac_t]
 
             k     = min(self.lookahead_k, len(frac_indices))
@@ -663,27 +668,15 @@ class BnBSolver:
 
             best_var   = int(top_k[0])
             best_score = -float("inf")
-            bvec1      = torch.zeros(1, dtype=torch.long, device=self.device)
 
             for cand in top_k:
-                a_emb = h_vars[cand].unsqueeze(0)   # [1, H]
-
-                # Multi-step latent rollout
-                z_cur      = z
-                tokens_cur = node.past_tokens
-                discounted_return = 0.0
-                gamma = 1.0
-
-                for _ in range(self.lookahead_depth):
-                    z_cur, tokens_cur = self.model.dynamics_step(
-                        z_cur, a_emb, tokens_cur
-                    )
-                    v = self.model.value_pred(
-                        z_cur, z_cur, bvec1, frac_mask=None
-                    ).item()
-                    discounted_return += gamma * v
-                    gamma *= self.lookahead_gamma
-
+                discounted_return = self.model.rollout_candidate(
+                    z, h_vars, int(cand),
+                    depth=self.lookahead_depth,
+                    gamma=self.lookahead_gamma,
+                    valid_mask=valid_mask,
+                    past_tokens=node.past_tokens,
+                )
                 if discounted_return > best_score:
                     best_score = discounted_return
                     best_var   = int(cand)

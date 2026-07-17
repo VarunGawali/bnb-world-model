@@ -135,30 +135,28 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None):
         best_action = int(masked.argmax())
         return best_action, past_tokens
 
-    # --- multi-step dynamics lookahead over top-k candidates ---
+    # --- real multi-step latent rollout over top-k candidates ---
+    # For each candidate the model predicts BOTH z_{t+1} and h_vars_{t+1},
+    # re-runs the policy on the predicted state to pick the next action, and
+    # accumulates discounted value estimates — a genuine branching-sequence
+    # simulation rather than replaying the same variable.
     k            = min(_LOOKAHEAD_K, len(action_set))
     top_k_global = masked.topk(k).indices
-    bvec1        = torch.zeros(1, dtype=torch.long, device=device)
+
+    valid_mask = torch.zeros(scores_all.size(0), dtype=torch.bool, device=device)
+    valid_mask[aset_t] = True
 
     best_action = int(top_k_global[0])
     best_return = -float("inf")
 
     for cand_idx in top_k_global:
-        a_emb = h_vars[cand_idx].unsqueeze(0)   # [1, H]
-
-        z_cur      = z
-        tokens_cur = past_tokens
-        discounted_return = 0.0
-        gamma = 1.0
-
-        for _ in range(_LOOKAHEAD_DEPTH):
-            z_cur, tokens_cur = model.dynamics_step(z_cur, a_emb, tokens_cur)
-            v = model.value_pred(
-                z_cur, z_cur, bvec1, frac_mask=None
-            ).item()
-            discounted_return += gamma * v
-            gamma *= _LOOKAHEAD_GAMMA
-
+        discounted_return = model.rollout_candidate(
+            z, h_vars, int(cand_idx),
+            depth=_LOOKAHEAD_DEPTH,
+            gamma=_LOOKAHEAD_GAMMA,
+            valid_mask=valid_mask,
+            past_tokens=past_tokens,
+        )
         if discounted_return > best_return:
             best_return = discounted_return
             best_action = int(cand_idx)

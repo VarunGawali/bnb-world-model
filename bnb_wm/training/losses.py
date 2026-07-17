@@ -65,6 +65,38 @@ def dynamics_loss(z_pred, z_target):
     return mse + 0.1 * cos
 
 
+def var_reconstruction_loss(h_pred, h_target, var_mask=None):
+    """
+    MSE + cosine loss for per-variable latent transition prediction.
+
+    Trains the dynamics model's per-variable head so that the predicted
+    future embeddings h_vars_{t+1} stay on the real-encoder manifold — the
+    ingredient that makes a latent rollout (policy re-run on predicted state)
+    trustworthy rather than drifting out of distribution.
+
+    Args:
+        h_pred   : [B, T, V, H]  predicted next per-variable embeddings
+        h_target : [B, T, V, H]  true next per-variable embeddings
+        var_mask : [B, T, V] bool — valid (non-padding) variable positions,
+                   or None to use all positions
+    """
+    if var_mask is not None:
+        m = var_mask.unsqueeze(-1)                       # [B, T, V, 1]
+        h_pred   = h_pred * m
+        h_target = h_target * m
+        denom = m.sum().clamp_min(1.0)
+        mse = ((h_pred - h_target) ** 2).sum() / (denom * h_pred.size(-1))
+    else:
+        mse = F.mse_loss(h_pred, h_target)
+
+    cos = 1.0 - F.cosine_similarity(
+        h_pred.reshape(-1, h_pred.size(-1)),
+        h_target.reshape(-1, h_target.size(-1)),
+        dim=-1,
+    ).mean()
+    return mse + 0.1 * cos
+
+
 def integrality_loss(logit, target, pos_weight):
     """
     Weighted BCE for leaf-node prediction.

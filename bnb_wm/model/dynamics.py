@@ -85,6 +85,50 @@ class _FFN(nn.Module):
         return x + self.net(self.norm(x))
 
 
+class _VarDynamics(nn.Module):
+    """
+    Per-variable latent transition head.
+
+    Predicts how each variable-node embedding evolves after a branching
+    decision. Between two consecutive B&B nodes the variable *set* is
+    unchanged (only bounds tighten), so the update is naturally expressed
+    as a per-variable residual conditioned on:
+
+        - the variable's current embedding   h_var_i^t
+        - the predicted next graph latent     z_{t+1}
+        - the branching action embedding      a_t
+
+        h_var_i^{t+1} = h_var_i^t + MLP([h_var_i^t || z_{t+1} || a_t])
+
+    The MLP is shared across variables and count-agnostic, so it applies
+    to any number of variables and any problem size. This is the head that
+    lets the policy be re-run on a *predicted* future state — the missing
+    ingredient for a real latent rollout.
+    """
+
+    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(3 * hidden_dim, 2 * hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        h_vars: torch.Tensor,   # [..., V, H]
+        z_next: torch.Tensor,   # [..., H]
+        a: torch.Tensor,        # [..., H]
+    ) -> torch.Tensor:
+        # Broadcast graph-level z_next and action a across the V variables.
+        z_b = z_next.unsqueeze(-2).expand_as(h_vars)
+        a_b = a.unsqueeze(-2).expand_as(h_vars)
+        delta = self.net(torch.cat([h_vars, z_b, a_b], dim=-1))
+        return self.norm(h_vars + delta)
+
+
 class DynamicsTransformer(nn.Module):
     """
     Causal Transformer dynamics model.
@@ -93,11 +137,15 @@ class DynamicsTransformer(nn.Module):
         token_t = Linear([z_t || a_t])   ->  d_model
 
     The model predicts z_{t+1} from the full causal context
-    [token_0, ..., token_t].
+    [token_0, ..., token_t]. In addition, a per-variable head (_VarDynamics)
+    predicts the next per-variable embeddings h_vars_{t+1}, so the policy can
+    be re-run on the predicted state and a genuine multi-step branching
+    rollout can be performed in latent space (no LP solves).
 
     Training (parallel, teacher-forced):
         inputs  : token sequence [B, T, d_model]
         targets : z_{1}, ..., z_{T}  (one-step shifted)
+                  and optionally h_vars_{1}, ..., h_vars_{T}
 
     Inference (auto-regressive, O(1) per step):
         Maintain a growing buffer of past tokens; feed the full buffer
@@ -139,6 +187,21 @@ class DynamicsTransformer(nn.Module):
 
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # Per-variable transition head (enables real latent rollout)
+        self.var_dynamics = _VarDynamics(hidden_dim, dropout)
+
+    # ------------------------------------------------------------------
+    # Per-variable prediction helper
+    # ------------------------------------------------------------------
+    def predict_vars(
+        self,
+        h_vars: torch.Tensor,
+        z_next: torch.Tensor,
+        a: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict h_vars_{t+1} given current h_vars, predicted z_{t+1}, action a."""
+        return self.var_dynamics(h_vars, z_next, a)
 
     def forward(
         self,
@@ -205,3 +268,56 @@ class DynamicsTransformer(nn.Module):
 
         z_next = self.out_proj(self.out_norm(x[:, -1, :]))   # [B, H]
         return z_next, tokens
+
+    def step_full(
+        self,
+        z_t: torch.Tensor,
+        a_t: torch.Tensor,
+        h_vars_t: torch.Tensor,
+        past_tokens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Single-step inference that also predicts the next per-variable
+        embeddings — the primitive for a *real* latent rollout.
+
+        Args:
+            z_t         : [B, H]        current graph embedding
+            a_t         : [B, H]        current action embedding
+            h_vars_t    : [V, H]        current per-variable embeddings
+            past_tokens : [B, t, H]     token buffer (or None)
+
+        Returns:
+            z_next      : [B, H]        predicted next graph embedding
+            h_vars_next : [V, H]        predicted next per-variable embeddings
+            new_tokens  : [B, t+1, H]   updated token buffer
+        """
+        z_next, tokens = self.step(z_t, a_t, past_tokens)
+        # Predict per-variable evolution conditioned on the new graph latent
+        # and the action taken. z_next[0]/a_t[0]: single-graph rollout.
+        h_vars_next = self.var_dynamics(h_vars_t, z_next[0], a_t[0])
+        return z_next, h_vars_next, tokens
+
+    def forward_with_vars(
+        self,
+        z_seq: torch.Tensor,
+        a_seq: torch.Tensor,
+        h_vars_seq: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parallel (training) forward returning BOTH the next graph latents and
+        the next per-variable embeddings.
+
+        Args:
+            z_seq      : [B, T, H]      graph embeddings at steps 0..T-1
+            a_seq      : [B, T, H]      action embeddings at steps 0..T-1
+            h_vars_seq : [B, T, V, H]   per-variable embeddings at steps 0..T-1
+                         (padded to a common V; caller supplies a var mask
+                          when computing the reconstruction loss)
+
+        Returns:
+            z_pred      : [B, T, H]      predicted z at steps 1..T
+            h_vars_pred : [B, T, V, H]   predicted h_vars at steps 1..T
+        """
+        z_pred = self.forward(z_seq, a_seq)                          # [B, T, H]
+        h_vars_pred = self.var_dynamics(h_vars_seq, z_pred, a_seq)   # broadcast over V
+        return z_pred, h_vars_pred

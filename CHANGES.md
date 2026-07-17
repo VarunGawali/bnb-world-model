@@ -65,12 +65,25 @@ original notebook implementation (`MTP_model_code_1.ipynb`).
   influence the current prediction. It also trains in parallel on full
   trajectories (one forward pass) instead of T sequential GRU steps.
 
-- **Multi-step latent rollout at inference (1-step → 3-step)**
-  Previously the Transformer was unrolled only one step per branching
-  candidate. It now rolls out 3 steps in latent space per candidate,
-  accumulates discounted value estimates, and picks the candidate with the
-  best predicted discounted return. This is the core "world model" behaviour:
-  simulate consequences of a decision before committing to it.
+- **True multi-step latent rollout at inference (real world-model lookahead)**
+  Earlier the rollout reused the same action embedding at every step and the
+  dynamics model only predicted the graph latent z — so it could not choose a
+  next action and was really a value re-ranking heuristic. The dynamics model
+  now has a per-variable head that also predicts h_vars_{t+1}. Each rollout
+  step therefore: (1) predicts z_{t+1} and h_vars_{t+1}, (2) re-runs the
+  policy on the predicted state to select the *next* branching variable,
+  (3) rolls forward with that chosen action, accumulating discounted value.
+  This simulates a genuine branching *sequence* in latent space with no LP
+  solves — the actual world-model claim, analogous to MuZero planning on a
+  learned model rather than re-encoding real states.
+
+- **Value head trained on its own predicted latents**
+  Phase 3 now supervises the per-variable head (reconstruction loss against
+  the real encoder outputs) so predicted h_vars stay on the encoder manifold.
+  Phase 4 adds a value-consistency term: the value head is required to read
+  dynamics-predicted latents the same way it reads real ones. Together these
+  remove the distribution shift the value estimates would otherwise face
+  during rollout.
 
 ---
 

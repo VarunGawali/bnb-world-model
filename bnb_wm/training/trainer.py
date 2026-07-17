@@ -21,6 +21,7 @@ from .losses import (
     value_loss as _value_loss,
     integrality_loss,
     dynamics_loss as _dynamics_loss,
+    var_reconstruction_loss as _var_recon_loss,
     cutting_plane_loss,
 )
 from .checkpoint import save_checkpoint
@@ -269,6 +270,40 @@ class Trainer:
     # ------------------------------------------------------------------
     # Phase 3 — Dynamics
     # ------------------------------------------------------------------
+    def _dynamics_batch_loss(self, batch):
+        """
+        Compute the Phase-3 dynamics loss for one batch.
+
+        Supports two loader batch forms:
+            (z_seq, a_seq, z_next_seq)
+                -> graph-latent transition loss only.
+            (z_seq, a_seq, z_next_seq, hv_seq, hv_next_seq, var_mask)
+                -> graph-latent loss + per-variable reconstruction loss,
+                   training the head that enables the latent rollout.
+        """
+        if len(batch) == 3:
+            z_seq, a_seq, z_next_seq = batch
+            z_seq      = z_seq.to(self.device)
+            a_seq      = a_seq.to(self.device)
+            z_next_seq = z_next_seq.to(self.device)
+            z_pred = self.model.dynamics_forward(z_seq, a_seq)
+            return _dynamics_loss(z_pred, z_next_seq)
+
+        z_seq, a_seq, z_next_seq, hv_seq, hv_next_seq, var_mask = batch
+        z_seq       = z_seq.to(self.device)
+        a_seq       = a_seq.to(self.device)
+        z_next_seq  = z_next_seq.to(self.device)
+        hv_seq      = hv_seq.to(self.device)
+        hv_next_seq = hv_next_seq.to(self.device)
+        var_mask    = var_mask.to(self.device)
+
+        z_pred, hv_pred = self.model.dynamics.forward_with_vars(
+            z_seq, a_seq, hv_seq
+        )
+        z_loss = _dynamics_loss(z_pred, z_next_seq)
+        v_loss = _var_recon_loss(hv_pred, hv_next_seq, var_mask)
+        return z_loss + v_loss
+
     def train_dynamics(self, train_loader, val_loader, epochs, lr=5e-4):
         """
         Train DynamicsTransformer on pre-computed trajectory sequences.
@@ -280,6 +315,15 @@ class Trainer:
 
         The SequenceDataset is responsible for pre-computing z and a
         values using the frozen encoder from Phase 1/2.
+
+        If the loader also yields per-variable embedding sequences, the
+        dynamics model's per-variable head is supervised jointly. This is
+        what keeps predicted future h_vars on the real-encoder manifold, so
+        the policy can be re-run on predicted states during the latent
+        rollout without distribution drift. Loader batch forms supported:
+
+            (z_seq, a_seq, z_next_seq)
+            (z_seq, a_seq, z_next_seq, hv_seq, hv_next_seq, var_mask)
         """
         for name, p in self.model.named_parameters():
             p.requires_grad = "dynamics" in name
@@ -297,17 +341,12 @@ class Trainer:
             self.model.train()
             total_loss = n = 0
 
-            for z_seq, a_seq, z_next_seq in tqdm(
+            for batch in tqdm(
                 train_loader, desc=f"Dyn Train Epoch {epoch}", leave=False
             ):
-                z_seq      = z_seq.to(self.device)
-                a_seq      = a_seq.to(self.device)
-                z_next_seq = z_next_seq.to(self.device)
-
                 optimizer.zero_grad(set_to_none=True)
                 with autocast("cuda", enabled=self.amp):
-                    z_pred = self.model.dynamics_forward(z_seq, a_seq)
-                    loss   = _dynamics_loss(z_pred, z_next_seq)
+                    loss = self._dynamics_batch_loss(batch)
 
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(optimizer)
@@ -322,14 +361,8 @@ class Trainer:
             self.model.eval()
             val_loss_sum = val_n = 0
             with torch.no_grad():
-                for z_seq, a_seq, z_next_seq in tqdm(
-                    val_loader, desc="Dyn Val", leave=False
-                ):
-                    z_seq      = z_seq.to(self.device)
-                    a_seq      = a_seq.to(self.device)
-                    z_next_seq = z_next_seq.to(self.device)
-                    z_pred     = self.model.dynamics_forward(z_seq, a_seq)
-                    val_loss_sum += _dynamics_loss(z_pred, z_next_seq).item()
+                for batch in tqdm(val_loader, desc="Dyn Val", leave=False):
+                    val_loss_sum += self._dynamics_batch_loss(batch).item()
                     val_n += 1
 
             train_loss = total_loss / n
@@ -396,9 +429,10 @@ class Trainer:
                     z_per_var = z[pyg_batch.batch[var_mask]]
                     scores    = self.model.policy(h_vars, z_per_var)
 
-                    # Policy loss
+                    # Policy loss (and collect expert-chosen var embeddings)
                     p_losses, top1 = [], 0
                     offset = 0
+                    chosen_idx = []
                     for meta in metas:
                         n_v    = meta["n_vars"]
                         logits = scores[offset : offset + n_v]
@@ -408,17 +442,29 @@ class Trainer:
                         )
                         p_losses.append(ploss)
                         top1  += acc
+                        chosen_idx.append(offset + int(aset[meta["local_label"]]))
                         offset += n_v
                     p_loss = torch.stack(p_losses).mean()
 
-                    # Value loss
+                    # Value loss (on real encoder latents)
                     targets_v = torch.tensor(
                         [m["norm_db"] for m in metas],
                         dtype=torch.float32, device=self.device,
                     )
-                    v_loss = _value_loss(
-                        self.model.value_pred(z, h_vars, bvec, frac_mask), targets_v
-                    )
+                    v_pred_real = self.model.value_pred(z, h_vars, bvec, frac_mask)
+                    v_loss = _value_loss(v_pred_real, targets_v)
+
+                    # Value consistency on dynamics-PREDICTED latents.
+                    # Roll one dynamics step forward from the expert action and
+                    # require the value head to read the predicted latent the
+                    # same way it reads the real one. This trains the value head
+                    # on its own distribution, removing the OOD gap it would
+                    # otherwise face during the latent rollout at inference.
+                    a_chosen = h_vars[torch.tensor(chosen_idx, device=self.device)]
+                    z_pred1, _ = self.model.dynamics_step(z, a_chosen)
+                    bvec_g   = torch.zeros(z.size(0), dtype=torch.long, device=self.device)
+                    v_on_pred = self.model.value_pred(z_pred1, z_pred1, bvec_g, None)
+                    v_consist = F.mse_loss(v_on_pred, v_pred_real.detach())
 
                     # Integrality loss
                     targets_i = torch.tensor(
@@ -436,7 +482,7 @@ class Trainer:
                     i_logit = self.model.integrality_logit(z, depth, n_frac)
                     i_loss  = integrality_loss(i_logit, targets_i, pw)
 
-                    loss = p_loss + 0.5 * v_loss + 0.1 * i_loss
+                    loss = p_loss + 0.5 * v_loss + 0.1 * i_loss + 0.1 * v_consist
 
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(optimizer)

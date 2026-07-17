@@ -175,3 +175,87 @@ class BnBWorldModel(nn.Module):
             past_tokens : [B, t+1, H]
         """
         return self.dynamics.step(z_t, a_t, past_tokens)
+
+    def dynamics_step_full(
+        self,
+        z_t: torch.Tensor,
+        a_t: torch.Tensor,
+        h_vars_t: torch.Tensor,
+        past_tokens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Single-step latent transition that also predicts next h_vars.
+
+        Returns (z_next [B,H], h_vars_next [V,H], past_tokens [B,t+1,H]).
+        """
+        return self.dynamics.step_full(z_t, a_t, h_vars_t, past_tokens)
+
+    # ------------------------------------------------------------------
+    # Real latent rollout for candidate selection
+    # ------------------------------------------------------------------
+    def rollout_candidate(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        cand_idx: int,
+        depth: int,
+        gamma: float,
+        valid_mask: torch.Tensor | None = None,
+        past_tokens: torch.Tensor | None = None,
+    ) -> float:
+        """
+        Estimate the discounted subtree value of branching on `cand_idx` by
+        rolling the learned dynamics forward `depth` steps in latent space.
+
+        Unlike the earlier heuristic (which reused the same action embedding
+        at every step), this performs a genuine rollout:
+
+            1. branch on cand_idx  -> predict z_1, h_vars_1
+            2. run the policy on h_vars_1 to pick the *next* branching var
+            3. roll forward with that chosen action -> z_2, h_vars_2
+            4. repeat; accumulate discounted value estimates
+
+        Args:
+            z           : [1, H]   current graph latent
+            h_vars      : [V, H]   current per-variable embeddings
+            cand_idx    : int      first action (candidate under evaluation)
+            depth       : int      rollout horizon
+            gamma       : float    per-step discount
+            valid_mask  : [V] bool valid branching candidates (fractional vars)
+            past_tokens : token buffer for the dynamics Transformer
+
+        Returns:
+            discounted_return : float
+        """
+        z_cur      = z
+        h_cur      = h_vars
+        tokens_cur = past_tokens
+        a_idx      = cand_idx
+        # Per-variable batch vector (single graph): every variable maps to graph 0.
+        bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=z.device)
+
+        discounted_return = 0.0
+        g = 1.0
+        for _ in range(depth):
+            a_emb = h_cur[a_idx].unsqueeze(0)                    # [1, H]
+            z_cur, h_cur, tokens_cur = self.dynamics.step_full(
+                z_cur, a_emb, h_cur, tokens_cur
+            )
+            # Value of the predicted future state, with reconstructed
+            # per-variable fractional context (fixes the frac_mask=None gap).
+            v = self.value(
+                z_cur, h_cur, bvec,
+                frac_mask=valid_mask,
+            ).item()
+            discounted_return += g * v
+            g *= gamma
+
+            # Pick the next branching action ON THE PREDICTED STATE.
+            scores = self.policy(h_cur, z_cur.expand(h_cur.size(0), -1))
+            if valid_mask is not None:
+                masked = torch.full_like(scores, -1e4)
+                masked[valid_mask] = scores[valid_mask]
+                a_idx = int(masked.argmax())
+            else:
+                a_idx = int(scores.argmax())
+
+        return discounted_return
