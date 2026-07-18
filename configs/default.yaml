@@ -62,6 +62,10 @@ solver:
   # Rollout branching factor (Gap 4). 1 = single greedy path; >1 expands a
   # predicted branching tree of that width and averages child continuations.
   branch_factor: 2
+  # Node selection (Gap 5). "bound" = best-bound (default, LP-bound priority);
+  # "cost_to_go" = learned best-first, ordering the frontier by the child's
+  # predicted remaining nodes. Order never affects correctness, only speed.
+  node_selection: cost_to_go
 
 benchmark:
   n_instances: 10

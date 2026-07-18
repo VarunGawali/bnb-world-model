@@ -112,6 +112,7 @@ class BnBSolver:
         size_weight: float = 1.0,
         ctg_weight: float = 0.0,
         branch_factor: int = 1,
+        node_selection: str = "bound",
     ):
         self.model               = model
         self.device              = device
@@ -126,6 +127,7 @@ class BnBSolver:
         self.size_weight         = size_weight       # predicted-subtree-size penalty
         self.ctg_weight          = ctg_weight         # cost-to-go penalty (Gap 3)
         self.branch_factor       = branch_factor      # rollout tree width (Gap 4)
+        self.node_selection      = node_selection     # "bound" | "cost_to_go" (Gap 5)
 
         # Detect highspy for LP warmstarting; fall back to scipy linprog
         try:
@@ -281,14 +283,30 @@ class BnBSolver:
                 h_vars, z, x_lp, node
             )
 
-            # Value head for node priority
+            # Node priority for the search queue (min-heap pops smallest first).
             with torch.no_grad():
                 bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
                 frac_t = torch.tensor(
                     np.abs(x_lp - np.round(x_lp)) > 1e-4, dtype=torch.bool, device=self.device
                 )
-                v_score = self.model.value_pred(z, h_vars, bvec, frac_t).item()
-            child_priority = -lp_obj + 0.01 * v_score
+                if self.node_selection == "cost_to_go":
+                    # Gap 5: learned best-first search. Predict the child's
+                    # cost-to-go by rolling one dynamics step forward from this
+                    # node along the branching action, then order the frontier
+                    # so the node predicted to close in the fewest remaining
+                    # nodes is explored first. Node order never affects
+                    # correctness, only efficiency, so exactness is preserved.
+                    a_emb = h_vars[branch_var].unsqueeze(0)
+                    z_child, h_child, _ = self.model.dynamics_step_full(
+                        z, a_emb, h_vars, node.past_tokens
+                    )
+                    child_priority = self.model.cost_to_go_pred(
+                        z_child, h_child, bvec, frac_t
+                    ).item()
+                else:
+                    # Best-bound (default): explore the strongest LP bound first.
+                    v_score = self.model.value_pred(z, h_vars, bvec, frac_t).item()
+                    child_priority = -lp_obj + 0.01 * v_score
 
             # Branch: x[branch_var] <= 0  and  x[branch_var] >= 1
             for fix_val in (0.0, 1.0):
