@@ -145,7 +145,7 @@ def integrality_loss(logit, target, pos_weight):
         pos_weight : scalar tensor — n_neg / n_pos
     """
     return F.binary_cross_entropy_with_logits(
-        logit.squeeze(), target.float(), pos_weight=pos_weight
+        logit.reshape(-1), target.float().reshape(-1), pos_weight=pos_weight
     )
 
 
@@ -166,5 +166,5 @@ def cutting_plane_loss(scores, labels, pos_weight=None):
         loss : scalar tensor
     """
     return F.binary_cross_entropy_with_logits(
-        scores.squeeze(), labels.float(), pos_weight=pos_weight
+        scores.reshape(-1), labels.float().reshape(-1), pos_weight=pos_weight
     )
