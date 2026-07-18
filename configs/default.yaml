@@ -67,6 +67,10 @@ solver:
   # "cost_to_go" = learned best-first, ordering the frontier by the child's
   # predicted remaining nodes. Order never affects correctness, only speed.
   node_selection: cost_to_go
+  # MuZero-style rollout return (Fix 3). true = sum gamma^t r_t + gamma^k V(leaf)
+  # using the predicted per-step reward + one leaf value bootstrap; false = sum
+  # the value at every step (double-counts; kept as the ablation baseline).
+  use_reward_return: true
   # Global search-state context (Gap 1). Injects scalar frontier/bound features
   # into z. GATED OFF: the projection is zero-initialised and the frozen traces
   # lack per-node frontier signals to train it, so it is a no-op until a future

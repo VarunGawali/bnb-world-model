@@ -114,6 +114,7 @@ class BnBSolver:
         branch_factor: int = 1,
         node_selection: str = "bound",
         use_global_context: bool = False,
+        use_reward_return: bool = False,
     ):
         self.model               = model
         self.device              = device
@@ -130,6 +131,7 @@ class BnBSolver:
         self.branch_factor       = branch_factor      # rollout tree width (Gap 4)
         self.node_selection      = node_selection     # "bound" | "cost_to_go" (Gap 5)
         self.use_global_context  = use_global_context  # inject global scalars (Gap 1)
+        self.use_reward_return   = use_reward_return   # MuZero-style return (Fix 3)
 
         # Detect highspy for LP warmstarting; fall back to scipy linprog
         try:
@@ -740,6 +742,7 @@ class BnBSolver:
                     size_weight=self.size_weight,
                     ctg_weight=self.ctg_weight,
                     branch_factor=self.branch_factor,
+                    use_reward_return=self.use_reward_return,
                 )
                 if discounted_return > best_score:
                     best_score = discounted_return

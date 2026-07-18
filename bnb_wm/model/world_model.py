@@ -65,6 +65,13 @@ class BnBWorldModel(nn.Module):
         # solver quantity instead of drifting as a free self-supervised latent.
         self.dyn_bound      = nn.Linear(hidden_dim, 1)
 
+        # Reward head (Fix 3): predicts the per-step reward of a transition
+        # (the dual-bound improvement) from the predicted latent. Enables a
+        # MuZero-style rollout return  sum_t gamma^t r_t + gamma^k V(leaf)
+        # instead of summing the cost-to-go value at every step (which
+        # double-counts remaining work).
+        self.dyn_reward     = nn.Linear(hidden_dim, 1)
+
         # Global search-state context (Gap 1): projects scalar frontier/bound
         # features and adds them to the node embedding z, so heads can see the
         # global search state (open-node count, bounds, gap) not just the local
@@ -237,6 +244,13 @@ class BnBWorldModel(nn.Module):
         """
         return self.dyn_bound(z).squeeze(-1)
 
+    def dynamics_reward_pred(self, z: torch.Tensor) -> torch.Tensor:
+        """Predict the per-step reward (dual-bound improvement) (Fix 3).
+
+        Accepts z of shape [..., H]; returns [...] (last dim squeezed).
+        """
+        return self.dyn_reward(z).squeeze(-1)
+
     def dynamics_step_full(
         self,
         z_t: torch.Tensor,
@@ -265,6 +279,7 @@ class BnBWorldModel(nn.Module):
         size_weight: float = 1.0,
         ctg_weight: float = 0.0,
         branch_factor: int = 1,
+        use_reward_return: bool = False,
     ) -> float:
         """
         Estimate the quality of branching on `cand_idx` by rolling the learned
@@ -308,6 +323,12 @@ class BnBWorldModel(nn.Module):
                                    (the original behaviour); >1 expands a
                                    predicted branching tree and averages child
                                    continuations, a richer subtree estimate.
+            use_reward_return : bool  Fix 3. If True the return is the MuZero
+                                   form  sum_t gamma^t r_t + gamma^k V(leaf)
+                                   using the predicted per-step reward and a
+                                   single value bootstrap at each leaf. If False
+                                   (default) the legacy form sums the value at
+                                   every step (the ablation baseline).
 
         Returns:
             score : float   higher is better (branch on the max-score candidate)
@@ -323,8 +344,15 @@ class BnBWorldModel(nn.Module):
             z_n, h_n, tok = self.dynamics.step_full(
                 z_cur, a_emb, h_cur, tokens_cur
             )
-            v = self.value(z_n, h_n, bvec, frac_mask=valid_mask).item()
-            node_score = g * v
+            if use_reward_return:
+                # Immediate predicted reward (dual-bound improvement) for this
+                # transition; the value is bootstrapped only at the leaf below.
+                node_score = g * self.dynamics_reward_pred(z_n).item()
+            else:
+                # Legacy: sum the value at every step.
+                node_score = g * self.value(
+                    z_n, h_n, bvec, frac_mask=valid_mask
+                ).item()
             if ctg_weight != 0.0:
                 ctg = self.cost_to_go(z_n, h_n, bvec, frac_mask=valid_mask).item()
                 node_score -= ctg_weight * g * ctg
@@ -334,6 +362,11 @@ class BnBWorldModel(nn.Module):
                 ).item()
 
             if depth_left <= 1:
+                if use_reward_return:
+                    # Bootstrap the leaf with the value estimate.
+                    node_score += g * self.value(
+                        z_n, h_n, bvec, frac_mask=valid_mask
+                    ).item()
                 return node_score
 
             # Expand the top-b next actions on the PREDICTED state and average

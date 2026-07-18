@@ -373,6 +373,18 @@ class Trainer:
                 loss = loss + 0.5 * (per * tmask.float()).sum() / \
                     tmask.float().sum().clamp_min(1.0)
 
+        # Fix 3: train the reward head to predict the per-step dual-bound
+        # improvement, so the MuZero-style rollout return is grounded.
+        if d.get("reward_seq") is not None:
+            r_pred = self.model.dynamics_reward_pred(z_pred)      # [B, T]
+            r_tgt  = d["reward_seq"].to(self.device)
+            if tmask is None:
+                loss = loss + 0.5 * F.huber_loss(r_pred, r_tgt, delta=1.0)
+            else:
+                per = F.huber_loss(r_pred, r_tgt, delta=1.0, reduction="none")
+                loss = loss + 0.5 * (per * tmask.float()).sum() / \
+                    tmask.float().sum().clamp_min(1.0)
+
         return loss
 
     def train_dynamics(self, train_loader, val_loader, epochs, lr=5e-4,

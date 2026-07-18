@@ -46,6 +46,9 @@ _SIZE_WEIGHT = 0.0
 _CTG_WEIGHT = 1.0
 # Rollout branching factor (Gap 4): 1 = single greedy path, >1 = predicted tree.
 _BRANCH_FACTOR = 2
+# MuZero-style return (Fix 3): sum gamma^t r_t + gamma^k V(leaf). False = value
+# summed at every step (the ablation baseline).
+_USE_REWARD_RETURN = True
 # Integrality probability threshold above which lookahead is skipped
 _LEAF_PROB_SKIP = 0.8
 
@@ -168,6 +171,7 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None):
             size_weight=_SIZE_WEIGHT,
             ctg_weight=_CTG_WEIGHT,
             branch_factor=_BRANCH_FACTOR,
+            use_reward_return=_USE_REWARD_RETURN,
         )
         if discounted_return > best_return:
             best_return = discounted_return

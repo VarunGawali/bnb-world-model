@@ -170,6 +170,15 @@ stays reproducible and the untrainable ones are safe no-ops.
   incumbent, bounds) and adds them to z. Zero-initialised and gated off: a safe
   no-op until a future run with frontier data fine-tunes the projection.
 
+- **Fix 3 — reward model + MuZero-style return (`use_reward_return`)**
+  A reward head (`dyn_reward`) predicts the per-step dual-bound improvement,
+  trained in Phase 3 on `norm_dual_bounds[t+1] - norm_dual_bounds[t]`. The
+  rollout return becomes `sum_t gamma^t r_t + gamma^k V(leaf)` — the predicted
+  reward accumulated along the path with a single value bootstrap at the leaf —
+  instead of summing the cost-to-go value at every step (which double-counts
+  remaining work). `use_reward_return=false` keeps the value-sum form as the
+  ablation baseline.
+
 ## Bug Fixes
 
 - **Feature index misalignment between training data and solver**

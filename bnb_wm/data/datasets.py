@@ -259,6 +259,7 @@ class SequenceDataset(Dataset):
                 "z_seq": torch.zeros(1, H), "a_seq": torch.zeros(1, H),
                 "z_next_seq": torch.zeros(1, H),
                 "bound_next_seq": torch.zeros(1),
+                "reward_seq": torch.zeros(1),
                 "valid_len": 0,
             }
 
@@ -288,12 +289,15 @@ class SequenceDataset(Dataset):
             a_list.append(ht[bv])
         a_all = torch.stack(a_list, dim=0)            # [T, H]
 
+        ndb = np.asarray(d["norm_dual_bounds"], dtype=np.float32)
         out = {
             "z_seq":          z[:-1],
             "a_seq":          a_all[:-1],
             "z_next_seq":     z[1:],
-            "bound_next_seq": torch.as_tensor(
-                np.asarray(d["norm_dual_bounds"])[1:], dtype=torch.float32),
+            "bound_next_seq": torch.as_tensor(ndb[1:], dtype=torch.float32),
+            # Per-step reward = dual-bound improvement (Fix 3 target).
+            "reward_seq":     torch.as_tensor(ndb[1:] - ndb[:-1],
+                                              dtype=torch.float32),
             "valid_len":      T - 1,
         }
 
@@ -327,6 +331,7 @@ def make_sequence_collate(include_vars=True):
         a_seq   = torch.zeros(B, Tmax, H)
         z_next  = torch.zeros(B, Tmax, H)
         bound   = torch.zeros(B, Tmax)
+        reward  = torch.zeros(B, Tmax)
         tmask   = torch.zeros(B, Tmax, dtype=torch.bool)
 
         has_vars = include_vars and ("hv_seq" in batch[0])
@@ -344,6 +349,8 @@ def make_sequence_collate(include_vars=True):
             a_seq[i, :L]  = b["a_seq"][:L]
             z_next[i, :L] = b["z_next_seq"][:L]
             bound[i, :L]  = b["bound_next_seq"][:L]
+            if "reward_seq" in b:
+                reward[i, :L] = b["reward_seq"][:L]
             tmask[i, :L]  = True
             if has_vars and "hv_seq" in b:
                 k = b["hv_seq"].size(1)
@@ -353,7 +360,7 @@ def make_sequence_collate(include_vars=True):
 
         out = {
             "z_seq": z_seq, "a_seq": a_seq, "z_next_seq": z_next,
-            "bound_next_seq": bound, "time_mask": tmask,
+            "bound_next_seq": bound, "reward_seq": reward, "time_mask": tmask,
         }
         if has_vars:
             out["hv_seq"] = hv_seq
