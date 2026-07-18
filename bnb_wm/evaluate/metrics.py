@@ -135,8 +135,12 @@ def compute_spearman(model, val_loader, device):
             pyg_batch, metas = batch
             pyg_batch = pyg_batch.to(device)
 
-            _, z = model(pyg_batch)
-            preds = model.value_pred(z).squeeze(-1)
+            h_vars, z = model.encode(pyg_batch)
+            var_mask = pyg_batch.node_type == 0
+            bvec     = pyg_batch.batch[var_mask]
+            x_var    = pyg_batch.x[var_mask]
+            frac_mask = (x_var[:, 14] > 0.05) if x_var.size(1) > 14 else None
+            preds = model.value_pred(z, h_vars, bvec, frac_mask)
 
             preds_all.extend(preds.cpu().numpy().tolist())
             tgts_all.extend([m["norm_db"] for m in metas])

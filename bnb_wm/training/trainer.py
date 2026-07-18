@@ -410,8 +410,14 @@ class Trainer:
             (z_seq, a_seq, z_next_seq, hv_seq, hv_next_seq, var_mask)
         """
         self.overshoot_depth = overshoot_depth
+        # Train the dynamics transformer AND its two prediction heads. dyn_bound
+        # (Gap 2) and dyn_reward (Fix 3) are top-level modules whose parameter
+        # names do NOT contain "dynamics", so they must be named explicitly or
+        # they would stay frozen and never learn.
         for name, p in self.model.named_parameters():
-            p.requires_grad = "dynamics" in name
+            p.requires_grad = (
+                "dynamics" in name or "dyn_bound" in name or "dyn_reward" in name
+            )
 
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         print(f"Trainable params (Phase 3): {sum(p.numel() for p in trainable):,}"

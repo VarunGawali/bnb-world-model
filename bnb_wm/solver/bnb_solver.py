@@ -313,9 +313,13 @@ class BnBSolver:
                     z_child, h_child, _ = self.model.dynamics_step_full(
                         z, a_emb, h_vars, node.past_tokens
                     )
-                    child_priority = self.model.cost_to_go_pred(
+                    ctg = self.model.cost_to_go_pred(
                         z_child, h_child, bvec, frac_t
                     ).item()
+                    # Node.__lt__ is a MAX-heap on priority (higher popped
+                    # first), so negate: the SMALLEST predicted remaining work
+                    # gets the highest priority and is explored first.
+                    child_priority = -ctg
                 else:
                     # Best-bound (default): explore the strongest LP bound first.
                     v_score = self.model.value_pred(z, h_vars, bvec, frac_t).item()
@@ -346,8 +350,11 @@ class BnBSolver:
                 )
                 heapq.heappush(heap, child)
 
-        # Compute final gap
-        global_lb = heap[0].lb if heap else global_ub
+        # Compute final gap. The global lower bound is the MINIMUM lb over all
+        # open nodes, not heap[0] (which under learned node selection is the
+        # max-priority node, not the min-bound one). Using heap[0] would
+        # misreport the gap and could wrongly declare optimality.
+        global_lb = min((nd.lb for nd in heap), default=global_ub)
         gap = ((global_ub - global_lb) / (abs(global_ub) + 1e-10)
                if best_sol is not None else np.inf)
 
