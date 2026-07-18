@@ -120,6 +120,9 @@ class Trainer:
         self.amp      = amp and (device.type == "cuda")
         self.scaler   = GradScaler("cuda", enabled=self.amp)
         self.history  = defaultdict(list)
+        # Latent-overshooting horizon for Phase 3 (0 = one-step teacher forcing
+        # only). Set by train_dynamics from config.
+        self.overshoot_depth = 0
 
     # ------------------------------------------------------------------
     # Phase 1 — Policy
@@ -340,6 +343,24 @@ class Trainer:
                 d["var_mask"].to(self.device),
             )
 
+        # Latent overshooting (Technique 1): unroll the dynamics autoregressively
+        # from z_0, feeding its own predictions back in, and supervise each
+        # predicted step against the real future latent. Trains the model in the
+        # same compounding regime it faces during the inference rollout.
+        if self.overshoot_depth and self.overshoot_depth > 0:
+            k = min(self.overshoot_depth, a_seq.size(1))
+            if k > 0:
+                preds = self.model.dynamics.rollout(
+                    z_seq[:, 0], a_seq[:, :k]
+                )                                        # [B, k, H]
+                tgt = z_next_seq[:, :k]                   # real z_1 .. z_k
+                if tmask is not None:
+                    om = tmask[:, :k].unsqueeze(-1).float()
+                    denom = om.sum().clamp_min(1.0) * preds.size(-1)
+                    loss = loss + ((preds - tgt) ** 2 * om).sum() / denom
+                else:
+                    loss = loss + F.mse_loss(preds, tgt)
+
         # Gap 2: ground the predicted latent against the next real dual bound.
         if d.get("bound_next_seq") is not None:
             bound_pred = self.model.dynamics_bound_pred(z_pred)   # [B, T]
@@ -354,7 +375,8 @@ class Trainer:
 
         return loss
 
-    def train_dynamics(self, train_loader, val_loader, epochs, lr=5e-4):
+    def train_dynamics(self, train_loader, val_loader, epochs, lr=5e-4,
+                       overshoot_depth=0):
         """
         Train DynamicsTransformer on pre-computed trajectory sequences.
 
@@ -375,11 +397,13 @@ class Trainer:
             (z_seq, a_seq, z_next_seq)
             (z_seq, a_seq, z_next_seq, hv_seq, hv_next_seq, var_mask)
         """
+        self.overshoot_depth = overshoot_depth
         for name, p in self.model.named_parameters():
             p.requires_grad = "dynamics" in name
 
         trainable = [p for p in self.model.parameters() if p.requires_grad]
-        print(f"Trainable params (Phase 3): {sum(p.numel() for p in trainable):,}")
+        print(f"Trainable params (Phase 3): {sum(p.numel() for p in trainable):,}"
+              f" | overshoot_depth={overshoot_depth}")
 
         optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

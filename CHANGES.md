@@ -85,6 +85,15 @@ original notebook implementation (`MTP_model_code_1.ipynb`).
   remove the distribution shift the value estimates would otherwise face
   during rollout.
 
+- **Latent overshooting in Phase 3 (Dreamer/PlaNet)**
+  In addition to one-step teacher forcing, the dynamics is unrolled
+  autoregressively `overshoot_depth` steps from z_0 — feeding its own
+  predictions back in — and every predicted latent is supervised against the
+  real future latent. This trains the model in the same compounding regime it
+  faces during the inference rollout, cutting exposure bias so the multi-step
+  (and tree) rollout does not drift. `overshoot_depth=0` recovers one-step
+  training.
+
 - **SubtreeSizeHead — branch to minimise predicted tree growth**
   A new head predicts log1p(subtree node count) rooted at the current node.
   Because the solver's cost *is* node count, this is the decision-relevant

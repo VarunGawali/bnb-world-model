@@ -269,6 +269,37 @@ class DynamicsTransformer(nn.Module):
         z_next = self.out_proj(self.out_norm(x[:, -1, :]))   # [B, H]
         return z_next, tokens
 
+    def rollout(
+        self,
+        z0: torch.Tensor,
+        a_seq: torch.Tensor,
+        past_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Autoregressive latent rollout for training-time latent overshooting.
+
+        Starting from the real latent z0, predict k steps forward feeding each
+        prediction back in as the next input (rather than the real next latent).
+        Supervising these against the real future latents forces predictions to
+        stay on the encoder manifold under compounding — the Dreamer/PlaNet
+        "latent overshooting" objective, and the exact regime used at inference.
+
+        Args:
+            z0          : [B, H]      real starting latent
+            a_seq       : [B, k, H]   action embeddings for the k steps
+            past_tokens : [B, t, H]   optional prior token buffer
+
+        Returns:
+            preds : [B, k, H]  predicted latents z_1_hat .. z_k_hat
+        """
+        preds = []
+        z_cur = z0
+        tokens = past_tokens
+        for j in range(a_seq.size(1)):
+            z_cur, tokens = self.step(z_cur, a_seq[:, j], tokens)
+            preds.append(z_cur)
+        return torch.stack(preds, dim=1)   # [B, k, H]
+
     def step_full(
         self,
         z_t: torch.Tensor,

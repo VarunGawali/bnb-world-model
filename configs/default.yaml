@@ -13,6 +13,7 @@ training:
   epochs_phase1: 8      # policy head
   epochs_phase2: 8      # value head
   epochs_phase3: 8      # dynamics Transformer
+  overshoot_depth: 3    # Phase 3 latent-overshooting horizon (0 = one-step only)
   epochs_phase4: 8      # joint fine-tuning
   epochs_phase5: 8      # cut selection head
   batch_size: 64

@@ -158,6 +158,7 @@ def main():
             sequence_loader(tr_files, True),
             sequence_loader(va_files, False),
             epochs=tcfg["epochs_phase3"], lr=tcfg["lr_phase3"],
+            overshoot_depth=tcfg.get("overshoot_depth", 0),
         )
         reload_best(model, ckpt_dir, 3, device)
 
