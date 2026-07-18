@@ -52,6 +52,40 @@ def list_trajectory_files(data_root, pattern="traj_*.npz"):
     return files
 
 
+def compute_label_stats(files, with_cuts=False):
+    """
+    Scan trajectory files for class imbalance, to set pos_weight in the
+    integrality (leaf) and cut-selection BCE losses.
+
+    Returns a dict with:
+        leaf_pos_weight : float or None   (n_non_leaf / n_leaf)
+        cut_pos_weight  : float or None   (n_neg_cut / n_pos_cut)
+    None means no positives were found (pos_weight left unset).
+    """
+    leaf_pos = leaf_tot = 0
+    cut_pos = cut_tot = 0
+    for f in files:
+        d = np.load(f, allow_pickle=True)
+        nil = np.asarray(d["next_is_leaf"], dtype=np.float32)
+        leaf_pos += int((nil > 0.5).sum())
+        leaf_tot += int(nil.size)
+        if with_cuts:
+            for t in range(int(d["n_steps"])):
+                if int(d["n_cuts"][t]) > 0:
+                    cl = np.asarray(d["cut_labels"][t], dtype=np.float32)
+                    cut_pos += int((cl > 0.5).sum())
+                    cut_tot += int(cl.size)
+
+    def _pw(pos, tot):
+        neg = tot - pos
+        return float(neg) / float(pos) if pos > 0 else None
+
+    return {
+        "leaf_pos_weight": _pw(leaf_pos, leaf_tot),
+        "cut_pos_weight":  _pw(cut_pos, cut_tot) if with_cuts else None,
+    }
+
+
 def split_files(files, train=0.8, val=0.1, test=0.1, seed=0):
     """Deterministically split a file list into (train, val, test)."""
     files = list(files)

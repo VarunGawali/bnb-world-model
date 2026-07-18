@@ -127,7 +127,8 @@ class Trainer:
     # ------------------------------------------------------------------
     # Phase 1 — Policy
     # ------------------------------------------------------------------
-    def train_policy(self, train_loader, val_loader, epochs, lr=1e-3):
+    def train_policy(self, train_loader, val_loader, epochs, lr=1e-3,
+                     patience=None):
         """Imitation learning: all params trainable."""
         optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=lr, weight_decay=1e-4
@@ -136,6 +137,7 @@ class Trainer:
             optimizer, T_max=epochs, eta_min=1e-5
         )
         best_val_acc = 0.0
+        no_improve = 0
 
         for epoch in range(1, epochs + 1):
             train_loss, train_acc = self._epoch_policy(
@@ -158,12 +160,19 @@ class Trainer:
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                no_improve = 0
                 save_checkpoint(
                     self.model, optimizer, epoch,
                     {"val_acc": val_acc},
                     self.ckpt_dir / "phase1_best.pt",
                 )
                 print("  Saved best Phase 1 model")
+            else:
+                no_improve += 1
+                if patience and no_improve >= patience:
+                    print(f"  Early stop at epoch {epoch} "
+                          f"(no val improvement for {patience} epochs)")
+                    break
 
         save_checkpoint(
             self.model, optimizer, epochs, {}, self.ckpt_dir / "phase1_final.pt"
@@ -199,7 +208,8 @@ class Trainer:
     # ------------------------------------------------------------------
     # Phase 2 — Value
     # ------------------------------------------------------------------
-    def train_value(self, train_loader, val_loader, epochs, lr=5e-4):
+    def train_value(self, train_loader, val_loader, epochs, lr=5e-4,
+                    patience=None):
         """Train value head with encoder + policy frozen."""
         for name, p in self.model.named_parameters():
             p.requires_grad = "value" in name
@@ -212,6 +222,7 @@ class Trainer:
             optimizer, T_max=epochs, eta_min=1e-5
         )
         best_spearman = -1.0
+        no_improve = 0
 
         for epoch in range(1, epochs + 1):
             train_loss = self._epoch_value_train(train_loader, optimizer)
@@ -229,12 +240,19 @@ class Trainer:
 
             if spearman_r > best_spearman:
                 best_spearman = spearman_r
+                no_improve = 0
                 save_checkpoint(
                     self.model, optimizer, epoch,
                     {"val_spearman": spearman_r},
                     self.ckpt_dir / "phase2_best.pt",
                 )
                 print("  Saved best Phase 2 model")
+            else:
+                no_improve += 1
+                if patience and no_improve >= patience:
+                    print(f"  Early stop at epoch {epoch} "
+                          f"(no val improvement for {patience} epochs)")
+                    break
 
         save_checkpoint(
             self.model, optimizer, epochs, {}, self.ckpt_dir / "phase2_final.pt"
@@ -388,7 +406,7 @@ class Trainer:
         return loss
 
     def train_dynamics(self, train_loader, val_loader, epochs, lr=5e-4,
-                       overshoot_depth=0):
+                       overshoot_depth=0, patience=None):
         """
         Train DynamicsTransformer on pre-computed trajectory sequences.
 
@@ -428,6 +446,7 @@ class Trainer:
             optimizer, T_max=epochs, eta_min=1e-5
         )
         best_val_loss = float("inf")
+        no_improve = 0
 
         for epoch in range(1, epochs + 1):
             self.model.train()
@@ -471,12 +490,19 @@ class Trainer:
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                no_improve = 0
                 save_checkpoint(
                     self.model, optimizer, epoch,
                     {"val_loss": val_loss},
                     self.ckpt_dir / "phase3_best.pt",
                 )
                 print("  Saved best Phase 3 model")
+            else:
+                no_improve += 1
+                if patience and no_improve >= patience:
+                    print(f"  Early stop at epoch {epoch} "
+                          f"(no val improvement for {patience} epochs)")
+                    break
 
         save_checkpoint(
             self.model, optimizer, epochs, {}, self.ckpt_dir / "phase3_final.pt"
@@ -488,7 +514,7 @@ class Trainer:
     # Phase 4 — Joint fine-tuning
     # ------------------------------------------------------------------
     def train_joint(self, train_loader, val_loader, epochs, lr=1e-4,
-                    pos_weight=None):
+                    pos_weight=None, patience=None):
         """End-to-end fine-tuning: policy + value + integrality losses."""
         for p in self.model.parameters():
             p.requires_grad = True
@@ -501,6 +527,7 @@ class Trainer:
         )
         pw = pos_weight.to(self.device) if pos_weight is not None else None
         best_val_acc = 0.0
+        no_improve = 0
 
         for epoch in range(1, epochs + 1):
             self.model.train()
@@ -632,12 +659,19 @@ class Trainer:
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                no_improve = 0
                 save_checkpoint(
                     self.model, optimizer, epoch,
                     {"val_acc": val_acc},
                     self.ckpt_dir / "phase4_best.pt",
                 )
                 print("  Saved best Phase 4 model")
+            else:
+                no_improve += 1
+                if patience and no_improve >= patience:
+                    print(f"  Early stop at epoch {epoch} "
+                          f"(no val improvement for {patience} epochs)")
+                    break
 
         save_checkpoint(
             self.model, optimizer, epochs, {}, self.ckpt_dir / "phase4_final.pt"
@@ -647,7 +681,7 @@ class Trainer:
     # Phase 5 — Cut selection
     # ------------------------------------------------------------------
     def train_cuts(self, train_loader, val_loader, epochs, lr=5e-4,
-                   pos_weight=None):
+                   pos_weight=None, patience=None):
         """
         Train CuttingPlaneHead to imitate SCIP's cut selection.
 
@@ -673,6 +707,7 @@ class Trainer:
         )
         pw = pos_weight.to(self.device) if pos_weight is not None else None
         best_val_loss = float("inf")
+        no_improve = 0
 
         for epoch in range(1, epochs + 1):
             self.model.train()
@@ -746,12 +781,19 @@ class Trainer:
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                no_improve = 0
                 save_checkpoint(
                     self.model, optimizer, epoch,
                     {"val_loss": val_loss},
                     self.ckpt_dir / "phase5_best.pt",
                 )
                 print("  Saved best Phase 5 model")
+            else:
+                no_improve += 1
+                if patience and no_improve >= patience:
+                    print(f"  Early stop at epoch {epoch} "
+                          f"(no val improvement for {patience} epochs)")
+                    break
 
         save_checkpoint(
             self.model, optimizer, epochs, {}, self.ckpt_dir / "phase5_final.pt"

@@ -8,6 +8,7 @@ from .labels import (
 from .datasets import (
     list_trajectory_files,
     split_files,
+    compute_label_stats,
     build_pyg_data,
     TransitionDataset,
     transition_collate,
@@ -21,6 +22,7 @@ __all__ = [
     "subtree_sizes_from_depths",
     "list_trajectory_files",
     "split_files",
+    "compute_label_stats",
     "build_pyg_data",
     "TransitionDataset",
     "transition_collate",

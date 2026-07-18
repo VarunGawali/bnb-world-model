@@ -40,6 +40,7 @@ from bnb_wm.training.checkpoint import load_weights_only
 from bnb_wm.data import (
     list_trajectory_files,
     split_files,
+    compute_label_stats,
     TransitionDataset,
     transition_collate,
     SequenceDataset,
@@ -119,6 +120,16 @@ def main():
                           collate_fn=transition_collate,
                           num_workers=args.num_workers)
 
+    # ---- class-imbalance correction (pos_weight) + early stopping ----
+    patience = tcfg.get("patience")
+    stats = compute_label_stats(tr_files, with_cuts=args.with_cuts)
+    leaf_pw = (torch.tensor(float(stats["leaf_pos_weight"]), device=device)
+               if stats["leaf_pos_weight"] else None)
+    cut_pw = (torch.tensor(float(stats["cut_pos_weight"]), device=device)
+              if stats["cut_pos_weight"] else None)
+    print(f"pos_weight | leaf={stats['leaf_pos_weight']} "
+          f"cut={stats['cut_pos_weight']} | early-stop patience={patience}")
+
     # ---- model + trainer ----
     model = build_model(cfg, device)
     trainer = Trainer(model, device, ckpt_dir, amp=tcfg.get("amp", True))
@@ -130,6 +141,7 @@ def main():
             transition_loader(tr_files, True),
             transition_loader(va_files, False),
             epochs=tcfg["epochs_phase1"], lr=tcfg["lr_phase1"],
+            patience=patience,
         )
         reload_best(model, ckpt_dir, 1, device)
 
@@ -140,6 +152,7 @@ def main():
             transition_loader(tr_files, True),
             transition_loader(va_files, False),
             epochs=tcfg["epochs_phase2"], lr=tcfg["lr_phase2"],
+            patience=patience,
         )
         reload_best(model, ckpt_dir, 2, device)
 
@@ -159,6 +172,7 @@ def main():
             sequence_loader(va_files, False),
             epochs=tcfg["epochs_phase3"], lr=tcfg["lr_phase3"],
             overshoot_depth=tcfg.get("overshoot_depth", 0),
+            patience=patience,
         )
         reload_best(model, ckpt_dir, 3, device)
 
@@ -169,6 +183,7 @@ def main():
             transition_loader(tr_files, True),
             transition_loader(va_files, False),
             epochs=tcfg["epochs_phase4"], lr=tcfg["lr_phase4"],
+            pos_weight=leaf_pw, patience=patience,
         )
         reload_best(model, ckpt_dir, 4, device)
 
@@ -182,6 +197,7 @@ def main():
                 transition_loader(tr_files, True),
                 transition_loader(va_files, False),
                 epochs=tcfg["epochs_phase5"], lr=tcfg["lr_phase5"],
+                pos_weight=cut_pw, patience=patience,
             )
             reload_best(model, ckpt_dir, 5, device)
 
