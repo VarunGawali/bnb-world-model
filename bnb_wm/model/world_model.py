@@ -60,6 +60,10 @@ class BnBWorldModel(nn.Module):
             hidden_dim=hidden_dim, n_layers=n_dyn_layers,
             n_heads=n_dyn_heads, max_seq=max_seq,
         )
+        # Grounding head (Gap 2): predicts the next node's normalised dual bound
+        # from the predicted latent, so the dynamics is anchored to a real
+        # solver quantity instead of drifting as a free self-supervised latent.
+        self.dyn_bound      = nn.Linear(hidden_dim, 1)
 
     # ------------------------------------------------------------------
     # Primary forward (Phase 1 training)
@@ -200,6 +204,13 @@ class BnBWorldModel(nn.Module):
             past_tokens : [B, t+1, H]
         """
         return self.dynamics.step(z_t, a_t, past_tokens)
+
+    def dynamics_bound_pred(self, z: torch.Tensor) -> torch.Tensor:
+        """Predict the normalised dual bound from a (predicted) latent (Gap 2).
+
+        Accepts z of shape [..., H]; returns [...] (last dim squeezed).
+        """
+        return self.dyn_bound(z).squeeze(-1)
 
     def dynamics_step_full(
         self,

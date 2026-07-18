@@ -276,35 +276,65 @@ class Trainer:
         """
         Compute the Phase-3 dynamics loss for one batch.
 
-        Supports two loader batch forms:
+        Accepts either a tuple (legacy) or a dict (extensible). All terms
+        beyond the base latent-transition loss activate only when their inputs
+        are present, so the same code path serves whatever the loader supplies.
+
+        Tuple forms (backward compatible):
             (z_seq, a_seq, z_next_seq)
-                -> graph-latent transition loss only.
             (z_seq, a_seq, z_next_seq, hv_seq, hv_next_seq, var_mask)
-                -> graph-latent loss + per-variable reconstruction loss,
-                   training the head that enables the latent rollout.
+
+        Dict form (preferred) keys:
+            z_seq, a_seq, z_next_seq                 (required)
+            hv_seq, hv_next_seq, var_mask            (optional: per-var recon)
+            bound_next_seq                           (optional: Gap-2 grounding)
+
+        Loss terms:
+            latent transition   (always)
+            per-variable recon  (if hv_* present)   — enables the rollout
+            grounded dual bound (if bound present)  — Gap 2, anchors the latent
         """
-        if len(batch) == 3:
-            z_seq, a_seq, z_next_seq = batch
-            z_seq      = z_seq.to(self.device)
-            a_seq      = a_seq.to(self.device)
-            z_next_seq = z_next_seq.to(self.device)
+        # Normalise to a dict.
+        if isinstance(batch, dict):
+            d = batch
+        elif len(batch) == 3:
+            d = dict(zip(("z_seq", "a_seq", "z_next_seq"), batch))
+        else:
+            d = dict(zip(
+                ("z_seq", "a_seq", "z_next_seq", "hv_seq", "hv_next_seq",
+                 "var_mask"),
+                batch,
+            ))
+
+        z_seq      = d["z_seq"].to(self.device)
+        a_seq      = d["a_seq"].to(self.device)
+        z_next_seq = d["z_next_seq"].to(self.device)
+
+        has_vars = d.get("hv_seq") is not None
+        if has_vars:
+            hv_seq = d["hv_seq"].to(self.device)
+            z_pred, hv_pred = self.model.dynamics.forward_with_vars(
+                z_seq, a_seq, hv_seq
+            )
+        else:
             z_pred = self.model.dynamics_forward(z_seq, a_seq)
-            return _dynamics_loss(z_pred, z_next_seq)
 
-        z_seq, a_seq, z_next_seq, hv_seq, hv_next_seq, var_mask = batch
-        z_seq       = z_seq.to(self.device)
-        a_seq       = a_seq.to(self.device)
-        z_next_seq  = z_next_seq.to(self.device)
-        hv_seq      = hv_seq.to(self.device)
-        hv_next_seq = hv_next_seq.to(self.device)
-        var_mask    = var_mask.to(self.device)
+        loss = _dynamics_loss(z_pred, z_next_seq)
 
-        z_pred, hv_pred = self.model.dynamics.forward_with_vars(
-            z_seq, a_seq, hv_seq
-        )
-        z_loss = _dynamics_loss(z_pred, z_next_seq)
-        v_loss = _var_recon_loss(hv_pred, hv_next_seq, var_mask)
-        return z_loss + v_loss
+        if has_vars:
+            loss = loss + _var_recon_loss(
+                hv_pred,
+                d["hv_next_seq"].to(self.device),
+                d["var_mask"].to(self.device),
+            )
+
+        # Gap 2: ground the predicted latent against the next real dual bound.
+        if d.get("bound_next_seq") is not None:
+            bound_pred = self.model.dynamics_bound_pred(z_pred)   # [B, T]
+            bound_tgt  = d["bound_next_seq"].to(self.device)
+            loss = loss + 0.5 * F.huber_loss(bound_pred, bound_tgt, delta=1.0)
+
+        return loss
 
     def train_dynamics(self, train_loader, val_loader, epochs, lr=5e-4):
         """
