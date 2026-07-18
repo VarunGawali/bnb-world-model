@@ -97,6 +97,23 @@ def var_reconstruction_loss(h_pred, h_target, var_mask=None):
     return mse + 0.1 * cos
 
 
+def subtree_size_loss(pred_log_size, target_size):
+    """
+    Huber loss on log1p subtree size.
+
+    The SubtreeSizeHead predicts log1p(node count); targets come directly from
+    the collected B&B traces (the true number of nodes in each node's subtree),
+    so this is a fully supervised regression — no proxy. Log space keeps the
+    loss well-conditioned across subtrees spanning several orders of magnitude.
+
+    Args:
+        pred_log_size : [batch]  predicted log1p(subtree size), already >= 0
+        target_size   : [batch]  true subtree node counts (raw, >= 1)
+    """
+    target_log = torch.log1p(target_size.clamp_min(0.0))
+    return F.huber_loss(pred_log_size.squeeze(), target_log.squeeze(), delta=1.0)
+
+
 def integrality_loss(logit, target, pos_weight):
     """
     Weighted BCE for leaf-node prediction.

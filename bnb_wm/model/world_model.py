@@ -25,7 +25,9 @@ Phase 5 : cut selection   (encoder frozen, cut imitation from SCIP)
 import torch
 import torch.nn as nn
 from .encoder import BipartiteGNN
-from .heads import PolicyHead, ValueHead, IntegralityHead, CuttingPlaneHead
+from .heads import (
+    PolicyHead, ValueHead, IntegralityHead, CuttingPlaneHead, SubtreeSizeHead,
+)
 from .dynamics import DynamicsTransformer
 
 
@@ -49,6 +51,7 @@ class BnBWorldModel(nn.Module):
         )
         self.policy         = PolicyHead(hidden_dim)
         self.value          = ValueHead(hidden_dim)
+        self.subtree_size   = SubtreeSizeHead(hidden_dim)
         self.integrality    = IntegralityHead(hidden_dim)
         self.cutting_planes = CuttingPlaneHead(hidden_dim, cut_feat_dim)
         self.dynamics       = DynamicsTransformer(
@@ -115,6 +118,16 @@ class BnBWorldModel(nn.Module):
     ) -> torch.Tensor:
         """Predict normalised dual bound."""
         return self.value(z, h_vars, batch_vec, frac_mask)
+
+    def subtree_size_pred(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        batch_vec: torch.Tensor,
+        frac_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict log1p(subtree node count) rooted at the current node."""
+        return self.subtree_size(z, h_vars, batch_vec, frac_mask)
 
     def integrality_logit(
         self,
@@ -201,10 +214,11 @@ class BnBWorldModel(nn.Module):
         gamma: float,
         valid_mask: torch.Tensor | None = None,
         past_tokens: torch.Tensor | None = None,
+        size_weight: float = 1.0,
     ) -> float:
         """
-        Estimate the discounted subtree value of branching on `cand_idx` by
-        rolling the learned dynamics forward `depth` steps in latent space.
+        Estimate the quality of branching on `cand_idx` by rolling the learned
+        dynamics forward `depth` steps in latent space.
 
         Unlike the earlier heuristic (which reused the same action embedding
         at every step), this performs a genuine rollout:
@@ -214,6 +228,16 @@ class BnBWorldModel(nn.Module):
             3. roll forward with that chosen action -> z_2, h_vars_2
             4. repeat; accumulate discounted value estimates
 
+        The score combines two learned signals about the simulated subtree:
+            + discounted value        (higher dual bound is better)
+            - predicted subtree size  (fewer nodes to close is better)
+
+        Predicting subtree size is the decision-relevant quantity — the
+        solver's cost is node count — so branching to minimise predicted tree
+        growth directly targets the metric we care about. The subtree-size
+        estimate is read at the candidate's immediate predicted child (the
+        root of the subtree that branching on this candidate creates).
+
         Args:
             z           : [1, H]   current graph latent
             h_vars      : [V, H]   current per-variable embeddings
@@ -222,9 +246,11 @@ class BnBWorldModel(nn.Module):
             gamma       : float    per-step discount
             valid_mask  : [V] bool valid branching candidates (fractional vars)
             past_tokens : token buffer for the dynamics Transformer
+            size_weight : float    weight on the predicted-subtree-size penalty
+                                   (0 recovers the pure value-based rollout)
 
         Returns:
-            discounted_return : float
+            score : float   higher is better (branch on the max-score candidate)
         """
         z_cur      = z
         h_cur      = h_vars
@@ -234,8 +260,9 @@ class BnBWorldModel(nn.Module):
         bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=z.device)
 
         discounted_return = 0.0
+        size_estimate = 0.0
         g = 1.0
-        for _ in range(depth):
+        for step in range(depth):
             a_emb = h_cur[a_idx].unsqueeze(0)                    # [1, H]
             z_cur, h_cur, tokens_cur = self.dynamics.step_full(
                 z_cur, a_emb, h_cur, tokens_cur
@@ -249,6 +276,12 @@ class BnBWorldModel(nn.Module):
             discounted_return += g * v
             g *= gamma
 
+            # Predicted subtree size at the immediate child of this candidate.
+            if step == 0 and size_weight != 0.0:
+                size_estimate = self.subtree_size(
+                    z_cur, h_cur, bvec, frac_mask=valid_mask
+                ).item()
+
             # Pick the next branching action ON THE PREDICTED STATE.
             scores = self.policy(h_cur, z_cur.expand(h_cur.size(0), -1))
             if valid_mask is not None:
@@ -258,4 +291,4 @@ class BnBWorldModel(nn.Module):
             else:
                 a_idx = int(scores.argmax())
 
-        return discounted_return
+        return discounted_return - size_weight * size_estimate

@@ -118,6 +118,59 @@ class IntegralityHead(nn.Module):
         return self.net(inp).squeeze(-1)
 
 
+class SubtreeSizeHead(nn.Module):
+    """
+    Predicts the size (node count) of the B&B subtree rooted at the current
+    node, in log space.
+
+    This is the decision-relevant quantity for branching: the solver's cost
+    IS the number of nodes explored, so a model that predicts how many nodes
+    a subtree will take lets us branch to *minimise predicted tree growth* —
+    a direct latent-space approximation of strong branching's subtree
+    evaluation.
+
+    The target is log1p(subtree_size), which is well-conditioned because true
+    subtree sizes span several orders of magnitude. The head shares the same
+    enriched input as the value head (z + fractional mean) since the same
+    signals — fractional state, dual gap — drive subtree growth.
+
+    Input  : z [batch, H], h_vars [total_vars, H],
+             batch_vec [total_vars], frac_mask [total_vars] bool (optional)
+    Output : log_size [batch]   predicted log1p(subtree node count)
+    """
+
+    def __init__(self, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        batch_vec: torch.Tensor,
+        frac_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size = z.size(0)
+
+        if frac_mask is not None and frac_mask.any():
+            frac_mean = torch.zeros_like(z)
+            for b in range(batch_size):
+                sel = (batch_vec == b) & frac_mask
+                frac_mean[b] = h_vars[sel].mean(0) if sel.any() else z[b]
+        else:
+            frac_mean = z
+
+        # Softplus keeps the predicted log-size non-negative (size >= 1).
+        out = self.net(torch.cat([z, frac_mean], dim=-1)).squeeze(-1)
+        return F.softplus(out)
+
+
 class CuttingPlaneHead(nn.Module):
     """
     Pointer Network that scores candidate cuts jointly for branch-and-cut.

@@ -37,6 +37,8 @@ _LOOKAHEAD_K = 5
 _LOOKAHEAD_DEPTH = 3
 # Discount factor per lookahead step
 _LOOKAHEAD_GAMMA = 0.95
+# Weight on the predicted-subtree-size penalty in the rollout score
+_SIZE_WEIGHT = 1.0
 # Integrality probability threshold above which lookahead is skipped
 _LEAF_PROB_SKIP = 0.8
 
@@ -156,6 +158,7 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None):
             gamma=_LOOKAHEAD_GAMMA,
             valid_mask=valid_mask,
             past_tokens=past_tokens,
+            size_weight=_SIZE_WEIGHT,
         )
         if discounted_return > best_return:
             best_return = discounted_return

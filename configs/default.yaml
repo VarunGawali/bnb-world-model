@@ -50,6 +50,7 @@ solver:
   lookahead_k: 3             # candidates evaluated with dynamics lookahead
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
+  size_weight: 1.0           # penalty on predicted subtree size in rollout score
 
 benchmark:
   n_instances: 10
@@ -58,3 +59,4 @@ benchmark:
   lookahead_k: 5             # candidates for dynamics lookahead in benchmark
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
+  size_weight: 1.0           # penalty on predicted subtree size in rollout score

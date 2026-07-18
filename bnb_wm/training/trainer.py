@@ -22,6 +22,7 @@ from .losses import (
     integrality_loss,
     dynamics_loss as _dynamics_loss,
     var_reconstruction_loss as _var_recon_loss,
+    subtree_size_loss as _subtree_size_loss,
     cutting_plane_loss,
 )
 from .checkpoint import save_checkpoint
@@ -482,7 +483,25 @@ class Trainer:
                     i_logit = self.model.integrality_logit(z, depth, n_frac)
                     i_loss  = integrality_loss(i_logit, targets_i, pw)
 
-                    loss = p_loss + 0.5 * v_loss + 0.1 * i_loss + 0.1 * v_consist
+                    # Subtree-size loss (supervised on true node counts from the
+                    # collected traces). Trained here so it shares the encoder
+                    # with the value head. Skipped if the data lacks the target.
+                    if all("subtree_size" in m for m in metas):
+                        targets_s = torch.tensor(
+                            [m["subtree_size"] for m in metas],
+                            dtype=torch.float32, device=self.device,
+                        )
+                        s_pred = self.model.subtree_size_pred(
+                            z, h_vars, bvec, frac_mask
+                        )
+                        s_loss = _subtree_size_loss(s_pred, targets_s)
+                    else:
+                        s_loss = torch.zeros((), device=self.device)
+
+                    loss = (
+                        p_loss + 0.5 * v_loss + 0.1 * i_loss
+                        + 0.1 * v_consist + 0.3 * s_loss
+                    )
 
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(optimizer)

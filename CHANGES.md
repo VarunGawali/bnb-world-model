@@ -85,6 +85,26 @@ original notebook implementation (`MTP_model_code_1.ipynb`).
   remove the distribution shift the value estimates would otherwise face
   during rollout.
 
+- **SubtreeSizeHead — branch to minimise predicted tree growth**
+  A new head predicts log1p(subtree node count) rooted at the current node.
+  Because the solver's cost *is* node count, this is the decision-relevant
+  quantity: during the latent rollout the model reads the predicted subtree
+  size at each candidate's immediate child and the branching score becomes
+      score = discounted_value  -  size_weight * predicted_subtree_size
+  so the solver branches toward the candidate expected to close its subtree
+  in the fewest nodes — a latent-space approximation of strong branching's
+  subtree evaluation. The head is trained *fully supervised* (Phase 4) on the
+  true subtree sizes recorded in the collected B&B traces; no proxy label.
+
+  DATA REQUIREMENT: each per-node meta must carry `subtree_size` (the true
+  number of B&B nodes in that node's subtree). It can be computed from an
+  existing trace: for a depth-first visitation order, the subtree size of the
+  node at position t is the count of subsequent nodes whose recorded depth is
+  greater than depth[t], up to the first node whose depth returns to <=
+  depth[t] (a standard stack pass over the `depths` array). If the field is
+  absent, Phase 4 silently skips the subtree-size term and the rollout uses
+  size_weight only if the head has been trained — otherwise set size_weight=0.
+
 ---
 
 ## Solver

@@ -109,6 +109,7 @@ class BnBSolver:
         lookahead_k: int = 3,
         lookahead_depth: int = 3,
         lookahead_gamma: float = 0.95,
+        size_weight: float = 1.0,
     ):
         self.model               = model
         self.device              = device
@@ -120,6 +121,7 @@ class BnBSolver:
         self.lookahead_k         = lookahead_k
         self.lookahead_depth     = lookahead_depth   # steps of latent rollout
         self.lookahead_gamma     = lookahead_gamma   # discount per step
+        self.size_weight         = size_weight       # predicted-subtree-size penalty
 
         # Detect highspy for LP warmstarting; fall back to scipy linprog
         try:
@@ -676,6 +678,7 @@ class BnBSolver:
                     gamma=self.lookahead_gamma,
                     valid_mask=valid_mask,
                     past_tokens=node.past_tokens,
+                    size_weight=self.size_weight,
                 )
                 if discounted_return > best_score:
                     best_score = discounted_return
