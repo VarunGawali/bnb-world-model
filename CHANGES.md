@@ -128,6 +128,39 @@ original notebook implementation (`MTP_model_code_1.ipynb`).
 
 ---
 
+## Steps Toward the Ideal B&B World Model
+
+These target the gaps between the current model and a MuZero-style B&B world
+model (see `RESEARCH_ROADMAP.md`). Each is gated/configurable so the AAAI run
+stays reproducible and the untrainable ones are safe no-ops.
+
+- **Gap 3 — cost-to-go value (`CostToGoHead`)**
+  Predicts log1p(remaining B&B nodes). Target is the Monte-Carlo return
+  `n_steps - t`, which needs no DFS ordering and so trains on the collected
+  non-DFS traces (unlike subtree size). The rollout subtracts a discounted
+  cost-to-go term (`ctg_weight`); 0 recovers the pure dual-bound-value rollout.
+  This replaces the dual-bound *proxy* with the decision-relevant value.
+
+- **Gap 2 — grounded dynamics (`dyn_bound`)**
+  A linear head predicts the next node's normalised dual bound from the
+  predicted latent, anchoring the dynamics to a real solver quantity. Trained
+  in Phase 3 when the loader supplies `bound_next_seq`.
+
+- **Gap 4 — tree rollout (`branch_factor`)**
+  The rollout expands the top-`branch_factor` next actions at each step and
+  averages child continuations, forming a predicted branching tree instead of a
+  single greedy path. `branch_factor=1` reproduces the prior behaviour.
+
+- **Gap 5 — learned node selection (`node_selection: cost_to_go`)**
+  Orders the search frontier by each child's predicted cost-to-go (one dynamics
+  step ahead) instead of the LP bound — learned best-first search. Node order
+  affects only efficiency, never correctness, so exactness holds.
+
+- **Gap 1 — global search-state context (`use_global_context`)**
+  Projects scalar frontier/bound features (open-node count, gap, depth,
+  incumbent, bounds) and adds them to z. Zero-initialised and gated off: a safe
+  no-op until a future run with frontier data fine-tunes the projection.
+
 ## Bug Fixes
 
 - **Feature index misalignment between training data and solver**

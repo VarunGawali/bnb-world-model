@@ -65,6 +65,16 @@ class BnBWorldModel(nn.Module):
         # solver quantity instead of drifting as a free self-supervised latent.
         self.dyn_bound      = nn.Linear(hidden_dim, 1)
 
+        # Global search-state context (Gap 1): projects scalar frontier/bound
+        # features and adds them to the node embedding z, so heads can see the
+        # global search state (open-node count, bounds, gap) not just the local
+        # node. Zero-initialised, so until fine-tuned it is an exact no-op and
+        # cannot degrade a model trained without it.
+        self.n_global       = 6
+        self.global_proj    = nn.Linear(self.n_global, hidden_dim)
+        nn.init.zeros_(self.global_proj.weight)
+        nn.init.zeros_(self.global_proj.bias)
+
     # ------------------------------------------------------------------
     # Primary forward (Phase 1 training)
     # ------------------------------------------------------------------
@@ -204,6 +214,21 @@ class BnBWorldModel(nn.Module):
             past_tokens : [B, t+1, H]
         """
         return self.dynamics.step(z_t, a_t, past_tokens)
+
+    def add_global_context(
+        self,
+        z: torch.Tensor,
+        global_ctx: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Add the projected global search-state context to z (Gap 1).
+
+        Args:
+            z          : [batch, H]
+            global_ctx : [batch, n_global] scalar features, or None (no-op)
+        """
+        if global_ctx is None:
+            return z
+        return z + self.global_proj(global_ctx)
 
     def dynamics_bound_pred(self, z: torch.Tensor) -> torch.Tensor:
         """Predict the normalised dual bound from a (predicted) latent (Gap 2).

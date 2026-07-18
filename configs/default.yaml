@@ -66,6 +66,11 @@ solver:
   # "cost_to_go" = learned best-first, ordering the frontier by the child's
   # predicted remaining nodes. Order never affects correctness, only speed.
   node_selection: cost_to_go
+  # Global search-state context (Gap 1). Injects scalar frontier/bound features
+  # into z. GATED OFF: the projection is zero-initialised and the frozen traces
+  # lack per-node frontier signals to train it, so it is a no-op until a future
+  # run fine-tunes it. Enable only after training the global_proj layer.
+  use_global_context: false
 
 benchmark:
   n_instances: 10
