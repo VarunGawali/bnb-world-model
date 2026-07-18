@@ -319,9 +319,21 @@ class Trainer:
         else:
             z_pred = self.model.dynamics_forward(z_seq, a_seq)
 
-        loss = _dynamics_loss(z_pred, z_next_seq)
+        # Time-padding mask (present when batching variable-length trajectories).
+        tmask = d.get("time_mask")
+        if tmask is not None:
+            tmask = tmask.to(self.device)
+
+        if tmask is None:
+            loss = _dynamics_loss(z_pred, z_next_seq)
+        else:
+            # Masked MSE over valid time positions only.
+            m = tmask.unsqueeze(-1).float()                 # [B, T, 1]
+            denom = m.sum().clamp_min(1.0) * z_pred.size(-1)
+            loss = ((z_pred - z_next_seq) ** 2 * m).sum() / denom
 
         if has_vars:
+            # var_mask already spans only valid time positions.
             loss = loss + _var_recon_loss(
                 hv_pred,
                 d["hv_next_seq"].to(self.device),
@@ -332,7 +344,13 @@ class Trainer:
         if d.get("bound_next_seq") is not None:
             bound_pred = self.model.dynamics_bound_pred(z_pred)   # [B, T]
             bound_tgt  = d["bound_next_seq"].to(self.device)
-            loss = loss + 0.5 * F.huber_loss(bound_pred, bound_tgt, delta=1.0)
+            if tmask is None:
+                loss = loss + 0.5 * F.huber_loss(bound_pred, bound_tgt, delta=1.0)
+            else:
+                per = F.huber_loss(bound_pred, bound_tgt, delta=1.0,
+                                   reduction="none")
+                loss = loss + 0.5 * (per * tmask.float()).sum() / \
+                    tmask.float().sum().clamp_min(1.0)
 
         return loss
 
