@@ -1,6 +1,13 @@
 from .encoder import BipartiteGNN
-from .heads import PolicyHead, ValueHead, IntegralityHead
-from .dynamics import DynamicsGRU
+from .heads import (
+    PolicyHead,
+    ValueHead,
+    IntegralityHead,
+    CuttingPlaneHead,
+    SubtreeSizeHead,
+    CostToGoHead,
+)
+from .dynamics import DynamicsTransformer
 from .world_model import BnBWorldModel
 
 __all__ = [
@@ -8,6 +15,9 @@ __all__ = [
     "PolicyHead",
     "ValueHead",
     "IntegralityHead",
-    "DynamicsGRU",
+    "CuttingPlaneHead",
+    "SubtreeSizeHead",
+    "CostToGoHead",
+    "DynamicsTransformer",
     "BnBWorldModel",
 ]
