@@ -26,11 +26,14 @@ def policy_loss_masked(scores, action_set, local_label):
         acc  : float  1.0 if top-1 matches expert
         rand : float  1/k  (random baseline)
     """
-    masked = torch.full_like(scores, -1e9)
+    # Use the dtype's most-negative representable value so the mask works under
+    # AMP (fp16, where -1e9 overflows). Compute the loss in fp32 for stability.
+    neg_inf = torch.finfo(scores.dtype).min
+    masked = torch.full_like(scores, neg_inf)
     masked[action_set] = scores[action_set]
 
     target = action_set[local_label]
-    loss = F.cross_entropy(masked.unsqueeze(0), target.unsqueeze(0))
+    loss = F.cross_entropy(masked.unsqueeze(0).float(), target.unsqueeze(0))
 
     acc  = float(masked.argmax() == target)
     rand = 1.0 / len(action_set)
