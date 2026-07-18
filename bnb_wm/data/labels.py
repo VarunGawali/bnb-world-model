@@ -28,6 +28,23 @@ or record node/parent ids and reconstruct the tree directly.
 import numpy as np
 
 
+def steps_to_go(n_steps: int):
+    """
+    Cost-to-go target (Gap 3): remaining B&B nodes after each step.
+
+        steps_to_go(t) = n_steps - t          for t = 0 .. n_steps-1
+
+    This is a Monte-Carlo return read straight off the trajectory and needs no
+    DFS ordering, so it is valid on the collected non-DFS traces. Feed each
+    per-node value as meta["steps_to_go"] to train the CostToGoHead.
+
+    Returns:
+        np.ndarray [n_steps] of remaining node counts (>= 1, last node = 1).
+    """
+    n = int(n_steps)
+    return (n - np.arange(n, dtype=np.int64))
+
+
 def is_dfs_preorder(depths) -> bool:
     """
     True if `depths` is consistent with a depth-first pre-order traversal.

@@ -27,6 +27,7 @@ import torch.nn as nn
 from .encoder import BipartiteGNN
 from .heads import (
     PolicyHead, ValueHead, IntegralityHead, CuttingPlaneHead, SubtreeSizeHead,
+    CostToGoHead,
 )
 from .dynamics import DynamicsTransformer
 
@@ -52,6 +53,7 @@ class BnBWorldModel(nn.Module):
         self.policy         = PolicyHead(hidden_dim)
         self.value          = ValueHead(hidden_dim)
         self.subtree_size   = SubtreeSizeHead(hidden_dim)
+        self.cost_to_go     = CostToGoHead(hidden_dim)
         self.integrality    = IntegralityHead(hidden_dim)
         self.cutting_planes = CuttingPlaneHead(hidden_dim, cut_feat_dim)
         self.dynamics       = DynamicsTransformer(
@@ -128,6 +130,16 @@ class BnBWorldModel(nn.Module):
     ) -> torch.Tensor:
         """Predict log1p(subtree node count) rooted at the current node."""
         return self.subtree_size(z, h_vars, batch_vec, frac_mask)
+
+    def cost_to_go_pred(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        batch_vec: torch.Tensor,
+        frac_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict log1p(remaining B&B nodes) — the cost-to-go value."""
+        return self.cost_to_go(z, h_vars, batch_vec, frac_mask)
 
     def integrality_logit(
         self,
@@ -215,6 +227,7 @@ class BnBWorldModel(nn.Module):
         valid_mask: torch.Tensor | None = None,
         past_tokens: torch.Tensor | None = None,
         size_weight: float = 1.0,
+        ctg_weight: float = 0.0,
     ) -> float:
         """
         Estimate the quality of branching on `cand_idx` by rolling the learned
@@ -248,6 +261,11 @@ class BnBWorldModel(nn.Module):
             past_tokens : token buffer for the dynamics Transformer
             size_weight : float    weight on the predicted-subtree-size penalty
                                    (0 recovers the pure value-based rollout)
+            ctg_weight  : float    weight on the predicted cost-to-go (remaining
+                                   nodes). Lower cost-to-go is better, so it is
+                                   subtracted. This is the decision-relevant
+                                   signal; set value contribution and ctg_weight
+                                   to taste for the ablation.
 
         Returns:
             score : float   higher is better (branch on the max-score candidate)
@@ -260,6 +278,7 @@ class BnBWorldModel(nn.Module):
         bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=z.device)
 
         discounted_return = 0.0
+        discounted_ctg = 0.0
         size_estimate = 0.0
         g = 1.0
         for step in range(depth):
@@ -274,6 +293,14 @@ class BnBWorldModel(nn.Module):
                 frac_mask=valid_mask,
             ).item()
             discounted_return += g * v
+
+            # Predicted cost-to-go (remaining nodes) at the predicted state.
+            if ctg_weight != 0.0:
+                ctg = self.cost_to_go(
+                    z_cur, h_cur, bvec, frac_mask=valid_mask
+                ).item()
+                discounted_ctg += g * ctg
+
             g *= gamma
 
             # Predicted subtree size at the immediate child of this candidate.
@@ -291,4 +318,8 @@ class BnBWorldModel(nn.Module):
             else:
                 a_idx = int(scores.argmax())
 
-        return discounted_return - size_weight * size_estimate
+        return (
+            discounted_return
+            - size_weight * size_estimate
+            - ctg_weight * discounted_ctg
+        )

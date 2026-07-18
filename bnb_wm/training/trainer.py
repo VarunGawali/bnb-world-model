@@ -23,6 +23,7 @@ from .losses import (
     dynamics_loss as _dynamics_loss,
     var_reconstruction_loss as _var_recon_loss,
     subtree_size_loss as _subtree_size_loss,
+    cost_to_go_loss as _cost_to_go_loss,
     cutting_plane_loss,
 )
 from .checkpoint import save_checkpoint
@@ -498,9 +499,23 @@ class Trainer:
                     else:
                         s_loss = torch.zeros((), device=self.device)
 
+                    # Cost-to-go loss (Gap 3): Monte-Carlo return n_steps - t.
+                    # Needs no DFS ordering, so it trains on the non-DFS traces.
+                    if all("steps_to_go" in m for m in metas):
+                        targets_c = torch.tensor(
+                            [m["steps_to_go"] for m in metas],
+                            dtype=torch.float32, device=self.device,
+                        )
+                        c_pred = self.model.cost_to_go_pred(
+                            z, h_vars, bvec, frac_mask
+                        )
+                        c_loss = _cost_to_go_loss(c_pred, targets_c)
+                    else:
+                        c_loss = torch.zeros((), device=self.device)
+
                     loss = (
                         p_loss + 0.5 * v_loss + 0.1 * i_loss
-                        + 0.1 * v_consist + 0.3 * s_loss
+                        + 0.1 * v_consist + 0.3 * s_loss + 0.5 * c_loss
                     )
 
                 self.scaler.scale(loss).backward()

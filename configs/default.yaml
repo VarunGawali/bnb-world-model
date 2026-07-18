@@ -55,6 +55,10 @@ solver:
   # derived from `depths` (see bnb_wm/data/labels.py) and the SubtreeSizeHead is
   # untrained. Set >0 only with DFS-ordered collection or explicit tree ids.
   size_weight: 0.0
+  # Cost-to-go penalty (Gap 3). Predicted remaining nodes (n_steps - t), lower
+  # is better. Trainable on the non-DFS traces. Set >0 to branch by cost-to-go;
+  # 0 recovers the pure dual-bound-value rollout (the ablation axis).
+  ctg_weight: 1.0
 
 benchmark:
   n_instances: 10
@@ -64,3 +68,4 @@ benchmark:
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
   size_weight: 0.0           # gated off: non-DFS traces (see solver.size_weight)
+  ctg_weight: 1.0            # cost-to-go penalty in rollout score (Gap 3)

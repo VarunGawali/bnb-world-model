@@ -114,6 +114,24 @@ def subtree_size_loss(pred_log_size, target_size):
     return F.huber_loss(pred_log_size.squeeze(), target_log.squeeze(), delta=1.0)
 
 
+def cost_to_go_loss(pred_log_ctg, target_steps):
+    """
+    Huber loss on log1p cost-to-go (remaining B&B node count).
+
+    The target is a Monte-Carlo return read directly from the trajectory:
+    steps_to_go(t) = n_steps - t. It requires no DFS ordering, so it is
+    trainable on the collected non-DFS traces — unlike subtree size. Log space
+    keeps the loss well-conditioned across nodes with very different amounts of
+    remaining work.
+
+    Args:
+        pred_log_ctg : [batch]  predicted log1p(remaining nodes), already >= 0
+        target_steps : [batch]  true remaining node counts (n_steps - t, >= 0)
+    """
+    target_log = torch.log1p(target_steps.clamp_min(0.0))
+    return F.huber_loss(pred_log_ctg.squeeze(), target_log.squeeze(), delta=1.0)
+
+
 def integrality_loss(logit, target, pos_weight):
     """
     Weighted BCE for leaf-node prediction.
