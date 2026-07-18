@@ -72,7 +72,10 @@ Headline ablation:
 Result to report: **node-count reduction vs. SCIP pseudocost**, with the
 ablation isolating the contribution of the latent rollout.
 
-Status / gaps: no trained weights yet; `bnb_wm/data/` module not built.
+Status / gaps: no trained weights yet. Data module (`bnb_wm/data/`) and the
+5-phase entry point (`train.py`) are built; the pipeline is runnable end-to-end
+pending a GPU smoke run to confirm the `.npz` field layout matches
+`build_pyg_data` (esp. `edge_indices` orientation).
 
 Subtree-size head — GATED OFF for AAAI. The collected `SC-easy` traces
 (`data_with_cuts/`) use SCIP's default best-first node order, not DFS, so exact
