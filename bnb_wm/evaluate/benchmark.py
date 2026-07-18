@@ -44,6 +44,8 @@ _SIZE_WEIGHT = 0.0
 # Weight on the predicted cost-to-go (remaining nodes) in the rollout score
 # (Gap 3). Trainable on the non-DFS traces; set 0 for the pure-value ablation.
 _CTG_WEIGHT = 1.0
+# Rollout branching factor (Gap 4): 1 = single greedy path, >1 = predicted tree.
+_BRANCH_FACTOR = 2
 # Integrality probability threshold above which lookahead is skipped
 _LEAF_PROB_SKIP = 0.8
 
@@ -165,6 +167,7 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None):
             past_tokens=past_tokens,
             size_weight=_SIZE_WEIGHT,
             ctg_weight=_CTG_WEIGHT,
+            branch_factor=_BRANCH_FACTOR,
         )
         if discounted_return > best_return:
             best_return = discounted_return

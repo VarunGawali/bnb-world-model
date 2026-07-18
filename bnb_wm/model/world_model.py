@@ -239,6 +239,7 @@ class BnBWorldModel(nn.Module):
         past_tokens: torch.Tensor | None = None,
         size_weight: float = 1.0,
         ctg_weight: float = 0.0,
+        branch_factor: int = 1,
     ) -> float:
         """
         Estimate the quality of branching on `cand_idx` by rolling the learned
@@ -277,60 +278,54 @@ class BnBWorldModel(nn.Module):
                                    subtracted. This is the decision-relevant
                                    signal; set value contribution and ctg_weight
                                    to taste for the ablation.
+            branch_factor : int    number of next actions expanded at each
+                                   rollout step (Gap 4). 1 = single greedy path
+                                   (the original behaviour); >1 expands a
+                                   predicted branching tree and averages child
+                                   continuations, a richer subtree estimate.
 
         Returns:
             score : float   higher is better (branch on the max-score candidate)
         """
-        z_cur      = z
-        h_cur      = h_vars
-        tokens_cur = past_tokens
-        a_idx      = cand_idx
         # Per-variable batch vector (single graph): every variable maps to graph 0.
         bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=z.device)
+        b = max(1, branch_factor)
+        size_estimate = [0.0]   # captured from the candidate's immediate child
 
-        discounted_return = 0.0
-        discounted_ctg = 0.0
-        size_estimate = 0.0
-        g = 1.0
-        for step in range(depth):
+        def expand(z_cur, h_cur, tokens_cur, a_idx, depth_left, g, is_root):
+            # Apply the action -> predicted next state (z and per-variable h).
             a_emb = h_cur[a_idx].unsqueeze(0)                    # [1, H]
-            z_cur, h_cur, tokens_cur = self.dynamics.step_full(
+            z_n, h_n, tok = self.dynamics.step_full(
                 z_cur, a_emb, h_cur, tokens_cur
             )
-            # Value of the predicted future state, with reconstructed
-            # per-variable fractional context (fixes the frac_mask=None gap).
-            v = self.value(
-                z_cur, h_cur, bvec,
-                frac_mask=valid_mask,
-            ).item()
-            discounted_return += g * v
-
-            # Predicted cost-to-go (remaining nodes) at the predicted state.
+            v = self.value(z_n, h_n, bvec, frac_mask=valid_mask).item()
+            node_score = g * v
             if ctg_weight != 0.0:
-                ctg = self.cost_to_go(
-                    z_cur, h_cur, bvec, frac_mask=valid_mask
-                ).item()
-                discounted_ctg += g * ctg
-
-            g *= gamma
-
-            # Predicted subtree size at the immediate child of this candidate.
-            if step == 0 and size_weight != 0.0:
-                size_estimate = self.subtree_size(
-                    z_cur, h_cur, bvec, frac_mask=valid_mask
+                ctg = self.cost_to_go(z_n, h_n, bvec, frac_mask=valid_mask).item()
+                node_score -= ctg_weight * g * ctg
+            if is_root and size_weight != 0.0:
+                size_estimate[0] = self.subtree_size(
+                    z_n, h_n, bvec, frac_mask=valid_mask
                 ).item()
 
-            # Pick the next branching action ON THE PREDICTED STATE.
-            scores = self.policy(h_cur, z_cur.expand(h_cur.size(0), -1))
+            if depth_left <= 1:
+                return node_score
+
+            # Expand the top-b next actions on the PREDICTED state and average
+            # their continuations (b=1 recovers the single greedy path).
+            scores = self.policy(h_n, z_n.expand(h_n.size(0), -1))
             if valid_mask is not None:
                 masked = torch.full_like(scores, -1e4)
                 masked[valid_mask] = scores[valid_mask]
-                a_idx = int(masked.argmax())
             else:
-                a_idx = int(scores.argmax())
+                masked = scores
+            k = min(b, masked.size(0))
+            next_actions = masked.topk(k).indices
+            child = [
+                expand(z_n, h_n, tok, int(na), depth_left - 1, g * gamma, False)
+                for na in next_actions
+            ]
+            return node_score + sum(child) / len(child)
 
-        return (
-            discounted_return
-            - size_weight * size_estimate
-            - ctg_weight * discounted_ctg
-        )
+        total = expand(z, h_vars, past_tokens, cand_idx, depth, 1.0, True)
+        return total - size_weight * size_estimate[0]

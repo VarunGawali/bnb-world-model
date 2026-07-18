@@ -111,6 +111,7 @@ class BnBSolver:
         lookahead_gamma: float = 0.95,
         size_weight: float = 1.0,
         ctg_weight: float = 0.0,
+        branch_factor: int = 1,
     ):
         self.model               = model
         self.device              = device
@@ -124,6 +125,7 @@ class BnBSolver:
         self.lookahead_gamma     = lookahead_gamma   # discount per step
         self.size_weight         = size_weight       # predicted-subtree-size penalty
         self.ctg_weight          = ctg_weight         # cost-to-go penalty (Gap 3)
+        self.branch_factor       = branch_factor      # rollout tree width (Gap 4)
 
         # Detect highspy for LP warmstarting; fall back to scipy linprog
         try:
@@ -682,6 +684,7 @@ class BnBSolver:
                     past_tokens=node.past_tokens,
                     size_weight=self.size_weight,
                     ctg_weight=self.ctg_weight,
+                    branch_factor=self.branch_factor,
                 )
                 if discounted_return > best_score:
                     best_score = discounted_return
