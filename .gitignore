@@ -1,5 +1,6 @@
-# Data — never commit raw trajectories (too large)
-data/
+# Data — never commit raw trajectories (too large).
+# Anchored to repo root so the bnb_wm/data/ source package is still tracked.
+/data/
 *.npz
 
 # Model checkpoints — store on Google Drive / cloud, not git

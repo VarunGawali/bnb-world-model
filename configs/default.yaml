@@ -13,6 +13,7 @@ training:
   epochs_phase1: 8      # policy head
   epochs_phase2: 8      # value head
   epochs_phase3: 8      # dynamics Transformer
+  overshoot_depth: 3    # Phase 3 latent-overshooting horizon (0 = one-step only)
   epochs_phase4: 8      # joint fine-tuning
   epochs_phase5: 8      # cut selection head
   batch_size: 64
@@ -50,6 +51,31 @@ solver:
   lookahead_k: 3             # candidates evaluated with dynamics lookahead
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
+  # Predicted-subtree-size penalty. GATED OFF (0.0): the collected traces use
+  # SCIP's default (non-DFS) node order, so exact subtree_size labels cannot be
+  # derived from `depths` (see bnb_wm/data/labels.py) and the SubtreeSizeHead is
+  # untrained. Set >0 only with DFS-ordered collection or explicit tree ids.
+  size_weight: 0.0
+  # Cost-to-go penalty (Gap 3). Predicted remaining nodes (n_steps - t), lower
+  # is better. Trainable on the non-DFS traces. Set >0 to branch by cost-to-go;
+  # 0 recovers the pure dual-bound-value rollout (the ablation axis).
+  ctg_weight: 1.0
+  # Rollout branching factor (Gap 4). 1 = single greedy path; >1 expands a
+  # predicted branching tree of that width and averages child continuations.
+  branch_factor: 2
+  # Node selection (Gap 5). "bound" = best-bound (default, LP-bound priority);
+  # "cost_to_go" = learned best-first, ordering the frontier by the child's
+  # predicted remaining nodes. Order never affects correctness, only speed.
+  node_selection: cost_to_go
+  # MuZero-style rollout return (Fix 3). true = sum gamma^t r_t + gamma^k V(leaf)
+  # using the predicted per-step reward + one leaf value bootstrap; false = sum
+  # the value at every step (double-counts; kept as the ablation baseline).
+  use_reward_return: true
+  # Global search-state context (Gap 1). Injects scalar frontier/bound features
+  # into z. GATED OFF: the projection is zero-initialised and the frozen traces
+  # lack per-node frontier signals to train it, so it is a no-op until a future
+  # run fine-tunes it. Enable only after training the global_proj layer.
+  use_global_context: false
 
 benchmark:
   n_instances: 10
@@ -58,3 +84,6 @@ benchmark:
   lookahead_k: 5             # candidates for dynamics lookahead in benchmark
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
+  size_weight: 0.0           # gated off: non-DFS traces (see solver.size_weight)
+  ctg_weight: 1.0            # cost-to-go penalty in rollout score (Gap 3)
+  branch_factor: 2           # rollout tree width (Gap 4); 1 = single path

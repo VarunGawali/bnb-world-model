@@ -65,12 +65,54 @@ original notebook implementation (`MTP_model_code_1.ipynb`).
   influence the current prediction. It also trains in parallel on full
   trajectories (one forward pass) instead of T sequential GRU steps.
 
-- **Multi-step latent rollout at inference (1-step → 3-step)**
-  Previously the Transformer was unrolled only one step per branching
-  candidate. It now rolls out 3 steps in latent space per candidate,
-  accumulates discounted value estimates, and picks the candidate with the
-  best predicted discounted return. This is the core "world model" behaviour:
-  simulate consequences of a decision before committing to it.
+- **True multi-step latent rollout at inference (real world-model lookahead)**
+  Earlier the rollout reused the same action embedding at every step and the
+  dynamics model only predicted the graph latent z — so it could not choose a
+  next action and was really a value re-ranking heuristic. The dynamics model
+  now has a per-variable head that also predicts h_vars_{t+1}. Each rollout
+  step therefore: (1) predicts z_{t+1} and h_vars_{t+1}, (2) re-runs the
+  policy on the predicted state to select the *next* branching variable,
+  (3) rolls forward with that chosen action, accumulating discounted value.
+  This simulates a genuine branching *sequence* in latent space with no LP
+  solves — the actual world-model claim, analogous to MuZero planning on a
+  learned model rather than re-encoding real states.
+
+- **Value head trained on its own predicted latents**
+  Phase 3 now supervises the per-variable head (reconstruction loss against
+  the real encoder outputs) so predicted h_vars stay on the encoder manifold.
+  Phase 4 adds a value-consistency term: the value head is required to read
+  dynamics-predicted latents the same way it reads real ones. Together these
+  remove the distribution shift the value estimates would otherwise face
+  during rollout.
+
+- **Latent overshooting in Phase 3 (Dreamer/PlaNet)**
+  In addition to one-step teacher forcing, the dynamics is unrolled
+  autoregressively `overshoot_depth` steps from z_0 — feeding its own
+  predictions back in — and every predicted latent is supervised against the
+  real future latent. This trains the model in the same compounding regime it
+  faces during the inference rollout, cutting exposure bias so the multi-step
+  (and tree) rollout does not drift. `overshoot_depth=0` recovers one-step
+  training.
+
+- **SubtreeSizeHead — branch to minimise predicted tree growth**
+  A new head predicts log1p(subtree node count) rooted at the current node.
+  Because the solver's cost *is* node count, this is the decision-relevant
+  quantity: during the latent rollout the model reads the predicted subtree
+  size at each candidate's immediate child and the branching score becomes
+      score = discounted_value  -  size_weight * predicted_subtree_size
+  so the solver branches toward the candidate expected to close its subtree
+  in the fewest nodes — a latent-space approximation of strong branching's
+  subtree evaluation. The head is trained *fully supervised* (Phase 4) on the
+  true subtree sizes recorded in the collected B&B traces; no proxy label.
+
+  DATA REQUIREMENT: each per-node meta must carry `subtree_size` (the true
+  number of B&B nodes in that node's subtree). It can be computed from an
+  existing trace: for a depth-first visitation order, the subtree size of the
+  node at position t is the count of subsequent nodes whose recorded depth is
+  greater than depth[t], up to the first node whose depth returns to <=
+  depth[t] (a standard stack pass over the `depths` array). If the field is
+  absent, Phase 4 silently skips the subtree-size term and the rollout uses
+  size_weight only if the head has been trained — otherwise set size_weight=0.
 
 ---
 
@@ -94,6 +136,48 @@ original notebook implementation (`MTP_model_code_1.ipynb`).
   a full solve.
 
 ---
+
+## Steps Toward the Ideal B&B World Model
+
+These target the gaps between the current model and a MuZero-style B&B world
+model (see `RESEARCH_ROADMAP.md`). Each is gated/configurable so the AAAI run
+stays reproducible and the untrainable ones are safe no-ops.
+
+- **Gap 3 — cost-to-go value (`CostToGoHead`)**
+  Predicts log1p(remaining B&B nodes). Target is the Monte-Carlo return
+  `n_steps - t`, which needs no DFS ordering and so trains on the collected
+  non-DFS traces (unlike subtree size). The rollout subtracts a discounted
+  cost-to-go term (`ctg_weight`); 0 recovers the pure dual-bound-value rollout.
+  This replaces the dual-bound *proxy* with the decision-relevant value.
+
+- **Gap 2 — grounded dynamics (`dyn_bound`)**
+  A linear head predicts the next node's normalised dual bound from the
+  predicted latent, anchoring the dynamics to a real solver quantity. Trained
+  in Phase 3 when the loader supplies `bound_next_seq`.
+
+- **Gap 4 — tree rollout (`branch_factor`)**
+  The rollout expands the top-`branch_factor` next actions at each step and
+  averages child continuations, forming a predicted branching tree instead of a
+  single greedy path. `branch_factor=1` reproduces the prior behaviour.
+
+- **Gap 5 — learned node selection (`node_selection: cost_to_go`)**
+  Orders the search frontier by each child's predicted cost-to-go (one dynamics
+  step ahead) instead of the LP bound — learned best-first search. Node order
+  affects only efficiency, never correctness, so exactness holds.
+
+- **Gap 1 — global search-state context (`use_global_context`)**
+  Projects scalar frontier/bound features (open-node count, gap, depth,
+  incumbent, bounds) and adds them to z. Zero-initialised and gated off: a safe
+  no-op until a future run with frontier data fine-tunes the projection.
+
+- **Fix 3 — reward model + MuZero-style return (`use_reward_return`)**
+  A reward head (`dyn_reward`) predicts the per-step dual-bound improvement,
+  trained in Phase 3 on `norm_dual_bounds[t+1] - norm_dual_bounds[t]`. The
+  rollout return becomes `sum_t gamma^t r_t + gamma^k V(leaf)` — the predicted
+  reward accumulated along the path with a single value bootstrap at the leaf —
+  instead of summing the cost-to-go value at every step (which double-counts
+  remaining work). `use_reward_return=false` keeps the value-sum form as the
+  ablation baseline.
 
 ## Bug Fixes
 

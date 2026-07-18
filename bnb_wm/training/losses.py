@@ -65,6 +65,73 @@ def dynamics_loss(z_pred, z_target):
     return mse + 0.1 * cos
 
 
+def var_reconstruction_loss(h_pred, h_target, var_mask=None):
+    """
+    MSE + cosine loss for per-variable latent transition prediction.
+
+    Trains the dynamics model's per-variable head so that the predicted
+    future embeddings h_vars_{t+1} stay on the real-encoder manifold — the
+    ingredient that makes a latent rollout (policy re-run on predicted state)
+    trustworthy rather than drifting out of distribution.
+
+    Args:
+        h_pred   : [B, T, V, H]  predicted next per-variable embeddings
+        h_target : [B, T, V, H]  true next per-variable embeddings
+        var_mask : [B, T, V] bool — valid (non-padding) variable positions,
+                   or None to use all positions
+    """
+    if var_mask is not None:
+        m = var_mask.unsqueeze(-1)                       # [B, T, V, 1]
+        h_pred   = h_pred * m
+        h_target = h_target * m
+        denom = m.sum().clamp_min(1.0)
+        mse = ((h_pred - h_target) ** 2).sum() / (denom * h_pred.size(-1))
+    else:
+        mse = F.mse_loss(h_pred, h_target)
+
+    cos = 1.0 - F.cosine_similarity(
+        h_pred.reshape(-1, h_pred.size(-1)),
+        h_target.reshape(-1, h_target.size(-1)),
+        dim=-1,
+    ).mean()
+    return mse + 0.1 * cos
+
+
+def subtree_size_loss(pred_log_size, target_size):
+    """
+    Huber loss on log1p subtree size.
+
+    The SubtreeSizeHead predicts log1p(node count); targets come directly from
+    the collected B&B traces (the true number of nodes in each node's subtree),
+    so this is a fully supervised regression — no proxy. Log space keeps the
+    loss well-conditioned across subtrees spanning several orders of magnitude.
+
+    Args:
+        pred_log_size : [batch]  predicted log1p(subtree size), already >= 0
+        target_size   : [batch]  true subtree node counts (raw, >= 1)
+    """
+    target_log = torch.log1p(target_size.clamp_min(0.0))
+    return F.huber_loss(pred_log_size.squeeze(), target_log.squeeze(), delta=1.0)
+
+
+def cost_to_go_loss(pred_log_ctg, target_steps):
+    """
+    Huber loss on log1p cost-to-go (remaining B&B node count).
+
+    The target is a Monte-Carlo return read directly from the trajectory:
+    steps_to_go(t) = n_steps - t. It requires no DFS ordering, so it is
+    trainable on the collected non-DFS traces — unlike subtree size. Log space
+    keeps the loss well-conditioned across nodes with very different amounts of
+    remaining work.
+
+    Args:
+        pred_log_ctg : [batch]  predicted log1p(remaining nodes), already >= 0
+        target_steps : [batch]  true remaining node counts (n_steps - t, >= 0)
+    """
+    target_log = torch.log1p(target_steps.clamp_min(0.0))
+    return F.huber_loss(pred_log_ctg.squeeze(), target_log.squeeze(), delta=1.0)
+
+
 def integrality_loss(logit, target, pos_weight):
     """
     Weighted BCE for leaf-node prediction.

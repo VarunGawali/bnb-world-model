@@ -37,6 +37,18 @@ _LOOKAHEAD_K = 5
 _LOOKAHEAD_DEPTH = 3
 # Discount factor per lookahead step
 _LOOKAHEAD_GAMMA = 0.95
+# Weight on the predicted-subtree-size penalty in the rollout score.
+# Gated off (0.0): traces use SCIP's non-DFS node order, so subtree_size labels
+# are not derivable and the SubtreeSizeHead is untrained. Value rollout only.
+_SIZE_WEIGHT = 0.0
+# Weight on the predicted cost-to-go (remaining nodes) in the rollout score
+# (Gap 3). Trainable on the non-DFS traces; set 0 for the pure-value ablation.
+_CTG_WEIGHT = 1.0
+# Rollout branching factor (Gap 4): 1 = single greedy path, >1 = predicted tree.
+_BRANCH_FACTOR = 2
+# MuZero-style return (Fix 3): sum gamma^t r_t + gamma^k V(leaf). False = value
+# summed at every step (the ablation baseline).
+_USE_REWARD_RETURN = True
 # Integrality probability threshold above which lookahead is skipped
 _LEAF_PROB_SKIP = 0.8
 
@@ -135,30 +147,32 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None):
         best_action = int(masked.argmax())
         return best_action, past_tokens
 
-    # --- multi-step dynamics lookahead over top-k candidates ---
+    # --- real multi-step latent rollout over top-k candidates ---
+    # For each candidate the model predicts BOTH z_{t+1} and h_vars_{t+1},
+    # re-runs the policy on the predicted state to pick the next action, and
+    # accumulates discounted value estimates — a genuine branching-sequence
+    # simulation rather than replaying the same variable.
     k            = min(_LOOKAHEAD_K, len(action_set))
     top_k_global = masked.topk(k).indices
-    bvec1        = torch.zeros(1, dtype=torch.long, device=device)
+
+    valid_mask = torch.zeros(scores_all.size(0), dtype=torch.bool, device=device)
+    valid_mask[aset_t] = True
 
     best_action = int(top_k_global[0])
     best_return = -float("inf")
 
     for cand_idx in top_k_global:
-        a_emb = h_vars[cand_idx].unsqueeze(0)   # [1, H]
-
-        z_cur      = z
-        tokens_cur = past_tokens
-        discounted_return = 0.0
-        gamma = 1.0
-
-        for _ in range(_LOOKAHEAD_DEPTH):
-            z_cur, tokens_cur = model.dynamics_step(z_cur, a_emb, tokens_cur)
-            v = model.value_pred(
-                z_cur, z_cur, bvec1, frac_mask=None
-            ).item()
-            discounted_return += gamma * v
-            gamma *= _LOOKAHEAD_GAMMA
-
+        discounted_return = model.rollout_candidate(
+            z, h_vars, int(cand_idx),
+            depth=_LOOKAHEAD_DEPTH,
+            gamma=_LOOKAHEAD_GAMMA,
+            valid_mask=valid_mask,
+            past_tokens=past_tokens,
+            size_weight=_SIZE_WEIGHT,
+            ctg_weight=_CTG_WEIGHT,
+            branch_factor=_BRANCH_FACTOR,
+            use_reward_return=_USE_REWARD_RETURN,
+        )
         if discounted_return > best_return:
             best_return = discounted_return
             best_action = int(cand_idx)

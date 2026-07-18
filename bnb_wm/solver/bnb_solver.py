@@ -109,6 +109,12 @@ class BnBSolver:
         lookahead_k: int = 3,
         lookahead_depth: int = 3,
         lookahead_gamma: float = 0.95,
+        size_weight: float = 1.0,
+        ctg_weight: float = 0.0,
+        branch_factor: int = 1,
+        node_selection: str = "bound",
+        use_global_context: bool = False,
+        use_reward_return: bool = False,
     ):
         self.model               = model
         self.device              = device
@@ -120,6 +126,12 @@ class BnBSolver:
         self.lookahead_k         = lookahead_k
         self.lookahead_depth     = lookahead_depth   # steps of latent rollout
         self.lookahead_gamma     = lookahead_gamma   # discount per step
+        self.size_weight         = size_weight       # predicted-subtree-size penalty
+        self.ctg_weight          = ctg_weight         # cost-to-go penalty (Gap 3)
+        self.branch_factor       = branch_factor      # rollout tree width (Gap 4)
+        self.node_selection      = node_selection     # "bound" | "cost_to_go" (Gap 5)
+        self.use_global_context  = use_global_context  # inject global scalars (Gap 1)
+        self.use_reward_return   = use_reward_return   # MuZero-style return (Fix 3)
 
         # Detect highspy for LP warmstarting; fall back to scipy linprog
         try:
@@ -232,6 +244,15 @@ class BnBSolver:
                 node.inherited_cuts,
             )
 
+            # Gap 1: inject global search-state context into z (no-op unless
+            # enabled and fine-tuned; the projection is zero-initialised).
+            if self.use_global_context:
+                gctx = self._global_context(
+                    n_open=len(heap), depth=node.depth, lp_obj=lp_obj,
+                    global_ub=global_ub, global_lb=node.lb,
+                )
+                z = self.model.add_global_context(z, gctx)
+
             # IntegralityHead: detect near-leaf — skip cut generation
             frac_vals = np.abs(x_lp - np.round(x_lp))
             n_frac = int((frac_vals > 1e-4).sum())
@@ -275,14 +296,34 @@ class BnBSolver:
                 h_vars, z, x_lp, node
             )
 
-            # Value head for node priority
+            # Node priority for the search queue (min-heap pops smallest first).
             with torch.no_grad():
                 bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
                 frac_t = torch.tensor(
                     np.abs(x_lp - np.round(x_lp)) > 1e-4, dtype=torch.bool, device=self.device
                 )
-                v_score = self.model.value_pred(z, h_vars, bvec, frac_t).item()
-            child_priority = -lp_obj + 0.01 * v_score
+                if self.node_selection == "cost_to_go":
+                    # Gap 5: learned best-first search. Predict the child's
+                    # cost-to-go by rolling one dynamics step forward from this
+                    # node along the branching action, then order the frontier
+                    # so the node predicted to close in the fewest remaining
+                    # nodes is explored first. Node order never affects
+                    # correctness, only efficiency, so exactness is preserved.
+                    a_emb = h_vars[branch_var].unsqueeze(0)
+                    z_child, h_child, _ = self.model.dynamics_step_full(
+                        z, a_emb, h_vars, node.past_tokens
+                    )
+                    ctg = self.model.cost_to_go_pred(
+                        z_child, h_child, bvec, frac_t
+                    ).item()
+                    # Node.__lt__ is a MAX-heap on priority (higher popped
+                    # first), so negate: the SMALLEST predicted remaining work
+                    # gets the highest priority and is explored first.
+                    child_priority = -ctg
+                else:
+                    # Best-bound (default): explore the strongest LP bound first.
+                    v_score = self.model.value_pred(z, h_vars, bvec, frac_t).item()
+                    child_priority = -lp_obj + 0.01 * v_score
 
             # Branch: x[branch_var] <= 0  and  x[branch_var] >= 1
             for fix_val in (0.0, 1.0):
@@ -309,8 +350,11 @@ class BnBSolver:
                 )
                 heapq.heappush(heap, child)
 
-        # Compute final gap
-        global_lb = heap[0].lb if heap else global_ub
+        # Compute final gap. The global lower bound is the MINIMUM lb over all
+        # open nodes, not heap[0] (which under learned node selection is the
+        # max-priority node, not the min-bound one). Using heap[0] would
+        # misreport the gap and could wrongly declare optimality.
+        global_lb = min((nd.lb for nd in heap), default=global_ub)
         gap = ((global_ub - global_lb) / (abs(global_ub) + 1e-10)
                if best_sol is not None else np.inf)
 
@@ -623,6 +667,32 @@ class BnBSolver:
     # Branching variable selection
     # ------------------------------------------------------------------
 
+    def _global_context(
+        self,
+        n_open: int,
+        depth: int,
+        lp_obj: float,
+        global_ub: float,
+        global_lb: float,
+    ) -> torch.Tensor:
+        """Build the 6-dim global search-state context vector (Gap 1).
+
+        All features are bounded transforms so the vector is well-conditioned
+        regardless of instance scale. Returns a [1, 6] tensor on self.device.
+        """
+        has_inc = np.isfinite(global_ub)
+        denom   = abs(global_ub) + 1.0 if has_inc else abs(lp_obj) + 1.0
+        gap     = (global_ub - global_lb) / denom if has_inc else 1.0
+        feats = [
+            np.log1p(max(n_open, 0)) / 10.0,       # frontier size
+            float(np.clip(gap, 0.0, 1.0)),          # optimality gap
+            depth / 50.0,                            # normalised depth
+            1.0 if has_inc else 0.0,                 # incumbent found?
+            float(np.tanh(lp_obj / denom)),          # relative node bound
+            float(np.tanh(global_lb / denom)),       # relative global bound
+        ]
+        return torch.tensor([feats], dtype=torch.float32, device=self.device)
+
     def _select_branch_var(
         self,
         h_vars: torch.Tensor,
@@ -631,18 +701,18 @@ class BnBSolver:
         node: Node,
     ) -> int:
         """
-        Select branching variable using PolicyHead + multi-step dynamics lookahead.
+        Select branching variable using PolicyHead + a real multi-step
+        latent rollout (learned world-model lookahead).
 
-        For each of the top-k candidates by policy score, the DynamicsTransformer
-        is unrolled for `lookahead_depth` steps in latent space (no LP calls).
-        The value head evaluates each predicted future state; values are summed
-        with a per-step discount of `lookahead_gamma`. The candidate with the
-        highest discounted return is chosen.
-
-        At each lookahead step the action embedding is reused (we don't have
-        a future action to feed, so we use the candidate's embedding as a
-        stand-in — equivalent to "assume the same variable would be chosen
-        repeatedly", which is a reasonable proxy for trajectory continuation).
+        For each of the top-k candidates by policy score, the model rolls the
+        learned dynamics forward `lookahead_depth` steps in latent space (no
+        LP solves). At every rollout step it predicts both the next graph
+        latent z_{t+1} AND the next per-variable embeddings h_vars_{t+1}, then
+        re-runs the policy on the predicted state to choose the *next*
+        branching action — so the rollout simulates a genuine branching
+        sequence rather than replaying the same variable. The value head
+        scores each predicted future state; discounted returns are compared
+        and the best candidate is branched on.
         """
         frac_mask_np = (x_lp > 1e-4) & (x_lp < 1 - 1e-4)
         frac_indices = np.where(frac_mask_np)[0]
@@ -654,8 +724,13 @@ class BnBSolver:
             bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
             scores = self.model.policy_scores(h_vars, z, bvec)
 
-            masked = torch.full_like(scores, -1e4)
             frac_t = torch.tensor(frac_indices, dtype=torch.long, device=self.device)
+            valid_mask = torch.zeros(
+                h_vars.size(0), dtype=torch.bool, device=self.device
+            )
+            valid_mask[frac_t] = True
+
+            masked = torch.full_like(scores, -1e4)
             masked[frac_t] = scores[frac_t]
 
             k     = min(self.lookahead_k, len(frac_indices))
@@ -663,27 +738,19 @@ class BnBSolver:
 
             best_var   = int(top_k[0])
             best_score = -float("inf")
-            bvec1      = torch.zeros(1, dtype=torch.long, device=self.device)
 
             for cand in top_k:
-                a_emb = h_vars[cand].unsqueeze(0)   # [1, H]
-
-                # Multi-step latent rollout
-                z_cur      = z
-                tokens_cur = node.past_tokens
-                discounted_return = 0.0
-                gamma = 1.0
-
-                for _ in range(self.lookahead_depth):
-                    z_cur, tokens_cur = self.model.dynamics_step(
-                        z_cur, a_emb, tokens_cur
-                    )
-                    v = self.model.value_pred(
-                        z_cur, z_cur, bvec1, frac_mask=None
-                    ).item()
-                    discounted_return += gamma * v
-                    gamma *= self.lookahead_gamma
-
+                discounted_return = self.model.rollout_candidate(
+                    z, h_vars, int(cand),
+                    depth=self.lookahead_depth,
+                    gamma=self.lookahead_gamma,
+                    valid_mask=valid_mask,
+                    past_tokens=node.past_tokens,
+                    size_weight=self.size_weight,
+                    ctg_weight=self.ctg_weight,
+                    branch_factor=self.branch_factor,
+                    use_reward_return=self.use_reward_return,
+                )
                 if discounted_return > best_score:
                     best_score = discounted_return
                     best_var   = int(cand)
