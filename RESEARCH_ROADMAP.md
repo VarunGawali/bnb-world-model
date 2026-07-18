@@ -72,8 +72,22 @@ Headline ablation:
 Result to report: **node-count reduction vs. SCIP pseudocost**, with the
 ablation isolating the contribution of the latent rollout.
 
-Status / gaps: no trained weights yet; `bnb_wm/data/` module not built;
-subtree-size labels must be added to data collection (recipe in `CHANGES.md`).
+Status / gaps: no trained weights yet; `bnb_wm/data/` module not built.
+
+Subtree-size head — GATED OFF for AAAI. The collected `SC-easy` traces
+(`data_with_cuts/`) use SCIP's default best-first node order, not DFS, so exact
+`subtree_size` labels cannot be derived from `depths` (verified:
+`is_DFS_preorder = False`, e.g. depths `...5, 6, 3, 2, 4...`). `size_weight` is
+set to 0, so the headline result is the **value-based** latent rollout ablation
+(policy-only → +1-step → +3-step). The head stays in the codebase for a future
+run with DFS-ordered collection or recorded tree ids.
+
+The collected `.npz` schema (confirmed): `n_steps, var_features, con_features,
+edge_indices, edge_values, action_sets, branching_vars, local_branching_label,
+dual_bounds, norm_dual_bounds, next_is_leaf, depths, cut_features, cut_labels,
+cut_scores, cut_lhs, cut_rhs, n_cuts`. Matches the training-code expectations;
+`cut_scores` is an extra field (likely SCIP's native cut scores — a better
+Phase-5 label than the violation proxy).
 
 ---
 

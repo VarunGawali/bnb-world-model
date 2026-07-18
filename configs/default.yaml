@@ -50,7 +50,11 @@ solver:
   lookahead_k: 3             # candidates evaluated with dynamics lookahead
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
-  size_weight: 1.0           # penalty on predicted subtree size in rollout score
+  # Predicted-subtree-size penalty. GATED OFF (0.0): the collected traces use
+  # SCIP's default (non-DFS) node order, so exact subtree_size labels cannot be
+  # derived from `depths` (see bnb_wm/data/labels.py) and the SubtreeSizeHead is
+  # untrained. Set >0 only with DFS-ordered collection or explicit tree ids.
+  size_weight: 0.0
 
 benchmark:
   n_instances: 10
@@ -59,4 +63,4 @@ benchmark:
   lookahead_k: 5             # candidates for dynamics lookahead in benchmark
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
-  size_weight: 1.0           # penalty on predicted subtree size in rollout score
+  size_weight: 0.0           # gated off: non-DFS traces (see solver.size_weight)

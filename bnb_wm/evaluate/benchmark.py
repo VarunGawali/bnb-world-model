@@ -37,8 +37,10 @@ _LOOKAHEAD_K = 5
 _LOOKAHEAD_DEPTH = 3
 # Discount factor per lookahead step
 _LOOKAHEAD_GAMMA = 0.95
-# Weight on the predicted-subtree-size penalty in the rollout score
-_SIZE_WEIGHT = 1.0
+# Weight on the predicted-subtree-size penalty in the rollout score.
+# Gated off (0.0): traces use SCIP's non-DFS node order, so subtree_size labels
+# are not derivable and the SubtreeSizeHead is untrained. Value rollout only.
+_SIZE_WEIGHT = 0.0
 # Integrality probability threshold above which lookahead is skipped
 _LEAF_PROB_SKIP = 0.8
 
