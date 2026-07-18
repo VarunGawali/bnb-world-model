@@ -11,15 +11,16 @@ model:
 
 training:
   # Epoch numbers are CAPS, not fixed durations: early stopping (patience below)
-  # halts each phase when val stops improving and the best checkpoint is kept,
-  # so these can be set generously for the 2-day budget without overfitting.
-  epochs_phase1: 80     # policy head
-  epochs_phase2: 60     # value head
-  epochs_phase3: 80     # dynamics Transformer
+  # halts each phase when val stops improving and the best checkpoint is kept.
+  # Modest caps keep worst-case runtime bounded; raise them if a phase is still
+  # improving when it hits the cap (i.e. it ends without an "Early stop" line).
+  epochs_phase1: 30     # policy head
+  epochs_phase2: 25     # value head
+  epochs_phase3: 30     # dynamics Transformer
   overshoot_depth: 3    # Phase 3 latent-overshooting horizon (0 = one-step only)
-  epochs_phase4: 60     # joint fine-tuning
-  epochs_phase5: 50     # cut selection head
-  patience: 10          # early-stop after this many epochs without val improvement
+  epochs_phase4: 25     # joint fine-tuning
+  epochs_phase5: 20     # cut selection head
+  patience: 6           # early-stop after this many epochs without val improvement
   batch_size: 64
   lr_phase1: 1.0e-3
   lr_phase2: 5.0e-4
