@@ -167,14 +167,15 @@ class TransitionDataset(Dataset):
 
         # n_frac from sol_frac (Ecole var feature idx 14), falling back to none.
         if vf.shape[1] > 14:
-            n_frac = int((np.asarray(vf[:, 14]) > 0.05).sum())
+            n_frac = int((np.asarray(vf[:, 14], dtype=np.float32) > 0.05).sum())
         else:
             n_frac = 0
 
         meta = {
             "n_vars":      n_vars,
-            "action_set":  torch.as_tensor(np.asarray(d["action_sets"][t]),
-                                           dtype=torch.long),
+            "action_set":  torch.as_tensor(
+                np.asarray(d["action_sets"][t], dtype=np.int64),
+                dtype=torch.long),
             "local_label": int(d["local_branching_label"][t]),
             "norm_db":     float(d["norm_dual_bounds"][t]),
             "is_leaf":     float(d["next_is_leaf"][t]),
