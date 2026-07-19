@@ -106,8 +106,13 @@ def main():
     files = list_trajectory_files(data_root)
     if not files:
         raise SystemExit(f"No traj_*.npz files found under {data_root}")
-    if args.max_files:
-        files = files[: args.max_files]
+    if args.max_files and args.max_files < len(files):
+        # Sample a RANDOM subset, not the sorted prefix: the files sort by tier
+        # (SC-easy < SC-hard < SC-medium), so a prefix would be one difficulty
+        # only. A seeded shuffle keeps the subset representative across tiers.
+        import numpy as np
+        idx = np.random.default_rng(0).permutation(len(files))[: args.max_files]
+        files = [files[i] for i in sorted(idx)]
     tr_files, va_files, _ = split_files(
         files,
         cfg["data"]["train_split"], cfg["data"]["val_split"],
