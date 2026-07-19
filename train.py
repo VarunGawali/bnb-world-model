@@ -85,7 +85,12 @@ def main():
                     help="load cut fields and enable Phase 5")
     ap.add_argument("--max_files", type=int, default=None,
                     help="cap number of trajectory files (fast experiments)")
-    ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--num_workers", type=int, default=0,
+                    help="DataLoader workers for the transition loaders "
+                         "(parallel data loading; Phase 3 always uses 0)")
+    ap.add_argument("--max_epochs", type=int, default=None,
+                    help="cap every phase's epochs at this value (fast checks / "
+                         "budget control); overrides the config caps when lower")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -114,6 +119,10 @@ def main():
     tcfg = cfg["training"]
     bs = tcfg["batch_size"]
 
+    def epochs_of(key):
+        e = tcfg[key]
+        return min(e, args.max_epochs) if args.max_epochs else e
+
     def transition_loader(file_list, shuffle):
         ds = TransitionDataset(file_list, with_cuts=args.with_cuts)
         return DataLoader(ds, batch_size=bs, shuffle=shuffle,
@@ -140,7 +149,7 @@ def main():
         trainer.train_policy(
             transition_loader(tr_files, True),
             transition_loader(va_files, False),
-            epochs=tcfg["epochs_phase1"], lr=tcfg["lr_phase1"],
+            epochs=epochs_of("epochs_phase1"), lr=tcfg["lr_phase1"],
             patience=patience,
         )
         reload_best(model, ckpt_dir, 1, device)
@@ -151,7 +160,7 @@ def main():
         trainer.train_value(
             transition_loader(tr_files, True),
             transition_loader(va_files, False),
-            epochs=tcfg["epochs_phase2"], lr=tcfg["lr_phase2"],
+            epochs=epochs_of("epochs_phase2"), lr=tcfg["lr_phase2"],
             patience=patience,
         )
         reload_best(model, ckpt_dir, 2, device)
@@ -170,7 +179,7 @@ def main():
         trainer.train_dynamics(
             sequence_loader(tr_files, True),
             sequence_loader(va_files, False),
-            epochs=tcfg["epochs_phase3"], lr=tcfg["lr_phase3"],
+            epochs=epochs_of("epochs_phase3"), lr=tcfg["lr_phase3"],
             overshoot_depth=tcfg.get("overshoot_depth", 0),
             patience=patience,
         )
@@ -182,7 +191,7 @@ def main():
         trainer.train_joint(
             transition_loader(tr_files, True),
             transition_loader(va_files, False),
-            epochs=tcfg["epochs_phase4"], lr=tcfg["lr_phase4"],
+            epochs=epochs_of("epochs_phase4"), lr=tcfg["lr_phase4"],
             pos_weight=leaf_pw, patience=patience,
         )
         reload_best(model, ckpt_dir, 4, device)
@@ -196,7 +205,7 @@ def main():
             trainer.train_cuts(
                 transition_loader(tr_files, True),
                 transition_loader(va_files, False),
-                epochs=tcfg["epochs_phase5"], lr=tcfg["lr_phase5"],
+                epochs=epochs_of("epochs_phase5"), lr=tcfg["lr_phase5"],
                 pos_weight=cut_pw, patience=patience,
             )
             reload_best(model, ckpt_dir, 5, device)
