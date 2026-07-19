@@ -32,7 +32,16 @@ from pathlib import Path
 
 import yaml
 import torch
+import torch.multiprocessing as _mp
 from torch.utils.data import DataLoader
+
+# Avoid "received 0 items of ancdata" (file-descriptor exhaustion) when many
+# DataLoader workers share tensors — common with --with_cuts and large batches.
+# The file_system strategy shares via /dev/shm files instead of FDs.
+try:
+    _mp.set_sharing_strategy("file_system")
+except Exception:
+    pass
 
 from bnb_wm.model.world_model import BnBWorldModel
 from bnb_wm.training.trainer import Trainer
