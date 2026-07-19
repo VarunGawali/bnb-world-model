@@ -91,6 +91,9 @@ def main():
     ap.add_argument("--max_epochs", type=int, default=None,
                     help="cap every phase's epochs at this value (fast checks / "
                          "budget control); overrides the config caps when lower")
+    ap.add_argument("--batch_size", type=int, default=None,
+                    help="override training.batch_size (lower it to fit GPU "
+                         "memory on large instances / a shared GPU)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -122,7 +125,7 @@ def main():
           f"{len(va_files)} val")
 
     tcfg = cfg["training"]
-    bs = tcfg["batch_size"]
+    bs = args.batch_size or tcfg["batch_size"]
 
     def epochs_of(key):
         e = tcfg[key]
