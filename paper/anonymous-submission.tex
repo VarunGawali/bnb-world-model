@@ -34,7 +34,7 @@
 }
 
 % ---------------------------------------------------------------------------
-\title{Learning to Branch by Imagining:\\ A World Model for Branch-and-Bound}
+\title{Learning to Branch and Cut by Imagining:\\ A World Model for Branch-and-Cut Search}
 \author{Anonymous Submission}
 \affiliations{Anonymous Affiliation}
 % ---------------------------------------------------------------------------
@@ -43,151 +43,211 @@
 \maketitle
 
 \begin{abstract}
-Branch-and-Bound (B\&B) is the core of exact Mixed-Integer Programming solvers,
-and its efficiency hinges on variable selection. Strong branching yields
-excellent decisions but is prohibitively expensive, solving child linear
-programs (LPs) for every candidate; learned branchers imitate it cheaply, yet
-score each candidate from the current node alone, with no model of the subtree
-a decision induces. We introduce a \emph{world model} for B\&B: a learned
-latent dynamics model that simulates the consequences of a branching decision
-in latent space, approximating strong branching's subtree evaluation without
-solving any LPs. A bipartite graph encoder maps each node to a latent state,
-and a causal Transformer predicts future latent states together with
-per-variable embeddings, enabling multi-step, tree-structured rollouts in which
-the policy is re-applied to imagined states. Candidates are scored by a
-MuZero-style return that combines a learned per-step reward with a cost-to-go
-value directly estimating remaining tree size. The same world model
-additionally guides node and cut selection while preserving optimality. We
-evaluate on Set Cover across difficulty tiers, measuring node-count reduction
-against a strong solver baseline and ablating each planning component.
+Modern solvers for Mixed-Integer Programming rely on Branch-and-Cut, which
+interleaves two heuristic decisions at every node of the search tree: which
+cutting planes to add in order to tighten the linear-programming (LP)
+relaxation, and which fractional variable to branch on. Both decisions are
+costly to make well---strong branching, for example, evaluates every candidate
+by solving its child LPs---and recent learning-based methods have addressed
+each of them in isolation, scoring candidates only from the state of the current
+node. We introduce a \emph{world model} for Branch-and-Cut: a learned latent
+dynamics model that lets the solver \emph{imagine} the downstream consequences
+of a decision rather than computing them with LP solves. A bipartite graph
+encoder maps each node to a latent state, and a causal Transformer predicts how
+that state, together with the embeddings of the individual variables within it,
+evolves after an action. This makes it possible to roll a decision several steps
+forward in latent space and evaluate the branching sequence it induces. Each
+candidate is scored by a MuZero-style return that combines a learned per-step
+reward with a cost-to-go value estimating the remaining size of the tree. The
+same world model also selects globally valid cutting planes that it propagates
+across the subtree, chooses branching variables, and orders the open nodes, all
+while leaving the solver's optimality guarantee intact. We evaluate on Set Cover
+across difficulty tiers, measuring the reduction in explored nodes relative to a
+strong solver baseline and ablating each component of the planner.
 \end{abstract}
 
 % ---------------------------------------------------------------------------
 \section{Introduction}
 
-Mixed-Integer Programming (MIP) underpins a vast range of decision problems,
-and modern solvers attack it with Branch-and-Bound (B\&B), recursively
-partitioning the search space and pruning with linear-programming (LP) bounds.
-The efficiency of B\&B is dominated by \emph{variable selection}---which
-fractional variable to branch on at each node---because that choice determines
-how quickly the tree closes. \emph{Strong branching} makes near-optimal choices
-by tentatively solving the child LPs of every candidate and picking the one with
-the largest bound improvement, but its per-node cost makes it impractical as the
-default rule.
+Mixed-Integer Programming (MIP) is a workhorse for combinatorial decision
+making, and modern solvers attack it with Branch-and-Cut. Starting from the LP
+relaxation of a problem, the solver repeatedly does two things at each node of
+a search tree: it adds \emph{cutting planes}---valid inequalities that tighten
+the relaxation without removing any integer solution---and, when the relaxation
+remains fractional, it \emph{branches}, splitting the problem on a fractional
+variable. The number of nodes the solver must explore before it can prove
+optimality is governed almost entirely by how well these two decisions are
+made.
 
-A now-standard remedy is to \emph{learn} a branching policy that imitates strong
-branching with a graph neural network (GNN), amortizing its cost into a single
-cheap forward pass \citep{gasse2019exact,khalil2016learning}. These methods are
-effective, but they share a structural limitation: they score each candidate
-\emph{from the current node alone}. The very signal that makes strong branching
-powerful---the quality of the \emph{subtree} a decision induces---is discarded
-and replaced by a one-shot ranking.
+Unfortunately, making them well is expensive. The gold standard for branching,
+\emph{strong branching}, tentatively solves the child LPs of every candidate
+variable and keeps the one that improves the bound the most; cut selection
+faces an analogous trade-off between the many valid inequalities that could be
+added at a node. A now-common response is to \emph{learn} these decisions:
+graph neural networks trained to imitate strong branching amortize its cost into
+a single cheap forward pass \citep{gasse2019exact,khalil2016learning}, and
+reinforcement learning has been used to select cutting planes
+\citep{tang2020reinforcement}. These methods are effective, but they share a
+structural limitation. Each scores a candidate \emph{from the current node
+alone}, discarding the very signal that makes strong branching powerful---the
+quality of the subtree that a decision ultimately produces---and replacing it
+with a one-shot ranking.
 
-We argue that this gap is naturally filled by a \emph{world model}: a learned
-model of the search dynamics that lets the brancher \emph{imagine} the
-consequences of a decision instead of computing them with LP solves. Concretely,
-we encode each B\&B node into a latent state and train a causal Transformer to
-predict how that latent state---and the per-variable embeddings within it---
-evolve after a branching action. At inference, for each candidate we roll the
-dynamics forward several steps in latent space, re-applying the policy to the
-\emph{predicted} states to simulate a branching \emph{sequence}, and score the
-candidate by a cost-to-go value that directly estimates the remaining number of
-nodes. This is the same principle behind model-based planning agents such as
-MuZero and Dreamer \citep{schrittwieser2020mastering,hafner2020dream}, brought to
-the solver's search. Crucially, the model influences only search order and
-heuristic choices, so exactness is preserved.
+We argue that this gap is naturally closed by a \emph{world model}: a learned
+model of the search dynamics that lets the solver \emph{imagine} the
+consequences of a decision instead of paying for them with LP solves. We encode
+each node of the search as a latent state and train a causal Transformer to
+predict how that state, and the embeddings of the individual variables it
+contains, evolve after an action is taken. Because the model predicts
+per-variable embeddings and not only a summary vector, the branching policy can
+be re-applied to an \emph{imagined} state, allowing us to unroll a whole
+branching sequence in latent space and judge a candidate by the future it leads
+to. Candidates are scored by a MuZero-style return that adds a learned per-step
+reward along the rollout to a cost-to-go value estimating how many nodes remain.
+The same latent model drives the solver's other discrete choices: it scores
+candidate cutting planes against the node embedding and selects the ones worth
+adding, and it orders the frontier of open nodes by predicted remaining work.
+Throughout, the model influences only which decisions the solver makes and in
+what order, never the bounds or feasibility tests themselves, so exactness is
+preserved. This is the same principle behind model-based planning agents such as
+MuZero and Dreamer \citep{schrittwieser2020mastering,hafner2020dream}, here
+brought to the interior of an optimization solver.
 
-\paragraph{Contributions.}
-(i) A latent \emph{world model} that plans branching decisions by simulating
-subtree consequences without LP solves.
-(ii) A \emph{cost-to-go} value that targets node count directly and is trainable
-without depth-first-ordered traces.
-(iii) A grounded, MuZero-style latent rollout (per-step reward plus value
-bootstrap, with latent overshooting) that keeps multi-step predictions faithful.
-(iv) A single model that drives branching, node selection, and cut selection
-while preserving optimality.
-(v) An ablation quantifying each planning component's contribution to node
-reduction.
+Our contributions are as follows. We introduce a latent world model that plans
+Branch-and-Cut decisions by simulating their consequences in latent space
+rather than through LP solves. We show that a single such model can drive
+branching, node selection, and the selection of globally valid cutting planes
+that are propagated across the subtree, while preserving optimality. We propose
+a cost-to-go value that targets the solver's true objective---the number of
+nodes explored---and that can be trained directly from collected traces without
+requiring them to be depth-first ordered. We stabilize the multi-step rollout
+with a grounded, MuZero-style objective that combines a per-step reward, a value
+bootstrap, and latent overshooting. Finally, we present an ablation that isolates
+the contribution of each planning component to the reduction in explored nodes.
 
 % ---------------------------------------------------------------------------
 \section{Related Work}
 
-\textbf{Learning to branch.} \citet{khalil2016learning} learn branching scores
-from strong-branching labels; \citet{gasse2019exact} cast the node as a bipartite
-graph and train a GNN, the backbone we build on. \citet{nair2020solving} scale
-neural MIP solving with learned diving and branching. \citet{scavuzzo2022learning}
-use reinforcement learning with tree-structured returns.
-\textbf{Learning to cut / search.} Learned cut selection and learned large
-neighborhood search \citep{sonnerat2021learning} target other solver decisions.
-\textbf{World models and planning.} MuZero \citep{schrittwieser2020mastering} and
-Dreamer/PlaNet \citep{hafner2020dream} plan in a learned latent model; latent
-overshooting stabilizes multi-step prediction. Our contribution is to bring
-latent-space planning to B\&B variable selection: unlike prior learned branchers,
-we score candidates by \emph{simulated} subtree quality rather than a current-node
-ranking.
+Learning to make solver decisions is an active area \citep{bengio2021machine}.
+For branching, \citet{khalil2016learning} learn scores from strong-branching
+labels, and \citet{gasse2019exact} represent a node as a bipartite
+constraint--variable graph and train a graph convolutional network to imitate
+strong branching; the latter architecture is the backbone we build on.
+\citet{nair2020solving} scale neural MIP solving with learned diving and
+branching, and \citet{scavuzzo2022learning} train a branching policy with
+reinforcement learning using tree-structured returns. For cutting planes,
+\citet{tang2020reinforcement} cast cut selection as a sequential decision
+problem and learn it with reinforcement learning, and learned large neighborhood
+search \citep{sonnerat2021learning} targets yet another solver decision. All of
+these methods evaluate a candidate from the state of the current node.
+
+Our work is closer in spirit to model-based reinforcement learning. MuZero
+\citep{schrittwieser2020mastering} plans with a learned dynamics model that is
+never grounded in reconstructed observations, while Dreamer and its predecessors
+\citep{hafner2020dream} learn behaviors by imagination in a latent space, using
+latent overshooting to keep multi-step predictions faithful. We bring this style
+of latent-space planning inside a Branch-and-Cut solver: rather than ranking
+candidates by a static score, we simulate the subtree a decision induces and
+select the candidate whose imagined future is best, and we do so for cutting
+planes and node selection as well as for branching.
 
 % ---------------------------------------------------------------------------
 \section{Method}
 
-\subsection{Node encoding}
-Each B\&B node is represented as a bipartite constraint--variable graph with
-LP-derived features. A GNN with GATv2 attention \citep{brody2022how} and edge
-features performs two-directional message passing and a learned attention readout,
-producing per-variable embeddings $h_i$ and a graph latent $z$.
+\subsection{Representing a search node}
+We represent each node of the Branch-and-Cut tree as a bipartite graph whose two
+sides are the constraints and the variables of the current relaxation, with
+edges carrying the corresponding coefficients and nodes carrying LP-derived
+features such as solution values, reduced costs, and bound information. A graph
+neural network with GATv2 attention \citep{brody2022how} performs message
+passing in both directions and applies a learned attention-based readout,
+producing an embedding $h_i$ for every variable together with a single latent
+vector $z$ summarizing the whole node.
 
-\subsection{Latent dynamics}
-A causal Transformer treats the trajectory as a token sequence
-$\mathrm{token}_t = \mathrm{Linear}([z_t \,\|\, a_t])$, where $a_t$ is the chosen
-variable's embedding, and predicts the next latent $z_{t+1}$. A per-variable head
-additionally predicts $h_i^{t+1}$, so the policy can be re-applied to a predicted
-state. The dynamics is \emph{grounded} by an auxiliary head predicting the next
-dual bound, and trained both by teacher forcing and by \emph{latent overshooting}
-(autoregressive $k$-step rollout supervised against real future latents).
+\subsection{A latent dynamics model}
+The core of our method is a causal Transformer that models how the latent state
+evolves as the solver acts. We treat a trajectory through the tree as a sequence
+of tokens, each formed from the current node latent $z_t$ and an embedding of the
+action taken, and train the Transformer to predict the next latent $z_{t+1}$.
+Crucially, a companion head predicts the next per-variable embeddings as well, so
+that the branching policy can later be applied to a state the model has
+\emph{imagined}. We keep these predictions faithful over multiple steps in two
+ways: the latent is \emph{grounded} by an auxiliary head that predicts the node's
+dual bound, tying it to a real solver quantity, and the model is trained not only
+by teacher forcing but also by \emph{latent overshooting}, in which it is unrolled
+several steps from its own predictions and supervised against the true future
+latents.
 
 \subsection{Value and reward}
-A cost-to-go head predicts $\log(1+\text{remaining nodes})$, trained on the
-Monte-Carlo return $n_\text{steps}-t$ read directly from each trajectory (no
-depth-first ordering required). A reward head predicts the per-step dual-bound
-improvement, enabling a MuZero-style return
-$\sum_t \gamma^t r_t + \gamma^k V(\text{leaf})$.
+Because the quantity we ultimately care about is how many nodes the solver
+explores, we train a cost-to-go head to predict the number of remaining nodes,
+in logarithmic scale. Its target is a Monte-Carlo return read directly off each
+collected trajectory---the number of steps still to come---which, conveniently,
+requires no assumption that the trajectory was generated in depth-first order. A
+separate reward head predicts the improvement in the dual bound produced by a
+single step, which lets us score a rollout with a MuZero-style return that adds
+discounted per-step rewards along the imagined path to a value estimate at its
+end.
 
-\subsection{Planning rollout for candidate selection}
-For each top-$k$ candidate, we roll the dynamics forward: predict $(z,h)$,
-re-apply the policy to select the next action, and expand a shallow branching
-tree, scoring the candidate by the (reward + value) return minus the predicted
-cost-to-go. The candidate with the best score is branched on. The same
-cost-to-go value orders the open-node frontier (learned node selection), and a
-pointer head selects globally valid cuts.
+\subsection{Cutting-plane selection}
+At each eligible node the solver generates a pool of candidate cutting planes. We
+use pairwise Chv\'atal--Gomory intersection cuts, which for a covering problem
+such as Set Cover take the form of a valid inequality over the shared support of
+two tight constraints. These cuts are \emph{globally valid}: they hold for every
+integer-feasible solution regardless of the branching decisions above them, so
+they can be safely inherited by all descendants of the node at which they are
+generated---this is genuine Branch-and-Cut rather than cut-and-branch. A pointer
+network scores each candidate cut against the node embedding $z$ and selects the
+subset worth adding, replacing the fixed heuristics (maximum violation, minimum
+density) that solvers use by default.
+
+\subsection{Planning at inference}
+To choose a branching variable, we take the policy's top candidates and, for
+each, roll the dynamics forward: the model predicts the next latent state and
+per-variable embeddings, the policy is re-applied to that imagined state to
+choose the next action, and a shallow branching tree is expanded in this way. The
+candidate whose rollout yields the best return---discounted reward plus value,
+minus the predicted cost-to-go---is the one we branch on. The same machinery
+serves the solver's other choices: the cost-to-go value orders the frontier of
+open nodes so that the most promising subtree is explored first, and the
+cutting-plane head selects globally valid cuts to propagate downward.
 
 \subsection{Training}
-A five-phase curriculum trains policy (imitation), value, dynamics
-(+overshooting, grounding), a joint fine-tune (adding cost-to-go and a
-value-consistency term so the value head reads predicted latents in
-distribution), and cut selection. Class imbalance in the leaf and cut labels is
-corrected with per-loss \texttt{pos\_weight}; early stopping selects the best
-checkpoint per phase.
+The components are trained in a curriculum. We first fit the branching policy by
+imitation of strong branching, then the value head, then the dynamics model with
+its grounding and overshooting objectives, followed by a joint fine-tuning stage
+that also trains the cost-to-go head and enforces that the value head reads
+imagined latents consistently with real ones. A final stage trains the
+cutting-plane head to imitate a cut-quality signal. Class imbalance in the
+leaf-detection and cut-selection labels is corrected with a positive-class
+weighting, and early stopping selects the best checkpoint in each stage.
 
 % ---------------------------------------------------------------------------
 \section{Experiments}
 
 \subsection{Setup}
 We evaluate on Set Cover instances generated with Ecole
-\citep{prouvost2020ecole} across easy/medium/hard tiers, collecting
-strong-branching trajectories for training. \textbf{Baselines:} SCIP pseudocost
-branching and random branching. \textbf{Metric:} number of explored B\&B nodes
-(the solver's cost), with wall-clock time as a secondary measure.
+\citep{prouvost2020ecole} across easy, medium, and hard difficulty tiers, and we
+collect strong-branching trajectories for training. Our primary baseline is the
+SCIP solver with its default pseudocost branching; we also compare against random
+branching. Because the size of the search tree is what determines a solver's
+cost, our primary metric is the number of explored nodes, with wall-clock time
+reported as a secondary measure.
 
 \subsection{Ablation}
-We ablate the planning components: policy-only $\to$ $+$value rollout $\to$
-$+$cost-to-go $\to$ $+$tree rollout $\to$ $+$MuZero return $\to$ $+$learned node
+To understand where any improvement comes from, we ablate the planner one
+component at a time, starting from the imitation policy alone and successively
+enabling the value-based rollout, the cost-to-go objective, the tree-structured
+rollout, the reward-based return, learned node selection, and learned cut
 selection.
 
 \subsection{Results}
 % [TODO: insert results once training completes.]
-Table~\ref{tab:main} reports node-count reduction versus SCIP pseudocost
-branching. Following the reproducibility guidelines, results are reported as
-mean~$\pm$~std over multiple seeds / a held-out instance set, and improvements
-are assessed with a Wilcoxon signed-rank test on paired per-instance node counts.
+Table~\ref{tab:main} reports the reduction in explored nodes relative to SCIP
+pseudocost branching. Following standard reproducibility guidance, we report
+results as a mean with standard deviation over a held-out instance set and assess
+each improvement with a Wilcoxon signed-rank test on the paired per-instance node
+counts.
 
 \begin{table}[t]
 \centering
@@ -195,28 +255,33 @@ are assessed with a Wilcoxon signed-rank test on paired per-instance node counts
 \toprule
 Method & Nodes & vs.\ SCIP & $p$ \\
 \midrule
-SCIP pseudocost & -- & -- & -- \\
-GNN policy only  & -- & -- & -- \\
-$+$ value rollout & -- & -- & -- \\
-$+$ cost-to-go    & -- & -- & -- \\
-$+$ tree rollout  & -- & -- & -- \\
+SCIP pseudocost      & -- & -- & -- \\
+Learned policy only  & -- & -- & -- \\
+\ + value rollout    & -- & -- & -- \\
+\ + cost-to-go       & -- & -- & -- \\
+\ + tree rollout     & -- & -- & -- \\
+\ + learned cuts     & -- & -- & -- \\
 \bottomrule
 \end{tabular}
-\caption{Node-count reduction and paired significance. [Placeholder.]}
+\caption{Reduction in explored nodes and paired significance. [Placeholder;
+filled once training completes.]}
 \label{tab:main}
 \end{table}
 
 \subsection{Reproducibility}
-Experiments ran on NVIDIA Quadro RTX 5000 (16\,GB) GPUs (CUDA 13.2) with PyTorch
-and PyTorch Geometric; seeds, hyperparameters, and full source are provided.
+Experiments were run on NVIDIA Quadro RTX 5000 (16\,GB) GPUs under CUDA~13.2,
+using PyTorch and PyTorch Geometric. All seeds, hyperparameters, and source code
+are provided.
 
 % ---------------------------------------------------------------------------
 \section{Conclusion}
-We presented a world model for Branch-and-Bound that plans branching decisions
-in latent space, approximating strong branching's subtree evaluation without LP
-solves. Branch selection is one instantiation of latent planning for
-optimization; extending the world model to improvement search (e.g.\ large
-neighborhood search) is a promising direction.
+We have presented a world model for Branch-and-Cut that plans the solver's
+discrete decisions---branching, node selection, and the selection of globally
+valid cutting planes---by imagining their consequences in latent space rather
+than computing them with LP solves, all while preserving the solver's optimality
+guarantee. Planning inside the search tree is only one way a world model can
+serve optimization; extending the same idea to improvement search, such as
+learned large neighborhood search, is a natural next step.
 
 % ---------------------------------------------------------------------------
 \bibliographystyle{aaai2027}
