@@ -154,73 +154,131 @@ planes and node selection as well as for branching.
 % ---------------------------------------------------------------------------
 \section{Method}
 
-\subsection{Representing a search node}
-We represent each node of the Branch-and-Cut tree as a bipartite graph whose two
-sides are the constraints and the variables of the current relaxation, with
-edges carrying the corresponding coefficients and nodes carrying LP-derived
-features such as solution values, reduced costs, and bound information. A graph
-neural network with GATv2 attention \citep{brody2022how} performs message
-passing in both directions and applies a learned attention-based readout,
-producing an embedding $h_i$ for every variable together with a single latent
-vector $z$ summarizing the whole node.
+We view Branch-and-Cut as a sequential decision process. At each node $t$ of the
+search the solver observes a state $s_t$ (the current relaxation), takes an action
+$a_t$ (branch on a fractional variable, or add a cut), and transitions to the next
+node. We learn (i) an encoder that maps $s_t$ to a latent state, (ii) a dynamics
+model that predicts how that latent evolves under an action, and (iii) heads that
+score decisions by rolling the dynamics forward. Throughout, $d$ denotes the
+embedding dimension.
 
-\subsection{A latent dynamics model}
-The core of our method is a causal Transformer that models how the latent state
-evolves as the solver acts. We treat a trajectory through the tree as a sequence
-of tokens, each formed from the current node latent $z_t$ and an embedding of the
-action taken, and train the Transformer to predict the next latent $z_{t+1}$.
-Crucially, a companion head predicts the next per-variable embeddings as well, so
-that the branching policy can later be applied to a state the model has
-\emph{imagined}. We keep these predictions faithful over multiple steps in two
-ways: the latent is \emph{grounded} by an auxiliary head that predicts the node's
-dual bound, tying it to a real solver quantity, and the model is trained not only
-by teacher forcing but also by \emph{latent overshooting}, in which it is unrolled
-several steps from its own predictions and supervised against the true future
-latents.
+\subsection{Node encoder}
+Each node is a bipartite graph over the constraints and variables of the
+relaxation: variable nodes carry LP-derived features (solution value, reduced
+cost, bound and basis status), constraint nodes carry their features, and each
+edge carries its coefficient. A graph network with GATv2 attention
+\citep{brody2022how} performs two-directional message passing, and a learned
+attention readout pools the result:
+\begin{equation}
+\big(\{h_i\}_{i=1}^{n},\, z\big) = \mathrm{Enc}(s_t),
+\qquad h_i, z \in \mathbb{R}^{d},
+\end{equation}
+where $h_i$ is the embedding of variable $i$ and $z$ is a graph-level summary.
+The embedding of an action that branches on variable $v$ is $a = h_v$.
 
-\subsection{Value and reward}
-Because the quantity we ultimately care about is how many nodes the solver
-explores, we train a cost-to-go head to predict the number of remaining nodes,
-in logarithmic scale. Its target is a Monte-Carlo return read directly off each
-collected trajectory---the number of steps still to come---which, conveniently,
-requires no assumption that the trajectory was generated in depth-first order. A
-separate reward head predicts the improvement in the dual bound produced by a
-single step, which lets us score a rollout with a MuZero-style return that adds
-discounted per-step rewards along the imagined path to a value estimate at its
-end.
+\subsection{Latent dynamics}
+A causal Transformer models the evolution of the latent along a trajectory. From
+the sequence of tokens $u_\tau = W_{\mathrm{in}}[z_\tau \,\|\, a_\tau]$
+($\tau \le t$) with learned positional encodings, it predicts the next graph
+latent, while a per-variable head predicts how each variable embedding changes:
+\begin{align}
+z_{t+1} &= W_{\mathrm{out}}\,\mathrm{TF}(u_{0:t}), \\
+h_i^{\,t+1} &= \mathrm{LN}\!\big(h_i^{\,t} + \mathrm{MLP}([\,h_i^{\,t}\,\|\,z_{t+1}\,\|\,a_t\,])\big).
+\label{eq:varupdate}
+\end{align}
+Predicting per-variable embeddings~\eqref{eq:varupdate}, rather than only the
+graph summary $z$, is what lets the branching policy be re-applied to an
+\emph{imagined} state during planning. We ground the latent with a linear head
+$\hat b_{t+1}=w_b^\top z_{t+1}$ that predicts the node's normalized dual bound,
+tying it to a real solver quantity, and a reward head
+$\hat r_{t}=w_r^\top z_{t+1}$ that predicts the per-step dual-bound improvement.
+
+\subsection{Value, cost-to-go, and policy}
+Let $\bar h_{\mathrm{frac}}$ be the mean embedding of the currently fractional
+variables. The value and cost-to-go heads share this enriched input:
+\begin{align}
+V(z) &= \mathrm{MLP}_V([z \,\|\, \bar h_{\mathrm{frac}}]), \\
+C(z) &= \mathrm{softplus}\big(\mathrm{MLP}_C([z \,\|\, \bar h_{\mathrm{frac}}])\big),
+\end{align}
+where $C$ predicts $\log(1+\text{remaining nodes})$. Its regression target is the
+Monte-Carlo return $T-t$ read directly off a length-$T$ trajectory---the number of
+steps still to come---which requires \emph{no} assumption that the trajectory is
+depth-first ordered, unlike a subtree-size target. The branching policy is a
+pointer network scoring each variable against the graph latent,
+$\pi(v)\!\propto\! w^\top\!\tanh(W_k h_v + W_z z)$.
+
+\subsection{Planning rollout for candidate selection}
+To branch, we take the policy's top-$k$ candidates and score each by imagining the
+subtree it induces. Starting from the current $(z,\{h_i\})$ with first action
+$a=h_c$, we unroll the dynamics for $K$ steps, re-applying the policy to each
+predicted state to choose the next action
+$v_j=\arg\max_{v\in\mathcal{F}}\pi(v\mid z_j,\{h^j\})$ over the fractional set
+$\mathcal{F}$. The candidate is scored by a MuZero-style return that accumulates
+predicted rewards along the imagined path, bootstraps with the value at the leaf,
+and penalizes predicted remaining work:
+\begin{equation}
+R(c) = \sum_{j=1}^{K}\gamma^{\,j-1}\hat r_j \;+\; \gamma^{\,K-1}V(z_K)
+       \;-\; w_c\sum_{j=1}^{K}\gamma^{\,j-1}\hat C(z_j).
+\label{eq:return}
+\end{equation}
+We expand a shallow tree of branching factor $b$ (the top-$b$ actions at each
+step, child returns averaged); $b\!=\!1$ recovers a single greedy rollout. We
+branch on $c^\star=\arg\max_c R(c)$. The same value drives \emph{node selection}:
+open nodes are ordered by ascending predicted cost-to-go $C(z)$, so the subtree
+expected to close soonest is explored first. Because these choices affect only
+search order, never the bounds or feasibility tests, exactness is preserved.
+Algorithm~\ref{alg:select} summarizes candidate selection.
+
+\begin{algorithm}[t]
+\caption{Branching-variable selection by latent rollout}
+\label{alg:select}
+\begin{algorithmic}[1]
+\State \textbf{Input:} node latent $z$, variable embeddings $\{h_i\}$,
+fractional set $\mathcal{F}$, depth $K$, factor $b$
+\State $\mathcal{C}\gets \textsc{TopK}_k\big(\pi(\cdot\mid z,\{h_i\}),\,\mathcal{F}\big)$
+\For{each candidate $c\in\mathcal{C}$}
+  \State $R(c)\gets \textsc{Rollout}(z,\{h_i\},c,K,b)$ \Comment{Eq.~\eqref{eq:return}}
+\EndFor
+\State \textbf{return} $\arg\max_{c\in\mathcal{C}} R(c)$
+\end{algorithmic}
+\end{algorithm}
 
 \subsection{Cutting-plane selection}
-At each eligible node the solver generates a pool of candidate cutting planes. We
-use pairwise Chv\'atal--Gomory intersection cuts, which for a covering problem
-such as Set Cover take the form of a valid inequality over the shared support of
-two tight constraints. These cuts are \emph{globally valid}: they hold for every
-integer-feasible solution regardless of the branching decisions above them, so
-they can be safely inherited by all descendants of the node at which they are
-generated---this is genuine Branch-and-Cut rather than cut-and-branch. A pointer
-network scores each candidate cut against the node embedding $z$ and selects the
-subset worth adding, replacing the fixed heuristics (maximum violation, minimum
-density) that solvers use by default.
-
-\subsection{Planning at inference}
-To choose a branching variable, we take the policy's top candidates and, for
-each, roll the dynamics forward: the model predicts the next latent state and
-per-variable embeddings, the policy is re-applied to that imagined state to
-choose the next action, and a shallow branching tree is expanded in this way. The
-candidate whose rollout yields the best return---discounted reward plus value,
-minus the predicted cost-to-go---is the one we branch on. The same machinery
-serves the solver's other choices: the cost-to-go value orders the frontier of
-open nodes so that the most promising subtree is explored first, and the
-cutting-plane head selects globally valid cuts to propagate downward.
+At each eligible node we generate globally valid cuts. For two tight covering
+constraints $i_1,i_2$ (rows of $A$) with shared support
+$S=\{j : A_{i_1 j}\!=\!A_{i_2 j}\!=\!1\}$, the intersection cut
+$\sum_{j\in S} x_j \ge 1$ is a Chv\'atal--Gomory inequality with multipliers
+$\tfrac{1}{2}(e_{i_1}+e_{i_2})$ rounded up. Such cuts hold for \emph{every}
+integer-feasible solution regardless of the branching above, so they are safely
+inherited by all descendants of the node that generates them---genuine
+Branch-and-Cut rather than cut-and-branch. A pointer head scores each candidate
+cut $\ell$ (with feature vector $\phi_\ell$: violation, efficacy, density,
+parallelism, objective cutoff, support fraction) against the node latent,
+$\rho_\ell = w^\top\tanh(W_k\,\mathrm{MLP}(\phi_\ell)+W_z z)$, and cuts with
+$\sigma(\rho_\ell)>\tau$ are added, replacing fixed heuristics such as maximum
+violation.
 
 \subsection{Training}
-The components are trained in a curriculum. We first fit the branching policy by
-imitation of strong branching, then the value head, then the dynamics model with
-its grounding and overshooting objectives, followed by a joint fine-tuning stage
-that also trains the cost-to-go head and enforces that the value head reads
-imagined latents consistently with real ones. A final stage trains the
-cutting-plane head to imitate a cut-quality signal. Class imbalance in the
-leaf-detection and cut-selection labels is corrected with a positive-class
-weighting, and early stopping selects the best checkpoint in each stage.
+The components are trained in a five-stage curriculum, with the objectives:
+\begin{itemize}
+  \item \textbf{Policy} (imitation): masked cross-entropy of $\pi$ against the
+  strong-branching choice over the candidate set.
+  \item \textbf{Value}: Huber loss between $V(z)$ and the normalized dual bound.
+  \item \textbf{Dynamics}: an MSE\,$+$\,cosine latent-prediction loss on
+  $z_{t+1}$; a reconstruction loss on the predicted $h_i^{\,t+1}$; grounding and
+  reward losses on $\hat b,\hat r$; and \emph{latent overshooting}---unrolling
+  $K$ steps from the model's own predictions and supervising each against the
+  real future latent---to reduce compounding error at rollout time.
+  \item \textbf{Joint fine-tuning}: the above plus the cost-to-go loss (Huber on
+  $\log(1{+}(T{-}t))$) and a value-consistency term $\lVert V(\tilde z)-V(z)\rVert^2$
+  that trains the value head to read dynamics-\emph{predicted} latents
+  $\tilde z$ in distribution.
+  \item \textbf{Cut selection}: weighted binary cross-entropy of $\rho_\ell$
+  against a cut-quality label.
+\end{itemize}
+Class imbalance in the leaf-detection and cut-selection labels is corrected with a
+positive-class weight equal to the negative/positive ratio, and early stopping on
+a validation metric selects the best checkpoint in each stage.
 
 % ---------------------------------------------------------------------------
 \section{Experiments}
