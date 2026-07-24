@@ -103,6 +103,10 @@ def main():
     ap.add_argument("--batch_size", type=int, default=None,
                     help="override training.batch_size (lower it to fit GPU "
                          "memory on large instances / a shared GPU)")
+    ap.add_argument("--init_checkpoint", default=None,
+                    help="warm-start: load these weights before the phase loop, "
+                         "e.g. to re-run only --phases 3,4 on top of an existing "
+                         "model (reuses phases 1,2). Architecture must match.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -158,6 +162,9 @@ def main():
 
     # ---- model + trainer ----
     model = build_model(cfg, device)
+    if args.init_checkpoint:
+        load_weights_only(model, args.init_checkpoint, device=device)
+        print(f"Warm-started from {args.init_checkpoint}")
     trainer = Trainer(model, device, ckpt_dir, amp=tcfg.get("amp", True))
 
     # ---- Phase 1: policy ----

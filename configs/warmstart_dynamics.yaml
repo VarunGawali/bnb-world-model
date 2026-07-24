@@ -1,0 +1,81 @@
+# warmstart_dynamics.yaml — time-efficient retrain that reuses the existing
+# policy/value and only re-trains the undertrained dynamics (Phase 3) and the
+# joint fine-tune (Phase 4). Architecture is IDENTICAL to the first run so the
+# checkpoint loads. Launch warm-started, phases 3,4 only (skip cuts):
+#
+#   CUDA_VISIBLE_DEVICES=1 python train.py --config configs/warmstart_dynamics.yaml \
+#       --init_checkpoint checkpoints/model_final.pt --phases 3,4 \
+#       --data_root "$DATA" --num_workers 8 --batch_size 32
+#
+# Phases 1,2 are skipped and inherited from the checkpoint; Phase 3 gets a much
+# larger budget (it was still improving at 10 epochs); Phase 5 (cuts) is skipped
+# because the branching benchmark does not use cuts.
+
+model:
+  hidden_dim: 128
+  n_gnn_layers: 3
+  n_gnn_heads: 4
+  n_dyn_layers: 4         # MUST match the first run for --init_checkpoint to load
+  n_dyn_heads: 4
+  max_seq: 512
+
+training:
+  epochs_phase1: 30       # (unused when running --phases 3,4)
+  epochs_phase2: 25
+  epochs_phase3: 80       # the undertrained phase — big budget, early stop trims
+  overshoot_depth: 3
+  epochs_phase4: 40
+  epochs_phase5: 20
+  patience: 10
+  batch_size: 64
+  lr_phase1: 1.0e-3
+  lr_phase2: 5.0e-4
+  lr_phase3: 5.0e-4
+  lr_phase4: 1.0e-4
+  lr_phase5: 5.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  amp: true
+
+data:
+  problem: set_cover
+  n_rows: 500
+  n_cols: 1000
+  density: 0.05
+  n_instances: 1000
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  max_train_files: null
+
+paths:
+  data_root: data/
+  checkpoint_dir: checkpoints_warm/   # separate dir; first model is preserved
+  results_dir: results/
+
+solver:
+  time_limit: 300
+  node_limit: 100000
+  gap_tolerance: 1.0e-4
+  max_cuts_per_node: 10
+  cut_score_threshold: 0.3
+  lookahead_k: 3
+  lookahead_depth: 3
+  lookahead_gamma: 0.95
+  size_weight: 0.0
+  ctg_weight: 1.0
+  branch_factor: 2
+  node_selection: cost_to_go
+  use_reward_return: true
+  use_global_context: false
+
+benchmark:
+  n_instances: 10
+  time_limit: 60
+  problem: set_cover
+  lookahead_k: 5
+  lookahead_depth: 3
+  lookahead_gamma: 0.95
+  size_weight: 0.0
+  ctg_weight: 1.0
+  branch_factor: 2
