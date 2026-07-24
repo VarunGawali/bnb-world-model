@@ -169,6 +169,7 @@ class DynamicsTransformer(nn.Module):
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.max_seq = max_seq   # positional-embedding / causal-mask capacity
 
         # Project [z_t || a_t] (2*hidden_dim) -> d_model
         self.input_proj = nn.Linear(2 * hidden_dim, hidden_dim)
@@ -257,6 +258,12 @@ class DynamicsTransformer(nn.Module):
             tokens = token
         else:
             tokens = torch.cat([past_tokens, token], dim=1)  # [B, t+1, H]
+
+        # Bound the buffer to a sliding window of the most recent max_seq tokens.
+        # A real solve can exceed max_seq nodes, which would otherwise index the
+        # positional embedding / causal mask out of range.
+        if tokens.size(1) > self.max_seq:
+            tokens = tokens[:, -self.max_seq:]
 
         T = tokens.size(1)
         pos = self.pos_emb(torch.arange(T, device=z_t.device))
