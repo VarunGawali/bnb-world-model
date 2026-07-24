@@ -136,12 +136,15 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens):
     return best_action, past_tokens
 
 
-def _scip_node_count(env):
-    """SCIP node count for the just-finished Ecole episode (fallback: None)."""
+def _episode_stats(env, fallback_steps):
+    """(node_count, solved_optimally) for the just-finished Ecole episode."""
     try:
-        return int(env.model.as_pyscipopt().getNNodes())
+        scip = env.model.as_pyscipopt()
+        n = int(scip.getNNodes())
+        solved = (scip.getStatus() == "optimal")
+        return n, solved
     except Exception:
-        return None
+        return fallback_steps, False
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +181,7 @@ def run(model, device, configs, n_instances, generator_kwargs,
 
     methods = ["scip"] + list(configs.keys())
     nodes = {m: [] for m in methods}
+    solved = {m: [] for m in methods}          # solved-to-optimality flags
     model.eval()
 
     print(f"Evaluating {n_instances} instances | methods: {methods}\n")
@@ -192,6 +196,7 @@ def run(model, device, configs, n_instances, generator_kwargs,
         m.setParam("presolving/maxrounds", 0)
         m.optimize()
         nodes["scip"].append(int(m.getNNodes()))
+        solved["scip"].append(m.getStatus() == "optimal")
 
         # ---- each learned config ----
         for name, cfg in configs.items():
@@ -205,26 +210,32 @@ def run(model, device, configs, n_instances, generator_kwargs,
                     )
                     obs, action_set, _, done, _ = env.step(action)
                     steps += 1
-            n = _scip_node_count(env)
-            nodes[name].append(n if n is not None else steps)
+            n, opt = _episode_stats(env, steps)
+            nodes[name].append(n)
+            solved[name].append(opt)
 
-        row = " | ".join(f"{m}:{nodes[m][-1]}" for m in methods)
+        row = " | ".join(
+            f"{m}:{nodes[m][-1]}{'' if solved[m][-1] else '*'}" for m in methods
+        )
         print(f"  [{i+1:3d}/{n_instances}] {row}")
 
-    return nodes
+    print("  (* = hit time/node limit, NOT solved to optimality)")
+    return nodes, solved
 
 
-def summarize(nodes):
+def summarize(nodes, solved=None):
     """Print and return a per-method summary vs. SCIP with Wilcoxon significance."""
     scip = np.asarray(nodes["scip"], dtype=float)
     rows = []
-    print("\n" + "=" * 72)
+    print("\n" + "=" * 84)
     print(f"{'Method':<16}{'nodes(mean±std)':<22}{'median':<10}"
-          f"{'vs SCIP':<10}{'p':<10}")
-    print("-" * 72)
+          f"{'vs SCIP':<10}{'p':<10}{'%solved':<10}")
+    print("-" * 84)
     for m, vals in nodes.items():
         v = np.asarray(vals, dtype=float)
         mean, std, med = v.mean(), v.std(), np.median(v)
+        pct_solved = (100.0 * float(np.mean(solved[m]))
+                      if solved is not None else None)
         if m == "scip":
             red, p = 0.0, None
         else:
@@ -236,13 +247,16 @@ def summarize(nodes):
                 except Exception:
                     p = None
         rows.append(dict(method=m, mean=mean, std=std, median=med,
-                         reduction_pct=red, wilcoxon_p=p))
+                         reduction_pct=red, wilcoxon_p=p, pct_solved=pct_solved))
         pstr = f"{p:.2e}" if p is not None else "--"
+        sstr = f"{pct_solved:.0f}%" if pct_solved is not None else "--"
         print(f"{m:<16}{mean:8.1f} ± {std:6.1f}     {med:<10.0f}"
-              f"{red:>6.1f}%   {pstr:<10}")
-    print("=" * 72)
+              f"{red:>6.1f}%   {pstr:<10}{sstr:<10}")
+    print("=" * 84)
     print("Reduction = mean node reduction vs SCIP (higher is better). "
           "p = Wilcoxon signed-rank on paired per-instance counts.")
+    print("%solved = fraction of instances closed to OPTIMALITY (not timed out) "
+          "-- a node reduction is only a real win at 100% solved.")
 
     # Headline: best learned config vs every baseline (surfaces the win over
     # classical heuristics that the SCIP-only column hides).
@@ -287,18 +301,18 @@ def main():
     load_weights_only(model, args.checkpoint, device=device)
     print(f"Loaded {args.checkpoint} on {device}")
 
-    nodes = run(
+    nodes, solved = run(
         model, device, {**BASELINES, **ABLATIONS},
         n_instances=args.n_instances,
         generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
                               density=args.density),
         time_limit=args.time_limit, seed=args.seed,
     )
-    summary = summarize(nodes)
+    summary = summarize(nodes, solved)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    json.dump({"per_instance": nodes, "summary": summary,
+    json.dump({"per_instance": nodes, "solved": solved, "summary": summary,
                "config": vars(args)}, open(out, "w"), indent=2)
     print(f"\nSaved raw counts + summary to {out}")
 
