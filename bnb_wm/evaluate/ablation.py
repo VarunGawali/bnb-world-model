@@ -243,6 +243,20 @@ def summarize(nodes):
     print("=" * 72)
     print("Reduction = mean node reduction vs SCIP (higher is better). "
           "p = Wilcoxon signed-rank on paired per-instance counts.")
+
+    # Headline: best learned config vs every baseline (surfaces the win over
+    # classical heuristics that the SCIP-only column hides).
+    learned = {m: np.mean(nodes[m]) for m in nodes if m in ABLATIONS}
+    if learned:
+        best = min(learned, key=learned.get)
+        bm = learned[best]
+        print(f"\nBest learned config: {best} (mean {bm:.1f} nodes)")
+        for base in ("scip", "random", "most_fractional"):
+            if base in nodes:
+                bmean = float(np.mean(nodes[base]))
+                red = 100.0 * (bmean - bm) / max(bmean, 1e-9)
+                tag = "fewer nodes (better)" if red > 0 else "MORE nodes (worse)"
+                print(f"  vs {base:<16}: {red:+6.1f}%   {tag}")
     return rows
 
 
