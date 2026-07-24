@@ -64,6 +64,13 @@ ABLATIONS = {
     "reward_return": dict(mode="rollout", depth=3, gamma=0.95, k=5,
                           ctg_weight=1.0, branch_factor=2, use_reward_return=True),
 }
+
+# Classical (non-learned) branching baselines, for a fair comparison spectrum:
+# SCIP reliability branching is the strong upper baseline, these are the weak ones.
+BASELINES = {
+    "random":          dict(mode="random"),
+    "most_fractional": dict(mode="most_fractional"),
+}
 _LEAF_SKIP = 0.8
 
 
@@ -73,6 +80,22 @@ _LEAF_SKIP = 0.8
 
 def _pick_action(model, batch, action_set, device, cfg, past_tokens):
     """Pick a branching variable under one ablation config; returns (action, tokens)."""
+    mode = cfg["mode"]
+
+    # --- classical baselines: no model needed, short-circuit before encoding ---
+    if mode == "random":
+        return int(np.random.choice(action_set)), past_tokens
+    if mode == "most_fractional":
+        var_mask = batch.node_type == 0
+        vf = batch.x[var_mask]                       # [n_vars, 19]
+        # Ecole layout: column 14 = sol_frac = |x - round(x)| in [0, 0.5];
+        # most-fractional = largest sol_frac among the candidates.
+        frac = vf[:, 14] if vf.size(1) > 14 else torch.zeros(vf.size(0), device=device)
+        aset_t = torch.tensor(action_set, dtype=torch.long, device=device)
+        best = int(aset_t[int(frac[aset_t].argmax())])
+        return best, past_tokens
+
+    # --- learned policy / rollout ---
     h_vars, z = model.encode(batch)
     var_mask  = batch.node_type == 0
     var_batch = batch.batch[var_mask]
@@ -141,6 +164,7 @@ def run(model, device, configs, n_instances, generator_kwargs,
         density=gkw.get("density", 0.05),
     )
     generator.seed(seed)
+    np.random.seed(seed)   # reproducible random-branching baseline
 
     scip_params = {
         "limits/time":              time_limit,
@@ -250,7 +274,7 @@ def main():
     print(f"Loaded {args.checkpoint} on {device}")
 
     nodes = run(
-        model, device, ABLATIONS,
+        model, device, {**BASELINES, **ABLATIONS},
         n_instances=args.n_instances,
         generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
                               density=args.density),
