@@ -258,6 +258,34 @@ def summarize(nodes, solved=None):
     print("%solved = fraction of instances closed to OPTIMALITY (not timed out) "
           "-- a node reduction is only a real win at 100% solved.")
 
+    # Fair comparison: nodes ONLY on instances BOTH scip and the method solved
+    # to optimality. This isolates branching quality from the timeout confound
+    # (a slow per-node method can show fewer nodes just by timing out).
+    if solved is not None:
+        scip_opt = np.asarray(solved["scip"], dtype=bool)
+        print("\nFAIR comparison -- nodes on instances solved to optimality by "
+              "BOTH method and SCIP (the only valid node-count claim):")
+        for m in nodes:
+            if m == "scip":
+                continue
+            mask = scip_opt & np.asarray(solved[m], dtype=bool)
+            nb = int(mask.sum())
+            if nb == 0:
+                print(f"  {m:<16}: no instances solved by both -- inconclusive")
+                continue
+            sv = np.asarray(nodes["scip"], dtype=float)[mask]
+            mv = np.asarray(nodes[m], dtype=float)[mask]
+            red = 100.0 * (sv.mean() - mv.mean()) / max(sv.mean(), 1e-9)
+            p = None
+            if wilcoxon is not None and nb >= 2 and np.any(sv != mv):
+                try:
+                    p = float(wilcoxon(sv, mv).pvalue)
+                except Exception:
+                    p = None
+            pstr = f"p={p:.2e}" if p is not None else ""
+            print(f"  {m:<16}: n={nb:2d}  SCIP {sv.mean():7.0f} vs "
+                  f"{mv.mean():7.0f}  -> {red:+6.1f}%  {pstr}")
+
     # Headline: best learned config vs every baseline (surfaces the win over
     # classical heuristics that the SCIP-only column hides).
     learned = {m: np.mean(nodes[m]) for m in nodes if m in ABLATIONS}
