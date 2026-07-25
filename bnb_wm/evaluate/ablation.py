@@ -138,15 +138,34 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens):
     return best_action, past_tokens
 
 
+def _scip_metrics(scip, fallback_nodes):
+    """(nodes, solved_optimally, solve_time_s, cuts_applied) from a pyscipopt Model."""
+    try:
+        n = int(scip.getNNodes())
+    except Exception:
+        n = fallback_nodes
+    try:
+        solved = (scip.getStatus() == "optimal")
+    except Exception:
+        solved = False
+    try:
+        t = float(scip.getSolvingTime())
+    except Exception:
+        t = float("nan")
+    try:
+        c = int(scip.getNCutsApplied())
+    except Exception:
+        c = -1
+    return n, solved, t, c
+
+
 def _episode_stats(env, fallback_steps):
-    """(node_count, solved_optimally) for the just-finished Ecole episode."""
+    """(nodes, solved_optimally, time_s, cuts) for the just-finished Ecole episode."""
     try:
         scip = env.model.as_pyscipopt()
-        n = int(scip.getNNodes())
-        solved = (scip.getStatus() == "optimal")
-        return n, solved
+        return _scip_metrics(scip, fallback_steps)
     except Exception:
-        return fallback_steps, False
+        return fallback_steps, False, float("nan"), -1
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +173,7 @@ def _episode_stats(env, fallback_steps):
 # ---------------------------------------------------------------------------
 
 def run(model, device, configs, n_instances, generator_kwargs,
-        time_limit=60, seed=0):
+        time_limit=60, seed=0, separate=False):
     """
     Returns a dict: method -> list of per-instance node counts (aligned by index).
     "scip" is always included as the baseline.
@@ -171,9 +190,14 @@ def run(model, device, configs, n_instances, generator_kwargs,
     generator.seed(seed)
     np.random.seed(seed)   # reproducible random-branching baseline
 
+    # separate=False disables cutting planes to isolate BRANCHING quality (the
+    # node-count comparison). separate=True leaves SCIP's default separators on
+    # so the "cuts" metric is meaningful (true branch-and-cut). maxrounds=-1 is
+    # SCIP's "unlimited default rounds"; 0 disables separation entirely.
+    sep_rounds = -1 if separate else 0
     scip_params = {
         "limits/time":              time_limit,
-        "separating/maxrounds":     0,
+        "separating/maxrounds":     sep_rounds,
         "presolving/maxrounds":     0,
     }
     env = ecole.environment.Branching(
@@ -184,6 +208,8 @@ def run(model, device, configs, n_instances, generator_kwargs,
     methods = ["scip"] + list(configs.keys())
     nodes = {m: [] for m in methods}
     solved = {m: [] for m in methods}          # solved-to-optimality flags
+    times = {m: [] for m in methods}           # SCIP solving time (seconds)
+    cuts = {m: [] for m in methods}            # cutting planes applied
     model.eval()
 
     print(f"Evaluating {n_instances} instances | methods: {methods}\n")
@@ -194,11 +220,14 @@ def run(model, device, configs, n_instances, generator_kwargs,
         m = instance.copy_orig().as_pyscipopt()
         m.hideOutput()
         m.setParam("limits/time", time_limit)
-        m.setParam("separating/maxrounds", 0)
+        m.setParam("separating/maxrounds", sep_rounds)
         m.setParam("presolving/maxrounds", 0)
         m.optimize()
-        nodes["scip"].append(int(m.getNNodes()))
-        solved["scip"].append(m.getStatus() == "optimal")
+        n, opt, t, c = _scip_metrics(m, 0)
+        nodes["scip"].append(n)
+        solved["scip"].append(opt)
+        times["scip"].append(t)
+        cuts["scip"].append(c)
 
         # ---- each learned config ----
         for name, cfg in configs.items():
@@ -212,9 +241,11 @@ def run(model, device, configs, n_instances, generator_kwargs,
                     )
                     obs, action_set, _, done, _ = env.step(action)
                     steps += 1
-            n, opt = _episode_stats(env, steps)
+            n, opt, t, c = _episode_stats(env, steps)
             nodes[name].append(n)
             solved[name].append(opt)
+            times[name].append(t)
+            cuts[name].append(c)
 
         row = " | ".join(
             f"{m}:{nodes[m][-1]}{'' if solved[m][-1] else '*'}" for m in methods
@@ -222,22 +253,34 @@ def run(model, device, configs, n_instances, generator_kwargs,
         print(f"  [{i+1:3d}/{n_instances}] {row}")
 
     print("  (* = hit time/node limit, NOT solved to optimality)")
-    return nodes, solved
+    return nodes, solved, times, cuts
 
 
-def summarize(nodes, solved=None):
-    """Print and return a per-method summary vs. SCIP with Wilcoxon significance."""
+def _nanmean(x):
+    x = np.asarray(x, dtype=float)
+    x = x[~np.isnan(x)]
+    return float(x.mean()) if x.size else float("nan")
+
+
+def summarize(nodes, solved=None, times=None, cuts=None):
+    """Print and return a per-method summary vs. SCIP with Wilcoxon significance.
+
+    Reports the four metrics the evaluation requires per method:
+    optimality (%solved), nodes explored, solve time, and cuts applied.
+    """
     scip = np.asarray(nodes["scip"], dtype=float)
     rows = []
-    print("\n" + "=" * 84)
-    print(f"{'Method':<16}{'nodes(mean±std)':<22}{'median':<10}"
-          f"{'vs SCIP':<10}{'p':<10}{'%solved':<10}")
-    print("-" * 84)
+    print("\n" + "=" * 104)
+    print(f"{'Method':<16}{'nodes(mean±std)':<22}{'median':<9}"
+          f"{'vs SCIP':<9}{'p':<10}{'%solved':<9}{'time(s)':<10}{'cuts':<8}")
+    print("-" * 104)
     for m, vals in nodes.items():
         v = np.asarray(vals, dtype=float)
         mean, std, med = v.mean(), v.std(), np.median(v)
         pct_solved = (100.0 * float(np.mean(solved[m]))
                       if solved is not None else None)
+        mean_time = _nanmean(times[m]) if times is not None else None
+        mean_cuts = _nanmean(cuts[m]) if cuts is not None else None
         if m == "scip":
             red, p = 0.0, None
         else:
@@ -249,16 +292,20 @@ def summarize(nodes, solved=None):
                 except Exception:
                     p = None
         rows.append(dict(method=m, mean=mean, std=std, median=med,
-                         reduction_pct=red, wilcoxon_p=p, pct_solved=pct_solved))
+                         reduction_pct=red, wilcoxon_p=p, pct_solved=pct_solved,
+                         mean_time=mean_time, mean_cuts=mean_cuts))
         pstr = f"{p:.2e}" if p is not None else "--"
         sstr = f"{pct_solved:.0f}%" if pct_solved is not None else "--"
-        print(f"{m:<16}{mean:8.1f} ± {std:6.1f}     {med:<10.0f}"
-              f"{red:>6.1f}%   {pstr:<10}{sstr:<10}")
-    print("=" * 84)
+        tstr = f"{mean_time:.2f}" if mean_time is not None else "--"
+        cstr = f"{mean_cuts:.1f}" if mean_cuts is not None else "--"
+        print(f"{m:<16}{mean:8.1f} ± {std:6.1f}    {med:<9.0f}"
+              f"{red:>6.1f}%  {pstr:<10}{sstr:<9}{tstr:<10}{cstr:<8}")
+    print("=" * 104)
     print("Reduction = mean node reduction vs SCIP (higher is better). "
           "p = Wilcoxon signed-rank on paired per-instance counts.")
     print("%solved = fraction of instances closed to OPTIMALITY (not timed out) "
           "-- a node reduction is only a real win at 100% solved.")
+    print("time(s) = mean SCIP solving time; cuts = mean cutting planes applied.")
 
     # Fair comparison: nodes ONLY on instances BOTH scip and the method solved
     # to optimality. This isolates branching quality from the timeout confound
@@ -313,6 +360,10 @@ def main():
     ap.add_argument("--n_cols", type=int, default=1000)
     ap.add_argument("--density", type=float, default=0.05)
     ap.add_argument("--time_limit", type=int, default=60)
+    ap.add_argument("--separate", action="store_true",
+                    help="leave SCIP's cutting planes ON (true branch-and-cut) "
+                         "so the 'cuts' metric is meaningful. Default off, which "
+                         "isolates branching quality for the node comparison.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="results/ablation.json")
     args = ap.parse_args()
@@ -331,19 +382,20 @@ def main():
     load_weights_only(model, args.checkpoint, device=device)
     print(f"Loaded {args.checkpoint} on {device}")
 
-    nodes, solved = run(
+    nodes, solved, times, cuts = run(
         model, device, {**BASELINES, **ABLATIONS},
         n_instances=args.n_instances,
         generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
                               density=args.density),
-        time_limit=args.time_limit, seed=args.seed,
+        time_limit=args.time_limit, seed=args.seed, separate=args.separate,
     )
-    summary = summarize(nodes, solved)
+    summary = summarize(nodes, solved, times, cuts)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    json.dump({"per_instance": nodes, "solved": solved, "summary": summary,
-               "config": vars(args)}, open(out, "w"), indent=2)
+    json.dump({"per_instance": nodes, "solved": solved, "times": times,
+               "cuts": cuts, "summary": summary, "config": vars(args)},
+              open(out, "w"), indent=2)
     print(f"\nSaved raw counts + summary to {out}")
 
 
