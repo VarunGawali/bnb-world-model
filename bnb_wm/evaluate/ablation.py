@@ -55,13 +55,15 @@ from bnb_wm.evaluate.benchmark import _format_obs
 # mode "policy" ignores the rollout; mode "rollout" calls model.rollout_candidate.
 ABLATIONS = {
     "policy_only":   dict(mode="policy"),
-    "value_rollout": dict(mode="rollout", depth=3, gamma=0.95, k=5,
+    # depth=2, k=3 (was 3/5): ~2-3x faster per node so instances actually finish
+    # within the time budget, making node-count comparisons valid (not timeouts).
+    "value_rollout": dict(mode="rollout", depth=2, gamma=0.95, k=3,
                           ctg_weight=0.0, branch_factor=1, use_reward_return=False),
-    "cost_to_go":    dict(mode="rollout", depth=3, gamma=0.95, k=5,
+    "cost_to_go":    dict(mode="rollout", depth=2, gamma=0.95, k=3,
                           ctg_weight=1.0, branch_factor=1, use_reward_return=False),
-    "tree_rollout":  dict(mode="rollout", depth=3, gamma=0.95, k=5,
+    "tree_rollout":  dict(mode="rollout", depth=2, gamma=0.95, k=3,
                           ctg_weight=1.0, branch_factor=2, use_reward_return=False),
-    "reward_return": dict(mode="rollout", depth=3, gamma=0.95, k=5,
+    "reward_return": dict(mode="rollout", depth=2, gamma=0.95, k=3,
                           ctg_weight=1.0, branch_factor=2, use_reward_return=True),
 }
 

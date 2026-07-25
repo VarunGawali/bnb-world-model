@@ -60,7 +60,7 @@ solver:
   max_cuts_per_node: 10
   cut_score_threshold: 0.3
   lookahead_k: 3
-  lookahead_depth: 3
+  lookahead_depth: 2         # faster per-node inference (was 3) so solves finish
   lookahead_gamma: 0.95
   size_weight: 0.0
   ctg_weight: 1.0
@@ -73,8 +73,8 @@ benchmark:
   n_instances: 10
   time_limit: 60
   problem: set_cover
-  lookahead_k: 5
-  lookahead_depth: 3
+  lookahead_k: 3
+  lookahead_depth: 2
   lookahead_gamma: 0.95
   size_weight: 0.0
   ctg_weight: 1.0
