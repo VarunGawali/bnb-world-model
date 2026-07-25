@@ -194,8 +194,14 @@ def main():
         print("\n=== Phase 3: Dynamics ===")
         seq_collate = make_sequence_collate(include_vars=True)
 
+        # Encode-once cache: the Phase-3 encoder is frozen, so encoding each
+        # trajectory every epoch is pure waste. Cache to disk under the
+        # checkpoint dir; epoch 1 encodes, later epochs load (no GNN forward).
+        seq_cache = ckpt_dir / "seq_cache"
+
         def sequence_loader(file_list, shuffle):
-            ds = SequenceDataset(file_list, model, device, include_vars=True)
+            ds = SequenceDataset(file_list, model, device, include_vars=True,
+                                 cache_dir=seq_cache)
             # num_workers=0: the dataset holds the (unpicklable) model.
             return DataLoader(ds, batch_size=bs, shuffle=shuffle,
                               collate_fn=seq_collate, num_workers=0)

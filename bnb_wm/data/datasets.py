@@ -271,7 +271,7 @@ class SequenceDataset(Dataset):
     """
 
     def __init__(self, files, model, device, include_vars=True,
-                 max_vars_recon=64, seed=0):
+                 max_vars_recon=64, seed=0, cache_dir=None):
         self.files = list(files)
         self.model = model
         self.device = device
@@ -279,11 +279,52 @@ class SequenceDataset(Dataset):
         self.max_vars_recon = max_vars_recon
         self.rng = np.random.default_rng(seed)
 
+        # Encode-once cache. In Phase 3 the encoder is frozen, so the per-file
+        # encoded sequence is identical every epoch — re-encoding through the GNN
+        # each epoch is the dominant cost. When cache_dir is set, epoch 1 encodes
+        # and saves each trajectory's output dict to disk; later epochs load it
+        # (no GNN forward). The cache is keyed by a fingerprint of the encoder
+        # weights + the (include_vars, max_vars_recon, seed) settings, so it is
+        # invalidated automatically if any of those change.
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir is not None:
+            fp = self._encoder_fingerprint()
+            self.cache_dir = self.cache_dir / (
+                f"enc{fp}_v{int(include_vars)}_k{max_vars_recon}_s{seed}")
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _encoder_fingerprint(self):
+        """Short stable hash of encoder weights (frozen during Phase 3)."""
+        import hashlib
+        h = hashlib.md5()
+        for k, v in sorted(self.model.encoder.state_dict().items()):
+            h.update(k.encode())
+            h.update(v.detach().cpu().float().numpy().tobytes())
+        return h.hexdigest()[:12]
+
+    def _cache_path(self, i):
+        # Key by file path (not list index) so train/val loaders sharing one
+        # cache dir never collide on their 0-based indices.
+        import hashlib
+        key = hashlib.md5(str(self.files[i]).encode()).hexdigest()[:16]
+        return self.cache_dir / f"{key}.pt"
+
     def __len__(self):
         return len(self.files)
 
     @torch.no_grad()
     def __getitem__(self, i):
+        if self.cache_dir is not None:
+            cp = self._cache_path(i)
+            if cp.exists():
+                return torch.load(cp, map_location="cpu")
+            out = self._encode(i)
+            torch.save(out, cp)
+            return out
+        return self._encode(i)
+
+    @torch.no_grad()
+    def _encode(self, i):
         d = np.load(self.files[i], allow_pickle=True)
         T = int(d["n_steps"])
         # Need at least 2 nodes to form one transition.
