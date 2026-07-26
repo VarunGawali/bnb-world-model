@@ -82,19 +82,29 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--time_limit", type=float, default=60.0)
     ap.add_argument("--tol", type=float, default=1e-4)
+    ap.add_argument("--no_cuts", action="store_true",
+                    help="disable neural cut selection (isolates whether an "
+                         "invalid cut, not the LP/branching, breaks the optimum)")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Fresh, UNTRAINED model — correctness must not depend on weights.
     model = BnBWorldModel().to(device).eval()
 
+    # Disabling cuts = raise the acceptance threshold beyond reach and cap count.
+    cut_thr = 1e9 if args.no_cuts else 0.3
+    max_cuts = 0 if args.no_cuts else 10
+
     solver = BnBSolver(
         model, device,
         time_limit=args.time_limit,
+        cut_score_threshold=cut_thr, max_cuts_per_node=max_cuts,
         # Neutral guidance settings; correctness is independent of these.
         lookahead_k=3, lookahead_depth=2, branch_factor=1,
         node_selection="bound",
     )
+    print(f"LP backend: {'HiGHS-direct' if solver._use_highs_direct else 'scipy'}"
+          f" | cuts: {'OFF' if args.no_cuts else 'ON'}\n")
 
     rng = np.random.default_rng(args.seed)
     n_match = n_mismatch = n_skip = 0
