@@ -69,6 +69,19 @@ strong solver baseline and ablating each component of the planner.
 % ---------------------------------------------------------------------------
 \section{Introduction}
 
+A modern optimization solver is, at its core, a sequential decision maker. To
+solve a single instance it makes millions of discrete choices---which variable
+to branch on, which cutting planes to add, which open node to explore next---each
+one steering an enormous combinatorial search, and each one governed today by a
+hand-engineered heuristic. This is precisely the setting in which learned
+\emph{world models}---models that predict the consequences of an agent's actions
+and let it plan by imagining futures---have transformed sequential decision
+making elsewhere, from Atari and Go to continuous control
+\citep{schrittwieser2020mastering,hafner2020dream}. We ask whether the same
+principle can be brought inside an optimization solver, and we develop the first
+instance of it for the solver's most consequential decisions: those of
+Branch-and-Cut.
+
 Mixed-Integer Programming (MIP) is a workhorse for combinatorial decision
 making, and modern solvers attack it with Branch-and-Cut. Starting from the LP
 relaxation of a problem, the solver repeatedly does two things at each node of
@@ -113,7 +126,10 @@ preserved. This is the same principle behind model-based planning agents such as
 MuZero and Dreamer \citep{schrittwieser2020mastering,hafner2020dream}, here
 brought to the interior of an optimization solver.
 
-Our contributions are as follows. We introduce a latent world model that plans
+Our contributions are as follows. We propose \emph{world models for
+optimization}---learning a solver's decision dynamics so that its discrete
+choices can be planned in imagination---and realize it concretely inside
+Branch-and-Cut. Within this framing we introduce a latent world model that plans
 Branch-and-Cut decisions by simulating their consequences in latent space
 rather than through LP solves. We show that a single such model can drive
 branching, node selection, and the selection of globally valid cutting planes
@@ -287,10 +303,17 @@ a validation metric selects the best checkpoint in each stage.
 We evaluate on Set Cover instances generated with Ecole
 \citep{prouvost2020ecole} across easy, medium, and hard difficulty tiers, and we
 collect strong-branching trajectories for training. Our primary baseline is the
-SCIP solver with its default pseudocost branching; we also compare against random
-branching. Because the size of the search tree is what determines a solver's
-cost, our primary metric is the number of explored nodes, with wall-clock time
-reported as a secondary measure.
+SCIP solver with its default pseudocost branching; we also compare against two
+classical branching heuristics, random and most-fractional. We report four
+metrics per method on a common held-out instance set: the fraction of instances
+closed to \emph{optimality} within the time limit, the number of explored
+\emph{nodes}, the wall-clock solving \emph{time}, and the number of
+\emph{cutting planes} applied. Optimality is reported first because a reduction
+in nodes is only a genuine improvement when the instance is actually solved: a
+method that is slow per node can appear to explore fewer nodes merely by timing
+out. Accordingly, all node and time comparisons are made on the subset of
+instances solved to optimality by \emph{both} the method and the baseline, which
+isolates decision quality from the timeout confound.
 
 \subsection{Ablation}
 To understand where any improvement comes from, we ablate the planner one
@@ -300,29 +323,32 @@ rollout, the reward-based return, learned node selection, and learned cut
 selection.
 
 \subsection{Results}
-% [TODO: insert results once training completes.]
-Table~\ref{tab:main} reports the reduction in explored nodes relative to SCIP
-pseudocost branching. Following standard reproducibility guidance, we report
-results as a mean with standard deviation over a held-out instance set and assess
-each improvement with a Wilcoxon signed-rank test on the paired per-instance node
-counts.
+% [TODO: insert numbers once the retrained model is evaluated.]
+Table~\ref{tab:main} reports the four metrics for each method. Following standard
+reproducibility guidance, node counts are given as a mean with standard deviation
+over the held-out set, and each learned method is assessed against SCIP with a
+Wilcoxon signed-rank test on the paired per-instance counts, computed on the
+both-solved subset described above.
 
 \begin{table}[t]
 \centering
-\begin{tabular}{lccc}
+\begin{tabular}{lcccc}
 \toprule
-Method & Nodes & vs.\ SCIP & $p$ \\
+Method & \%\,Opt. & Nodes & Time (s) & Cuts \\
 \midrule
-SCIP pseudocost      & -- & -- & -- \\
-Learned policy only  & -- & -- & -- \\
-\ + value rollout    & -- & -- & -- \\
-\ + cost-to-go       & -- & -- & -- \\
-\ + tree rollout     & -- & -- & -- \\
-\ + learned cuts     & -- & -- & -- \\
+SCIP pseudocost      & -- & -- & -- & -- \\
+Random               & -- & -- & -- & -- \\
+Most-fractional      & -- & -- & -- & -- \\
+Learned policy only  & -- & -- & -- & -- \\
+\ + value rollout    & -- & -- & -- & -- \\
+\ + cost-to-go       & -- & -- & -- & -- \\
+\ + tree rollout     & -- & -- & -- & -- \\
+\ + reward return    & -- & -- & -- & -- \\
 \bottomrule
 \end{tabular}
-\caption{Reduction in explored nodes and paired significance. [Placeholder;
-filled once training completes.]}
+\caption{Optimality rate, explored nodes, solving time, and cuts applied per
+method. Node and time comparisons use the both-solved subset. [Placeholder;
+filled once the retrained model is evaluated.]}
 \label{tab:main}
 \end{table}
 
@@ -337,9 +363,16 @@ We have presented a world model for Branch-and-Cut that plans the solver's
 discrete decisions---branching, node selection, and the selection of globally
 valid cutting planes---by imagining their consequences in latent space rather
 than computing them with LP solves, all while preserving the solver's optimality
-guarantee. Planning inside the search tree is only one way a world model can
-serve optimization; extending the same idea to improvement search, such as
-learned large neighborhood search, is a natural next step.
+guarantee. We view this as the first realized instance of a broader agenda:
+learned world models for optimization, in which a solver's decision dynamics are
+modeled so that its choices can be planned rather than guessed by fixed
+heuristics. Branch-and-Cut exercises the hardest version of that idea---planning
+inside an exact search tree under a strict correctness constraint---but the same
+machinery applies wherever a solver makes a sequence of discrete choices.
+Extending it to improvement search, such as learned large neighborhood search
+where the world model imagines the effect of re-optimizing a chosen subset of
+variables, is a natural next step, and one where a forward model can be exploited
+without the exactness constraints of tree search.
 
 % ---------------------------------------------------------------------------
 \bibliographystyle{aaai2027}
