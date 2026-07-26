@@ -162,6 +162,12 @@ class BnBSolver:
         n = len(c)
         m = len(b)
 
+        # Reset the per-instance Gomory cut pool: cuts are derived from THIS
+        # instance's (A, b, c) and are invalid for any other instance, so the
+        # cache must not leak across solve() calls (the benchmark reuses one
+        # solver object over many instances).
+        self._gomory_pool = None
+
         # Root LP
         root_lb_arr = np.zeros(n, dtype=np.float64)
         root_ub_arr = np.ones(n,  dtype=np.float64)
@@ -765,70 +771,52 @@ class BnBSolver:
         self,
         A: np.ndarray,
         b: np.ndarray,
+        c: np.ndarray,
         x_lp: np.ndarray,
         existing_cuts: list,
     ) -> list:
         """
-        Generate pairwise Chvátal-Gomory intersection cuts for Set Cover.
+        Generate globally valid Gomory fractional cuts (see solver/gomory.py).
 
-        For each pair of constraints (i1, i2), the CG cut on their
-        intersection support is:
-            ∑_{j : A_{i1,j}=1 AND A_{i2,j}=1}  x_j  >=  1
+        The previous pairwise "intersection >= 1" cut was mathematically INVALID
+        for a covering system — it rounded a >= constraint's coefficients down,
+        which can remove feasible integer points, and made the solver return
+        wrong optima. Gomory fractional cuts are valid for every integer-feasible
+        point by construction.
 
-        This cut is:
-          (a) Globally valid — valid for any integer-feasible solution
-              because if x_j ∈ {0,1} and no element in the intersection
-              is selected, both constraint i1 and i2 could be violated.
-          (b) Derivable as a CG cut with multipliers u = (e_i1 + e_i2)/2,
-              rounded to integer LHS coefficients.
-          (c) Safe to propagate to all child nodes.
-
-        Strategy to avoid O(m^2) enumeration:
-            - Only consider "tight" constraints where A_i @ x* ∈ [1.0, 1.4]
-            - Limit to at most 30 tight constraints → C(30,2) = 435 pairs
-            - Only keep cuts violated by x* (intersection LP sum < 1 - eps)
-            - Deduplicate by frozenset of support indices
-            - Return top-50 by violation magnitude
+        The cut pool is derived ONCE at the root (globally valid, so it can be
+        propagated to any node) and cached. At a given node we return the cached
+        cuts that are (i) not already present and (ii) violated by the current
+        LP point x_lp, so only useful cuts are offered to the selection head.
+        If highspy is unavailable or nothing valid is derivable, the pool is
+        empty and no cuts are added — which keeps the solver correct.
         """
-        m, n = A.shape
-        b_bin = (A > 0.5)   # binary indicator matrix
+        n = A.shape[1]
 
-        # Existing cut supports (to avoid duplicates)
-        existing_supports = set()
+        # Build the global Gomory cut pool once (root), then reuse everywhere.
+        if getattr(self, "_gomory_pool", None) is None:
+            from .gomory import generate_root_gomory_cuts
+            pool = generate_root_gomory_cuts(A, b, c, self._highs)
+            self._gomory_pool = [
+                CutData(lhs=np.asarray(lhs, dtype=np.float64),
+                        rhs=float(rhs), cut_type="gomory")
+                for lhs, rhs in pool
+            ]
+
+        # Existing cut fingerprints (avoid re-adding an inherited cut).
+        existing = set()
         for cut in existing_cuts:
-            existing_supports.add(frozenset(np.where(cut.lhs > 0.5)[0]))
+            existing.add((tuple(np.round(cut.lhs, 6)), round(cut.rhs, 6)))
 
-        # Tight constraints
-        activity       = A @ x_lp
-        tight_mask     = (activity < 1.4) & (activity >= 1.0 - 1e-6)
-        tight_cons     = np.where(tight_mask)[0][:30]   # cap at 30
-
-        candidates = []
-        seen       = set()
-
-        for i1, i2 in combinations(tight_cons, 2):
-            inter = np.where(b_bin[i1] & b_bin[i2])[0]
-            if len(inter) == 0:
+        out = []
+        for cut in self._gomory_pool:
+            key = (tuple(np.round(cut.lhs, 6)), round(cut.rhs, 6))
+            if key in existing:
                 continue
-
-            key = frozenset(inter)
-            if key in seen or key in existing_supports:
-                continue
-            seen.add(key)
-
-            lp_val    = float(x_lp[inter].sum())
-            violation = 1.0 - lp_val
-            if violation > 1e-4:                  # must be violated
-                lhs = np.zeros(n, dtype=np.float64)
-                lhs[inter] = 1.0
-                candidates.append((violation, lhs))
-
-        # Sort by violation, take top 50
-        candidates.sort(key=lambda x: -x[0])
-        return [
-            CutData(lhs=lhs, rhs=1.0, cut_type="cg")
-            for _, lhs in candidates[:50]
-        ]
+            # Keep only cuts violated by the current LP point: lhs @ x < rhs.
+            if float(cut.lhs @ x_lp) < cut.rhs - 1e-6:
+                out.append(cut)
+        return out[:50]
 
     # ------------------------------------------------------------------
     # Cut feature computation
@@ -901,7 +889,7 @@ class BnBSolver:
         Selection rule:
             sigmoid(score) >= cut_score_threshold  AND  top-max_cuts_per_node
         """
-        candidates = self._generate_cg_cuts(A, b, x_lp, existing_cuts)
+        candidates = self._generate_cg_cuts(A, b, c, x_lp, existing_cuts)
         if not candidates:
             return []
 
