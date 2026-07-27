@@ -115,6 +115,7 @@ class BnBSolver:
         node_selection: str = "bound",
         use_global_context: bool = False,
         use_reward_return: bool = False,
+        cut_mode: str = "learned",
     ):
         self.model               = model
         self.device              = device
@@ -132,6 +133,10 @@ class BnBSolver:
         self.node_selection      = node_selection     # "bound" | "cost_to_go" (Gap 5)
         self.use_global_context  = use_global_context  # inject global scalars (Gap 1)
         self.use_reward_return   = use_reward_return   # MuZero-style return (Fix 3)
+        # Cut-selection mode for the ablation: "learned" (CuttingPlaneHead),
+        # "heuristic" (max-violation over the valid Gomory pool), "none".
+        self.cut_mode            = cut_mode
+        self._cuts_added         = 0                    # per-solve cut counter
 
         # Main LP solves use the proven scipy path. highspy (if present) is used
         # ONLY for basis extraction in Gomory cut generation, via the stable
@@ -169,6 +174,7 @@ class BnBSolver:
         # cache must not leak across solve() calls (the benchmark reuses one
         # solver object over many instances).
         self._gomory_pool = None
+        self._cuts_added = 0
 
         # Root LP
         root_lb_arr = np.zeros(n, dtype=np.float64)
@@ -891,10 +897,23 @@ class BnBSolver:
         Selection rule:
             sigmoid(score) >= cut_score_threshold  AND  top-max_cuts_per_node
         """
+        if self.cut_mode == "none":
+            return []
+
         candidates = self._generate_cg_cuts(A, b, c, x_lp, existing_cuts)
         if not candidates:
             return []
 
+        if self.cut_mode == "heuristic":
+            # Max-violation selection over the same valid Gomory pool (classical
+            # baseline): rank by how much each cut is violated by x_lp.
+            viol = np.array([cut.rhs - float(cut.lhs @ x_lp) for cut in candidates])
+            order = np.argsort(-viol)
+            selected = [candidates[i] for i in order[: self.max_cuts_per_node]]
+            self._cuts_added += len(selected)
+            return selected
+
+        # learned: score the valid candidates with the CuttingPlaneHead.
         feat_np = self._cut_features(candidates, x_lp, c)
         feat_t  = torch.tensor(feat_np, dtype=torch.float32, device=self.device)
 
@@ -910,6 +929,7 @@ class BnBSolver:
             if len(selected) >= self.max_cuts_per_node:
                 break
 
+        self._cuts_added += len(selected)
         return selected
 
     # ------------------------------------------------------------------
