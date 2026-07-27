@@ -200,7 +200,8 @@ def _episode_stats(env, fallback_steps):
 # ---------------------------------------------------------------------------
 
 def run(model, device, configs, n_instances, generator_kwargs,
-        time_limit=60, seed=0, separate=False, strong_branching=False):
+        time_limit=60, seed=0, separate=False, strong_branching=False,
+        pseudocost=False):
     """
     Returns a dict: method -> list of per-instance node counts (aligned by index).
     "scip" is always included as the baseline.
@@ -232,8 +233,9 @@ def run(model, device, configs, n_instances, generator_kwargs,
         scip_params=scip_params,
     )
 
-    methods = ["scip"] + (["strong_branching"] if strong_branching else []) \
-              + list(configs.keys())
+    extra = (["strong_branching"] if strong_branching else []) \
+            + (["pseudocost"] if pseudocost else [])
+    methods = ["scip"] + extra + list(configs.keys())
     nodes = {m: [] for m in methods}
     solved = {m: [] for m in methods}          # solved-to-optimality flags
     times = {m: [] for m in methods}           # SCIP solving time (seconds)
@@ -272,6 +274,21 @@ def run(model, device, configs, n_instances, generator_kwargs,
             solved["strong_branching"].append(opt)
             times["strong_branching"].append(t)
             cuts["strong_branching"].append(c)
+
+        # ---- pure pseudocost branching (classical standard rule) ----
+        if pseudocost:
+            mp = instance.copy_orig().as_pyscipopt()
+            mp.hideOutput()
+            mp.setParam("limits/time", time_limit)
+            mp.setParam("separating/maxrounds", sep_rounds)
+            mp.setParam("presolving/maxrounds", 0)
+            mp.setParam("branching/pscost/priority", 536870911)
+            mp.optimize()
+            n, opt, t, c = _scip_metrics(mp, 0)
+            nodes["pseudocost"].append(n)
+            solved["pseudocost"].append(opt)
+            times["pseudocost"].append(t)
+            cuts["pseudocost"].append(c)
 
         # ---- each learned config ----
         for name, cfg in configs.items():
@@ -426,6 +443,9 @@ def main():
     ap.add_argument("--strong_branching", action="store_true",
                     help="add a full-strong-branching baseline (fewest nodes, "
                          "but very slow -- the oracle the policy imitates).")
+    ap.add_argument("--pseudocost", action="store_true",
+                    help="add a pure pseudocost-branching baseline (the standard "
+                         "cheap classical rule).")
     ap.add_argument("--methods", default=None,
                     help="comma-separated subset of methods to run (e.g. "
                          "'reward_return' for a fast final-model-vs-SCIP head-to-"
@@ -481,7 +501,7 @@ def main():
         generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
                               density=args.density),
         time_limit=args.time_limit, seed=args.seed, separate=args.separate,
-        strong_branching=args.strong_branching,
+        strong_branching=args.strong_branching, pseudocost=args.pseudocost,
     )
     summary = summarize(nodes, solved, times, cuts)
 
