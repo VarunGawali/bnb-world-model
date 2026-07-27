@@ -365,6 +365,11 @@ def main():
                          "so the 'cuts' metric is meaningful. Default off, which "
                          "isolates branching quality for the node comparison.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--methods", default=None,
+                    help="comma-separated subset of methods to run (e.g. "
+                         "'reward_return' for a fast final-model-vs-SCIP head-to-"
+                         "head, or 'policy_only,reward_return'). SCIP is always "
+                         "included. Default: all baselines + ablations.")
     ap.add_argument("--out", default="results/ablation.json")
     args = ap.parse_args()
 
@@ -382,8 +387,19 @@ def main():
     load_weights_only(model, args.checkpoint, device=device)
     print(f"Loaded {args.checkpoint} on {device}")
 
+    all_configs = {**BASELINES, **ABLATIONS}
+    if args.methods:
+        want = [m.strip() for m in args.methods.split(",") if m.strip()]
+        missing = [m for m in want if m not in all_configs]
+        if missing:
+            raise SystemExit(f"Unknown method(s) {missing}. "
+                             f"Choose from {list(all_configs)}")
+        configs = {m: all_configs[m] for m in want}
+    else:
+        configs = all_configs
+
     nodes, solved, times, cuts = run(
-        model, device, {**BASELINES, **ABLATIONS},
+        model, device, configs,
         n_instances=args.n_instances,
         generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
                               density=args.density),
