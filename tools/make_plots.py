@@ -44,7 +44,7 @@ LEARNED_C, SCIP_C, BASE_C = "#3b6fb0", "#444444", "#b0b0b0"
 
 def _label(m):
     return {
-        "scip": "SCIP", "random": "random", "most_fractional": "most-frac",
+        "scip": "SCIP", "strong_branching": "strong", "pseudocost": "pscost", "random": "random", "most_fractional": "most-frac",
         "policy_only": "policy", "value_rollout": "+value",
         "cost_to_go": "+ctg", "tree_rollout": "+tree", "reward_return": "+reward",
     }.get(m, m)
@@ -52,12 +52,13 @@ def _label(m):
 
 def plot_nodes(data, outdir):
     nodes = data["per_instance"]
-    order = [m for m in ["scip", "random", "most_fractional", "policy_only",
-                         "value_rollout", "cost_to_go", "tree_rollout",
-                         "reward_return"] if m in nodes]
+    order = [m for m in ["strong_branching", "scip", "pseudocost", "random",
+                         "most_fractional", "policy_only", "value_rollout",
+                         "cost_to_go", "tree_rollout", "reward_return"]
+             if m in nodes]
     meds = [np.median(np.asarray(nodes[m], float)) for m in order]
-    colors = [SCIP_C if m == "scip"
-              else BASE_C if m in ("random", "most_fractional")
+    colors = [SCIP_C if m in ("scip", "strong_branching")
+              else BASE_C if m in ("random", "most_fractional", "pseudocost")
               else LEARNED_C for m in order]
     fig, ax = plt.subplots(figsize=(5.4, 3.0))
     ax.bar([_label(m) for m in order], meds, color=colors)
@@ -74,12 +75,13 @@ def plot_solved(data, outdir):
     solved = data.get("solved")
     if not solved:
         print("no 'solved' field; skipping %solved plot"); return
-    order = [m for m in ["scip", "random", "most_fractional", "policy_only",
-                         "value_rollout", "cost_to_go", "tree_rollout",
-                         "reward_return"] if m in solved]
+    order = [m for m in ["strong_branching", "scip", "pseudocost", "random",
+                         "most_fractional", "policy_only", "value_rollout",
+                         "cost_to_go", "tree_rollout", "reward_return"]
+             if m in solved]
     pct = [100.0 * np.mean(np.asarray(solved[m], float)) for m in order]
-    colors = [SCIP_C if m == "scip"
-              else BASE_C if m in ("random", "most_fractional")
+    colors = [SCIP_C if m in ("scip", "strong_branching")
+              else BASE_C if m in ("random", "most_fractional", "pseudocost")
               else LEARNED_C for m in order]
     fig, ax = plt.subplots(figsize=(5.4, 3.0))
     ax.bar([_label(m) for m in order], pct, color=colors)

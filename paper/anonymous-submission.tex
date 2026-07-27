@@ -398,32 +398,46 @@ enabling the value-based rollout, the cost-to-go objective, the tree-structured
 rollout, and the reward-based return.
 
 \subsection{Results}
-% [TODO: insert numbers once the retrained model is evaluated.]
-Table~\ref{tab:main} reports the four metrics for each method. Following standard
-reproducibility guidance, node counts are given as a mean with standard deviation
-over the held-out set, and each learned method is assessed against SCIP with a
-Wilcoxon signed-rank test on the paired per-instance counts, computed on the
-both-solved subset described above.
+Table~\ref{tab:main} reports the four metrics on the medium tier ($30$
+instances). Node counts are heavy-tailed, so we give both the median and the
+mean$\pm$std. The learned policy explores far fewer nodes than the naive
+heuristics (random, most-fractional) and closes more instances, but it does not
+match the pseudocost rule, SCIP, or strong branching; strong branching attains
+the fewest nodes but is the slowest. Among the learned variants, the full model
+(reward return) does not reduce the median below the imitation policy, but it
+has the lowest variance---its worst-case node count is markedly smaller
+(max.\ $3437$ vs.\ $5548$ for imitation)---so the latent lookahead trims the
+tail rather than the median. All node and time comparisons are on the
+both-solved subset.
 
 \begin{table}[t]
 \centering
-\begin{tabular}{lcccc}
+\small
+\begin{tabular}{lccccc}
 \toprule
-Method & \%\,Opt. & Nodes & Time (s) & Cuts \\
+Method & \%\,Opt. & Median & Nodes (mean$\pm$std) & Time & Cuts \\
 \midrule
-SCIP pseudocost      & -- & -- & -- & -- \\
-Random               & -- & -- & -- & -- \\
-Most-fractional      & -- & -- & -- & -- \\
-Learned policy only  & -- & -- & -- & -- \\
-\ + value rollout    & -- & -- & -- & -- \\
-\ + cost-to-go       & -- & -- & -- & -- \\
-\ + tree rollout     & -- & -- & -- & -- \\
-\ + reward return    & -- & -- & -- & -- \\
+Strong branching & 97  & \textbf{13}  & \textbf{18}\,$\pm$\,21   & 20.6 & 26.9 \\
+SCIP             & 100 & 41           & 104\,$\pm$\,230          & 9.2  & 25.4 \\
+Pseudocost       & 100 & 229          & 304\,$\pm$\,381          & 7.1  & 25.3 \\
+Most-fractional  & 93  & 1585         & 3105\,$\pm$\,3855        & 29.4 & 25.6 \\
+Random           & 93  & 2379         & 4415\,$\pm$\,4947        & 36.0 & 24.3 \\
+\midrule
+Imitation (policy) & 100 & 397        & 699\,$\pm$\,1032         & 16.1 & 23.9 \\
+\ + value rollout  & 100 & 462        & 654\,$\pm$\,958          & 18.2 & 25.4 \\
+\ + cost-to-go     & 100 & 430        & 709\,$\pm$\,990          & 18.3 & 24.8 \\
+\ + tree rollout   & 100 & 444        & 787\,$\pm$\,1253         & 19.4 & 24.4 \\
+\textbf{Ours (full)} & 100 & 484      & \textbf{626\,$\pm$\,690} & 17.5 & 25.6 \\
 \bottomrule
 \end{tabular}
-\caption{Optimality rate, explored nodes, solving time, and cuts applied per
-method. Node and time comparisons use the both-solved subset. [Placeholder;
-filled once the retrained model is evaluated.]}
+\caption{Medium tier ($500\times1000$ Set Cover, $30$ instances). \%\,Opt.\ is
+the fraction closed to optimality; nodes and time are on the both-solved subset.
+The learned policy beats the naive heuristics but not pseudocost, SCIP, or
+strong branching; our full model attains the lowest node variance among the
+learned variants. Cuts are SCIP's internal separators (equal across branching
+rules). Easy-tier results, where all strong methods solve in $\le\!2$ nodes,
+are in the appendix; the hard tier ($1000\times2000$) is intractable within the
+time budget for all methods, including SCIP.}
 \label{tab:main}
 \end{table}
 
