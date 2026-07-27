@@ -137,6 +137,9 @@ class BnBSolver:
         # "heuristic" (max-violation over the valid Gomory pool), "none".
         self.cut_mode            = cut_mode
         self._cuts_added         = 0                    # per-solve cut counter
+        # Branching mode for the ablation: "rollout" (latent world-model
+        # lookahead), "policy" (argmax policy, no rollout), "most_fractional".
+        self.branch_mode         = "rollout"
 
         # Main LP solves use the proven scipy path. highspy (if present) is used
         # ONLY for basis extraction in Gomory cut generation, via the stable
@@ -734,9 +737,23 @@ class BnBSolver:
         if len(frac_indices) == 0:
             return int(np.argmin(np.abs(x_lp - 0.5)))
 
+        # Classical baseline: branch on the most-fractional variable (no model).
+        if self.branch_mode == "most_fractional":
+            fr = np.abs(x_lp - np.round(x_lp))
+            return int(frac_indices[np.argmax(fr[frac_indices])])
+
         with torch.no_grad():
             bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
             scores = self.model.policy_scores(h_vars, z, bvec)
+
+            # Policy-only: take the top policy score, skip the latent rollout.
+            if self.branch_mode == "policy":
+                masked0 = torch.full_like(scores, -1e4)
+                masked0[torch.tensor(frac_indices, dtype=torch.long,
+                                     device=self.device)] = \
+                    scores[torch.tensor(frac_indices, dtype=torch.long,
+                                        device=self.device)]
+                return int(masked0.argmax())
 
             frac_t = torch.tensor(frac_indices, dtype=torch.long, device=self.device)
             valid_mask = torch.zeros(
