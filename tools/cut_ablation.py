@@ -76,6 +76,12 @@ def main():
     ap.add_argument("--density", type=float, default=0.15)
     ap.add_argument("--time_limit", type=float, default=60.0)
     ap.add_argument("--max_cuts", type=int, default=10)
+    ap.add_argument("--cut_threshold", type=float, default=0.3,
+                    help="sigmoid acceptance threshold for the LEARNED head. "
+                         "Set 0.0 to make it always take its top-max_cuts cuts, "
+                         "isolating the learned RANKING vs heuristic ranking "
+                         "(recommended: the absolute score is miscalibrated on "
+                         "instance sizes unlike training)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -98,7 +104,7 @@ def main():
     def make_solver(mode):
         return BnBSolver(
             model, device, time_limit=args.time_limit,
-            max_cuts_per_node=args.max_cuts, cut_score_threshold=0.3,
+            max_cuts_per_node=args.max_cuts, cut_score_threshold=args.cut_threshold,
             node_selection="bound", cut_mode=mode,
         )
 
