@@ -48,7 +48,7 @@
 \maketitle
 
 \begin{abstract}
-Branch-and-Cut, the core of modern Mixed-Integer Programming (MIP) solvers, makes costly heuristic choices at every search node: which variable to branch on and which cutting planes to add. Existing learning-based methods score these decisions from single-node features, leaving them blind to their downstream effect on the search. We introduce \emph{CutWorld}, a world model for Branch-and-Cut that forecasts the consequences of a decision in latent space, without extra LP solves. A bipartite GATv2 encoder maps each node to a graph latent and per-variable embeddings, and a causal Transformer predicts how both evolve under an action; grounding on the dual bound and latent overshooting keep multi-step predictions faithful. Because the model forecasts per-variable representations, the branching policy is re-applied to imagined states, unrolling a branching sequence in latent space and scoring each candidate by a MuZero-style return with a cost-to-go estimate of remaining tree size. The same latent selects globally valid Gomory cuts, so a single unified model drives branching, cut selection, and node ordering while provably preserving optimality. Framing this as a first instance of world models for optimization, we evaluate on Set Cover, reporting optimality, nodes, time, and cuts with ablations isolating each component.
+Branch-and-Cut, the core of modern Mixed-Integer Programming (MIP) solvers, makes costly heuristic choices at every search node: which variable to branch on and which cutting planes to add. Existing learning-based methods score these decisions from single-node features, leaving them blind to their downstream effect on the search. We introduce \emph{CutWorld}, a latent dynamics model for Branch-and-Cut that forecasts the consequences of a decision in latent space, without extra LP solves. A bipartite GATv2 encoder maps each node to a graph latent and per-variable embeddings, and a causal Transformer predicts how both evolve under an action; grounding on the dual bound and latent overshooting keep multi-step predictions faithful. Because the model forecasts per-variable representations, the branching policy is re-applied to imagined states, unrolling a branching sequence in latent space and scoring each candidate by a MuZero-style return with a cost-to-go estimate of remaining tree size. The same latent selects globally valid Gomory cuts, so a single unified model drives branching, cut selection, and node ordering while provably preserving optimality. Framing this as a first instance of learned dynamics models for optimization, we evaluate on Set Cover, reporting optimality, nodes, time, and cuts with ablations isolating each component.
 \end{abstract}
 
 % ---------------------------------------------------------------------------
@@ -68,12 +68,12 @@ CutWorld closes this gap with a learned latent dynamics model that simulates the
 
 \paragraph{Summary of Contributions}
 \begin{itemize}
-  \item \textbf{World models for optimization.} We propose learning a solver's
+  \item \textbf{Latent dynamics models for optimization.} We propose learning a solver's
   decision dynamics so that its discrete choices can be \emph{planned in
   imagination} rather than guessed by fixed heuristics, and realize the first
   concrete instance of this agenda inside Branch-and-Cut.
 
-  \item \textbf{A latent world model for Branch-and-Cut.} We instantiate this
+  \item \textbf{A latent dynamics model for Branch-and-Cut.} We instantiate this
   with a learned search-dynamics model that simulates the short-horizon
   consequences of search decisions in latent space, replacing expensive online
   LP solves with learned multi-step rollouts.
@@ -441,18 +441,18 @@ are provided.
 
 % ---------------------------------------------------------------------------
 \section{Conclusion}
-We have presented a world model for Branch-and-Cut that plans the solver's
+We have presented a latent dynamics model for Branch-and-Cut that plans the solver's
 discrete decisions---branching, node selection, and the selection of globally
 valid cutting planes---by imagining their consequences in latent space rather
 than computing them with LP solves, all while preserving the solver's optimality
 guarantee. We view this as the first realized instance of a broader agenda:
-learned world models for optimization, in which a solver's decision dynamics are
+learned learned dynamics models for optimization, in which a solver's decision dynamics are
 modeled so that its choices can be planned rather than guessed by fixed
 heuristics. Branch-and-Cut exercises the hardest version of that idea---planning
 inside an exact search tree under a strict correctness constraint---but the same
 machinery applies wherever a solver makes a sequence of discrete choices.
 Extending it to improvement search, such as learned large neighborhood search
-where the world model imagines the effect of re-optimizing a chosen subset of
+where the latent dynamics model imagines the effect of re-optimizing a chosen subset of
 variables, is a natural next step, and one where a forward model can be exploited
 without the exactness constraints of tree search.
 
