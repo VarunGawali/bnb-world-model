@@ -243,7 +243,8 @@ def run(model, device, configs, n_instances, generator_kwargs,
     model.eval()
 
     print(f"Evaluating {n_instances} instances | methods: {methods}\n")
-    for i in range(n_instances):
+    try:
+      for i in range(n_instances):
         instance = next(generator)
 
         # ---- SCIP default (pseudocost) ----
@@ -312,8 +313,19 @@ def run(model, device, configs, n_instances, generator_kwargs,
             f"{m}:{nodes[m][-1]}{'' if solved[m][-1] else '*'}" for m in methods
         )
         print(f"  [{i+1:3d}/{n_instances}] {row}")
+    except KeyboardInterrupt:
+        print("\nInterrupted -- saving completed instances only.")
 
-    print("  (* = hit time/node limit, NOT solved to optimality)")
+    # Truncate every method to the number of fully-completed instances so a
+    # mid-instance interrupt leaves aligned, valid arrays.
+    done_n = min(len(nodes[m]) for m in methods)
+    for m in methods:
+        nodes[m] = nodes[m][:done_n]
+        solved[m] = solved[m][:done_n]
+        times[m] = times[m][:done_n]
+        cuts[m] = cuts[m][:done_n]
+    print(f"  (* = hit time/node limit, NOT solved to optimality) "
+          f"[{done_n} instances completed]")
     return nodes, solved, times, cuts
 
 
