@@ -116,6 +116,41 @@ def plot_time(data, outdir):
     fig.savefig(p); plt.close(fig); print("wrote", p)
 
 
+def plot_tradeoff(data, outdir, tag="", title=None):
+    """Nodes-vs-time scatter: one labeled point per method (both log axes)."""
+    nodes = data["per_instance"]; times = data.get("times")
+    if not times:
+        print("no 'times' field; skipping tradeoff plot"); return
+    order = [m for m in ["strong_branching", "scip", "pseudocost", "random",
+                         "most_fractional", "policy_only", "value_rollout",
+                         "cost_to_go", "tree_rollout", "reward_return"]
+             if m in nodes and m in times]
+    fig, ax = plt.subplots(figsize=(5.0, 3.6))
+    for m in order:
+        x = float(np.median(np.asarray(nodes[m], float)))
+        y = float(np.mean(np.asarray(times[m], float)))
+        if m == "reward_return":
+            c, mk, sz = LEARNED_C, "*", 200        # highlight our full model
+        elif m in ("scip", "strong_branching"):
+            c, mk, sz = SCIP_C, "s", 60
+        elif m in ("random", "most_fractional", "pseudocost"):
+            c, mk, sz = BASE_C, "^", 60
+        else:
+            c, mk, sz = LEARNED_C, "o", 55
+        ax.scatter(x, y, c=c, marker=mk, s=sz, zorder=3)
+        ax.annotate(_label(m), (x, y), textcoords="offset points",
+                    xytext=(5, 4), fontsize=8)
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("median nodes (log)")
+    ax.set_ylabel("mean time, s (log)")
+    if title:
+        ax.set_title(title)
+    ax.grid(True, which="both", ls=":", lw=0.4, alpha=0.5)
+    fig.tight_layout()
+    p = os.path.join(outdir, f"fig_tradeoff{tag}.pdf")
+    fig.savefig(p); plt.close(fig); print("wrote", p)
+
+
 def plot_cuts(vals, outdir):
     names = ["no cuts", "max-violation", "learned"]
     fig, ax = plt.subplots(figsize=(4.0, 3.0))
@@ -138,6 +173,10 @@ def main():
     ap.add_argument("--cut_heur", type=float, default=None)
     ap.add_argument("--cut_learn", type=float, default=None)
     ap.add_argument("--outdir", default="paper/figures")
+    ap.add_argument("--tag", default="",
+                    help="suffix for the tradeoff filename, e.g. _medium, so a "
+                         "per-tier run does not overwrite (fig_tradeoff_medium.pdf)")
+    ap.add_argument("--title", default=None, help="title for the tradeoff plot")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -146,6 +185,7 @@ def main():
         plot_nodes(data, args.outdir)
         plot_solved(data, args.outdir)
         plot_time(data, args.outdir)
+        plot_tradeoff(data, args.outdir, tag=args.tag, title=args.title)
     if None not in (args.cut_none, args.cut_heur, args.cut_learn):
         plot_cuts([args.cut_none, args.cut_heur, args.cut_learn], args.outdir)
     if not args.ablation and args.cut_none is None:
