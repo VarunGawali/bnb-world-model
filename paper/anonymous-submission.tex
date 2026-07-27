@@ -588,4 +588,40 @@ completeness.}
 \label{fig:arch-full}
 \end{figure*}
 
+% ---------------------------------------------------------------------------
+\section{Easy-Tier Results}
+\label{app:easy}
+Table~\ref{tab:easy} reports the easy tier ($200\times400$ Set Cover, $30$
+instances). These instances are nearly trivial---SCIP and strong branching close
+them in a single node on average---so node counts are dominated by noise and the
+comparison is not informative; we include it for completeness. Every method
+solves all instances to optimality.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+Method & \%\,Opt. & Median & Nodes (mean$\pm$std) & Time & Cuts \\
+\midrule
+Strong branching & 100 & 1  & 1.3\,$\pm$\,0.9   & 1.05 & 22.4 \\
+SCIP             & 100 & 1  & 1.8\,$\pm$\,1.7   & 0.93 & 19.5 \\
+Pseudocost       & 100 & 6  & 14.8\,$\pm$\,22   & 0.85 & 19.4 \\
+Most-fractional  & 100 & 14 & 47.8\,$\pm$\,83   & 1.06 & 19.4 \\
+Random           & 100 & 9  & 74.2\,$\pm$\,171  & 1.04 & 18.5 \\
+\midrule
+Imitation (policy) & 100 & 22 & 68.1\,$\pm$\,118 & 1.31 & 21.2 \\
+\ + value rollout  & 100 & 8  & 60.3\,$\pm$\,104 & 1.67 & 20.6 \\
+\ + cost-to-go     & 100 & 15 & 90.5\,$\pm$\,152 & 2.11 & 18.3 \\
+\ + tree rollout   & 100 & 11 & 97.1\,$\pm$\,180 & 2.25 & 20.6 \\
+Ours (full)        & 100 & 12 & 89.4\,$\pm$\,187 & 2.05 & 19.0 \\
+\bottomrule
+\end{tabular}
+\caption{Easy tier ($200\times400$ Set Cover, $30$ instances). All methods solve
+every instance; the instances are near-trivial (SCIP and strong branching
+average $\le\!2$ nodes), so the node comparison is uninformative and included
+only for completeness.}
+\label{tab:easy}
+\end{table}
+
 \end{document}
