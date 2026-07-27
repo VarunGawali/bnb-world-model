@@ -68,15 +68,11 @@ CutWorld closes this gap with a learned latent dynamics model that simulates the
 
 \paragraph{Summary of Contributions}
 \begin{itemize}
-  \item \textbf{Latent dynamics models for optimization.} We propose learning a solver's
-  decision dynamics so that its discrete choices can be \emph{planned in
-  imagination} rather than guessed by fixed heuristics, and realize the first
-  concrete instance of this agenda inside Branch-and-Cut.
-
-  \item \textbf{A latent dynamics model for Branch-and-Cut.} We instantiate this
-  with a learned search-dynamics model that simulates the short-horizon
-  consequences of search decisions in latent space, replacing expensive online
-  LP solves with learned multi-step rollouts.
+  \item \textbf{A latent dynamics model for Branch-and-Cut.} We learn a
+  solver's decision dynamics---the first instance of \emph{latent dynamics
+  models for optimization}---so that branching and cutting are \emph{planned in
+  imagination} rather than chosen by fixed heuristics, replacing expensive
+  online LP solves with learned multi-step latent rollouts.
 
   \item \textbf{Unified control with exactness guarantees.} We show that a single latent model can simultaneously drive variable branching, node selection, and global cut propagation while strictly maintaining the solver's exact optimality guarantees.
 
