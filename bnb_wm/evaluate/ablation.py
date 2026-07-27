@@ -120,18 +120,35 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens):
     valid_mask = torch.zeros(scores_all.size(0), dtype=torch.bool, device=device)
     valid_mask[aset_t] = True
 
-    best_action, best_ret = int(top_k[0]), -float("inf")
+    rets = []
     for cand in top_k:
-        r = model.rollout_candidate(
+        rets.append(model.rollout_candidate(
             z, h_vars, int(cand),
             depth=cfg["depth"], gamma=cfg["gamma"],
             valid_mask=valid_mask, past_tokens=past_tokens,
             size_weight=0.0, ctg_weight=cfg["ctg_weight"],
             branch_factor=cfg["branch_factor"],
             use_reward_return=cfg["use_reward_return"],
-        )
-        if r > best_ret:
-            best_ret, best_action = r, int(cand)
+        ))
+
+    lam = cfg.get("anchor_lambda")
+    if lam is None:
+        # Original behaviour: branch on the max-return candidate.
+        best_action = int(top_k[int(np.argmax(rets))])
+    else:
+        # Policy-anchored selection: blend the policy's prior with the rollout
+        # return so the latent lookahead REFINES rather than overrides the
+        # policy. Both signals are standardized across the candidate set so
+        # lambda is scale-invariant (lambda=0 recovers the pure policy order).
+        pol = np.array([masked[int(c)].item() for c in top_k], dtype=float)
+        ret = np.array(rets, dtype=float)
+
+        def _z(x):
+            s = x.std()
+            return (x - x.mean()) / s if s > 1e-8 else np.zeros_like(x)
+
+        final = _z(pol) + lam * _z(ret)
+        best_action = int(top_k[int(np.argmax(final))])
 
     a_emb = h_vars[best_action].unsqueeze(0)
     _, past_tokens = model.dynamics_step(z, a_emb, past_tokens)
@@ -371,6 +388,10 @@ def main():
     ap.add_argument("--k", type=int, default=None,
                     help="override rollout candidate count (e.g. 2 to let the "
                          "rollout only re-rank the policy's top-2)")
+    ap.add_argument("--anchor_lambda", type=float, default=None,
+                    help="policy-anchored selection: blend standardized policy "
+                         "prior with lambda*rollout return (0 = pure policy, "
+                         "large = pure rollout). Try 0.3-1.0.")
     ap.add_argument("--methods", default=None,
                     help="comma-separated subset of methods to run (e.g. "
                          "'reward_return' for a fast final-model-vs-SCIP head-to-"
@@ -407,13 +428,15 @@ def main():
     # Inference-time overrides (no retraining): shallow one-step lookahead
     # (--depth 1) over a small candidate set (--k 2) keeps the latent dynamics
     # in the loop but avoids compounding error and over-riding the policy.
-    if args.depth is not None or args.k is not None:
+    if args.depth is not None or args.k is not None or args.anchor_lambda is not None:
         for name, cfg in configs.items():
             if cfg.get("mode") == "rollout":
                 if args.depth is not None:
                     cfg["depth"] = args.depth
                 if args.k is not None:
                     cfg["k"] = args.k
+                if args.anchor_lambda is not None:
+                    cfg["anchor_lambda"] = args.anchor_lambda
 
     nodes, solved, times, cuts = run(
         model, device, configs,
