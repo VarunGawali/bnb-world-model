@@ -234,7 +234,8 @@ Throughout, $d$ denotes the embedding dimension.
 Each node is a bipartite graph over the constraints and variables of the
 relaxation: variable nodes carry LP-derived features (solution value, reduced
 cost, bound and basis status), constraint nodes carry their features, and each
-edge carries its coefficient. A graph network with GATv2 attention
+edge carries its coefficient together with two derived features, the
+RHS-normalized value and the sign. A graph network with GATv2 attention
 \citep{brody2022how} performs two-directional message passing, and a learned
 attention readout pools the result:
 \begin{equation}
