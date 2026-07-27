@@ -365,6 +365,12 @@ def main():
                          "so the 'cuts' metric is meaningful. Default off, which "
                          "isolates branching quality for the node comparison.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--depth", type=int, default=None,
+                    help="override rollout depth for all rollout configs "
+                         "(e.g. 1 for a shallow one-step latent lookahead)")
+    ap.add_argument("--k", type=int, default=None,
+                    help="override rollout candidate count (e.g. 2 to let the "
+                         "rollout only re-rank the policy's top-2)")
     ap.add_argument("--methods", default=None,
                     help="comma-separated subset of methods to run (e.g. "
                          "'reward_return' for a fast final-model-vs-SCIP head-to-"
@@ -397,6 +403,17 @@ def main():
         configs = {m: all_configs[m] for m in want}
     else:
         configs = all_configs
+
+    # Inference-time overrides (no retraining): shallow one-step lookahead
+    # (--depth 1) over a small candidate set (--k 2) keeps the latent dynamics
+    # in the loop but avoids compounding error and over-riding the policy.
+    if args.depth is not None or args.k is not None:
+        for name, cfg in configs.items():
+            if cfg.get("mode") == "rollout":
+                if args.depth is not None:
+                    cfg["depth"] = args.depth
+                if args.k is not None:
+                    cfg["k"] = args.k
 
     nodes, solved, times, cuts = run(
         model, device, configs,
