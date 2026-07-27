@@ -291,11 +291,20 @@ R(c) = \sum_{j=1}^{K}\gamma^{\,j-1}\hat r_j \;+\; \gamma^{\,K-1}V(z_K)
 \label{eq:return}
 \end{equation}
 We expand a shallow tree of branching factor $b$ (the top-$b$ actions at each
-step, child returns averaged); $b\!=\!1$ recovers a single greedy rollout. We
-branch on $c^\star=\arg\max_c R(c)$. The same value drives \emph{node selection}:
-open nodes are ordered by ascending predicted cost-to-go $C(z)$, so the subtree
-expected to close soonest is explored first. Because these choices affect only
-search order, never the bounds or feasibility tests, exactness is preserved.
+step, child returns averaged); $b\!=\!1$ recovers a single greedy rollout.
+Rather than branching on $\arg\max_c R(c)$, which lets a single noisy rollout
+override a confident policy, we use a \emph{policy-anchored} rule: over the
+candidate set we standardize the policy scores and the returns and select
+$c^\star=\arg\max_c\big[\hat\pi(c)+\lambda\,\hat R(c)\big]$, so the latent
+lookahead refines the policy's ranking instead of replacing it ($\lambda\!=\!0$
+recovers the policy). A short horizon is used because deeper rollouts compound
+dynamics error, and the rollout is invoked only when the policy is
+uncertain---if the top candidate's probability exceeds a threshold, the policy
+choice is taken directly---so the lookahead cost is paid only on genuinely close
+decisions. The same value drives \emph{node selection}: open nodes are ordered
+by ascending predicted cost-to-go $C(z)$, so the subtree expected to close
+soonest is explored first. Because these choices affect only search order, never
+the bounds or feasibility tests, exactness is preserved.
 Algorithm~\ref{alg:select} summarizes candidate selection.
 
 \begin{algorithm}[t]
@@ -354,9 +363,13 @@ Each component has a supervised objective:
 \subsection{Setup}
 We evaluate on Set Cover instances generated with Ecole
 \citep{prouvost2020ecole} across easy, medium, and hard difficulty tiers, and we
-collect strong-branching trajectories for training. Our primary baseline is the
-SCIP solver with its default pseudocost branching; we also compare against two
-classical branching heuristics, random and most-fractional. We report four
+collect strong-branching trajectories for training. We compare against a
+spectrum of branching rules: the trivial \emph{random} and \emph{most-fractional}
+heuristics, the classical \emph{pseudocost} rule, \emph{full strong branching}
+(the near-optimal but expensive oracle our policy imitates), and \emph{SCIP}'s
+default reliability-pseudocost branching (the strong solver baseline). We also
+report an \emph{imitation} policy---the learned policy without any latent
+lookahead---as the prior learning-based approach. We report four
 metrics per method on a common held-out instance set: the fraction of instances
 closed to \emph{optimality} within the time limit, the number of explored
 \emph{nodes}, the wall-clock solving \emph{time}, and the number of
