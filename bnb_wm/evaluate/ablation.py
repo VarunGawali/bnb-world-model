@@ -200,7 +200,7 @@ def _episode_stats(env, fallback_steps):
 # ---------------------------------------------------------------------------
 
 def run(model, device, configs, n_instances, generator_kwargs,
-        time_limit=60, seed=0, separate=False):
+        time_limit=60, seed=0, separate=False, strong_branching=False):
     """
     Returns a dict: method -> list of per-instance node counts (aligned by index).
     "scip" is always included as the baseline.
@@ -232,7 +232,8 @@ def run(model, device, configs, n_instances, generator_kwargs,
         scip_params=scip_params,
     )
 
-    methods = ["scip"] + list(configs.keys())
+    methods = ["scip"] + (["strong_branching"] if strong_branching else []) \
+              + list(configs.keys())
     nodes = {m: [] for m in methods}
     solved = {m: [] for m in methods}          # solved-to-optimality flags
     times = {m: [] for m in methods}           # SCIP solving time (seconds)
@@ -255,6 +256,22 @@ def run(model, device, configs, n_instances, generator_kwargs,
         solved["scip"].append(opt)
         times["scip"].append(t)
         cuts["scip"].append(c)
+
+        # ---- full strong branching (the oracle the policy imitates) ----
+        if strong_branching:
+            ms = instance.copy_orig().as_pyscipopt()
+            ms.hideOutput()
+            ms.setParam("limits/time", time_limit)
+            ms.setParam("separating/maxrounds", sep_rounds)
+            ms.setParam("presolving/maxrounds", 0)
+            # Force full strong branching by giving it top rule priority.
+            ms.setParam("branching/fullstrong/priority", 536870911)
+            ms.optimize()
+            n, opt, t, c = _scip_metrics(ms, 0)
+            nodes["strong_branching"].append(n)
+            solved["strong_branching"].append(opt)
+            times["strong_branching"].append(t)
+            cuts["strong_branching"].append(c)
 
         # ---- each learned config ----
         for name, cfg in configs.items():
@@ -406,6 +423,9 @@ def main():
                     help="skip the rollout when the top candidate's softmax "
                          "probability exceeds this (e.g. 0.5): big speedup, "
                          "runs the lookahead only on genuinely close decisions.")
+    ap.add_argument("--strong_branching", action="store_true",
+                    help="add a full-strong-branching baseline (fewest nodes, "
+                         "but very slow -- the oracle the policy imitates).")
     ap.add_argument("--methods", default=None,
                     help="comma-separated subset of methods to run (e.g. "
                          "'reward_return' for a fast final-model-vs-SCIP head-to-"
@@ -461,6 +481,7 @@ def main():
         generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
                               density=args.density),
         time_limit=args.time_limit, seed=args.seed, separate=args.separate,
+        strong_branching=args.strong_branching,
     )
     summary = summarize(nodes, solved, times, cuts)
 
