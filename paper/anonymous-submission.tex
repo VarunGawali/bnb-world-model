@@ -203,16 +203,21 @@ fractional set $\mathcal{F}$, depth $K$, factor $b$
 \end{algorithm}
 
 \subsection{Cutting-plane selection}
-At each eligible node we generate globally valid cuts. For two tight covering
-constraints $i_1,i_2$ (rows of $A$) with shared support
-$S=\{j : A_{i_1 j}\!=\!A_{i_2 j}\!=\!1\}$, the intersection cut
-$\sum_{j\in S} x_j \ge 1$ is a Chv\'atal--Gomory inequality with multipliers
-$\tfrac{1}{2}(e_{i_1}+e_{i_2})$ rounded up. Such cuts hold for \emph{every}
-integer-feasible solution regardless of the branching above, so they are safely
-inherited by all descendants of the node that generates them---genuine
-Branch-and-Cut rather than cut-and-branch. A pointer head scores each candidate
-cut $\ell$ (with feature vector $\phi_\ell$: violation, efficacy, density,
-parallelism, objective cutoff, support fraction) against the node latent,
+The model performs cut \emph{selection}; validity is guaranteed by the
+generator, not the learner. We generate a pool of Gomory fractional cuts at the
+root from the LP optimal basis. Writing the relaxation in standard form---all
+variables nonnegative, with the box $0\le x\le 1$ lifted into explicit rows
+$x_j+t_j=1$ so every nonbasic variable rests at its lower bound---each basic
+structural variable $x_j$ with a fractional value $\bar b$ and tableau row
+$x_j+\sum_{k\in\mathcal N}\alpha_k v_k=\bar b$ yields the valid inequality
+$\sum_{k\in\mathcal N}\mathrm{frac}(\alpha_k)\,v_k \ge \mathrm{frac}(\bar b)$,
+which we express in the structural variables by substituting the slack
+definitions. Derived from globally valid rows with no branching bounds applied,
+these cuts hold for \emph{every} integer-feasible solution and are safely
+inherited by all descendants of the node---genuine Branch-and-Cut rather than
+cut-and-branch. A pointer head scores each candidate cut $\ell$ (with feature
+vector $\phi_\ell$: violation, efficacy, density, parallelism, objective cutoff,
+support fraction) against the node latent,
 $\rho_\ell = w^\top\tanh(W_k\,\mathrm{MLP}(\phi_\ell)+W_z z)$, and cuts with
 $\sigma(\rho_\ell)>\tau$ are added, replacing fixed heuristics such as maximum
 violation.
