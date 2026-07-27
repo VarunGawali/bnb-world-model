@@ -299,6 +299,34 @@ filled once the retrained model is evaluated.]}
 \label{tab:main}
 \end{table}
 
+\subsection{Cut selection}
+We isolate the learned cut-selection head in our own neural Branch-and-Cut
+solver, where the model controls which of the (globally valid) root Gomory cuts
+are added. All three modes---no cuts, max-violation selection, and learned
+selection---draw from the \emph{same} valid cut pool, so the comparison isolates
+the selection rule; every solve is verified to reach the true optimum (matching
+SCIP). Table~\ref{tab:cuts} reports mean explored nodes over 30 Set Cover
+instances under a cut budget of one and two cuts per node.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Selection rule & Nodes ($\le\!1$ cut) & Nodes ($\le\!2$ cuts) \\
+\midrule
+No cuts        & 7.73          & 7.73          \\
+Max-violation  & 7.07 ($-8.6\%$)  & 6.87 ($-11.2\%$) \\
+Learned        & \textbf{6.80} ($-12.1\%$) & 6.87 ($-11.2\%$) \\
+\bottomrule
+\end{tabular}
+\caption{Cut-selection ablation on Set Cover ($30$ instances, all closed to
+optimality). Valid cuts reduce explored nodes, and under the tightest budget of
+a single cut per node the learned head selects a more effective cut than the
+max-violation heuristic ($-12.1\%$ vs.\ $-8.6\%$); as the budget loosens both
+rules capture most of the benefit and converge.}
+\label{tab:cuts}
+\end{table}
+
 \subsection{Reproducibility}
 Experiments were run on NVIDIA Quadro RTX 5000 (16\,GB) GPUs under CUDA~13.2,
 using PyTorch and PyTorch Geometric. All seeds, hyperparameters, and source code
