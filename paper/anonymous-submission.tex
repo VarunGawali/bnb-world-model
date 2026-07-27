@@ -333,18 +333,20 @@ $\sigma(\rho_\ell)>\tau$ are added, replacing fixed heuristics such as maximum
 violation.
 
 \subsection{Learning objectives}
-Each component has a supervised objective. The policy is trained by masked
-cross-entropy against the strong-branching choice over the candidate set, and
-the value head by a Huber loss against the normalized dual bound. The dynamics
-model combines an MSE-plus-cosine latent-prediction loss on $z_{t+1}$, a
-reconstruction loss on the predicted $h_i^{\,t+1}$, grounding and reward losses
-on $\hat b$ and $\hat r$, and a \emph{latent-overshooting} loss that unrolls $K$
-steps from the model's own predictions and supervises each against the real
-future latent, reducing compounding error at rollout time. The cost-to-go head
-uses a Huber loss on $\log(1{+}(T{-}t))$, paired with a value-consistency term
-$\lVert V(\tilde z)-V(z)\rVert^2$ that aligns the value head to
-dynamics-predicted latents $\tilde z$. The cut head is trained by weighted
-binary cross-entropy against a cut-quality label.
+Each component has a supervised objective:
+\begin{itemize}
+  \item \textbf{Policy:} masked cross-entropy against the strong-branching
+  choice over the candidate set.
+  \item \textbf{Value:} Huber loss against the normalized dual bound.
+  \item \textbf{Dynamics:} MSE-plus-cosine latent prediction on $z_{t+1}$, a
+  reconstruction loss on $h_i^{\,t+1}$, grounding and reward losses on $\hat b$
+  and $\hat r$, and a \emph{latent-overshooting} loss unrolling $K$ steps from
+  the model's own predictions to curb compounding error.
+  \item \textbf{Cost-to-go:} Huber loss on $\log(1{+}(T{-}t))$, with a
+  value-consistency term $\lVert V(\tilde z)-V(z)\rVert^2$ aligning the value
+  head to dynamics-predicted latents $\tilde z$.
+  \item \textbf{Cut:} weighted binary cross-entropy against a cut-quality label.
+\end{itemize}
 
 % ---------------------------------------------------------------------------
 \section{Experiments}
