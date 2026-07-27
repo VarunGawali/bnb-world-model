@@ -82,49 +82,6 @@ CutWorld closes this gap with a learned latent dynamics model that simulates the
 \end{itemize}
 
 % ---------------------------------------------------------------------------
-\begin{figure*}[t]
-\centering
-\begin{tikzpicture}[
-  node distance=5mm and 9mm,
-  box/.style={draw, rounded corners, align=center, minimum height=10mm,
-              inner sep=3pt, font=\small},
-  lat/.style={align=center, font=\small},
-  heads/.style={draw, dashed, rounded corners, align=center,
-                minimum height=10mm, inner sep=3pt, font=\footnotesize},
-  arr/.style={-{Latex[length=2mm]}, thick},
-]
-\node[box] (inp) {B\&B node\\{\footnotesize bipartite}\\{\footnotesize graph}};
-\node[box, right=of inp] (enc) {GATv2\\Encoder};
-\node[lat, right=7mm of enc] (z) {$z,\{h_i\}$};
-\node[box, right=7mm of z] (dyn) {Causal\\Transformer\\{\footnotesize $z_{t+1},h_i^{t+1}$}};
-\node[box, right=of dyn] (plan) {Latent\\rollout\\{\footnotesize score $R(c)$}};
-\node[box, right=of plan] (dec) {Branch /\\Cut\\decision};
-\node[heads, below=8mm of z] (hd)
-  {Heads:\ $\pi$ (policy)\ \textbar\ $V$ (value)\\
-   $C$ (cost-to-go)\ \textbar\ $\rho$ (cut)};
-
-\draw[arr] (inp) -- (enc);
-\draw[arr] (enc) -- (z);
-\draw[arr] (z) -- (dyn);
-\draw[arr] (dyn) -- (plan);
-\draw[arr] (plan) -- (dec);
-\draw[arr] (z) -- (hd);
-\draw[arr] (hd.east) -| (plan.south);
-\draw[arr, dashed] (plan.north) to[out=60,in=120] node[above,font=\footnotesize]
-      {imagine next step (re-apply $\pi$)} (dyn.north);
-\end{tikzpicture}
-\caption{\textbf{CutWorld.} A GATv2 encoder maps each Branch-and-Cut node to a
-graph latent $z$ and per-variable embeddings $\{h_i\}$. A causal Transformer
-predicts how both evolve after an action, so the policy can be re-applied to an
-\emph{imagined} state and a branching sequence unrolled in latent space (dashed
-loop). Candidates are scored by the rollout return $R(c)$ (Eq.~\ref{eq:return});
-the same latent drives the value, cost-to-go, and cut-selection heads. The model
-chooses only \emph{which} decisions the solver makes, never the bounds or
-feasibility tests, so exactness is preserved (Proposition~\ref{prop:exact}).}
-\label{fig:arch}
-\end{figure*}
-
-% ---------------------------------------------------------------------------
 \section{Related Work}
 
 Learning to make solver decisions is an active area \citep{bengio2021machine}.
@@ -222,6 +179,48 @@ Gomory fractional cuts, which are valid by construction, and let the model
 
 % ---------------------------------------------------------------------------
 \section{Method}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=5mm and 9mm,
+  box/.style={draw, rounded corners, align=center, minimum height=10mm,
+              inner sep=3pt, font=\small},
+  lat/.style={align=center, font=\small},
+  heads/.style={draw, dashed, rounded corners, align=center,
+                minimum height=10mm, inner sep=3pt, font=\footnotesize},
+  arr/.style={-{Latex[length=2mm]}, thick},
+]
+\node[box] (inp) {B\&B node\\{\footnotesize bipartite}\\{\footnotesize graph}};
+\node[box, right=of inp] (enc) {GATv2\\Encoder};
+\node[lat, right=7mm of enc] (z) {$z,\{h_i\}$};
+\node[box, right=7mm of z] (dyn) {Causal\\Transformer\\{\footnotesize $z_{t+1},h_i^{t+1}$}};
+\node[box, right=of dyn] (plan) {Latent\\rollout\\{\footnotesize score $R(c)$}};
+\node[box, right=of plan] (dec) {Branch /\\Cut\\decision};
+\node[heads, below=8mm of z] (hd)
+  {Heads:\ $\pi$ (policy)\ \textbar\ $V$ (value)\\
+   $C$ (cost-to-go)\ \textbar\ $\rho$ (cut)};
+
+\draw[arr] (inp) -- (enc);
+\draw[arr] (enc) -- (z);
+\draw[arr] (z) -- (dyn);
+\draw[arr] (dyn) -- (plan);
+\draw[arr] (plan) -- (dec);
+\draw[arr] (z) -- (hd);
+\draw[arr] (hd.east) -| (plan.south);
+\draw[arr, dashed] (plan.north) to[out=60,in=120] node[above,font=\footnotesize]
+      {imagine next step (re-apply $\pi$)} (dyn.north);
+\end{tikzpicture}
+\caption{\textbf{CutWorld.} A GATv2 encoder maps each Branch-and-Cut node to a
+graph latent $z$ and per-variable embeddings $\{h_i\}$. A causal Transformer
+predicts how both evolve after an action, so the policy can be re-applied to an
+\emph{imagined} state and a branching sequence unrolled in latent space (dashed
+loop). Candidates are scored by the rollout return $R(c)$ (Eq.~\ref{eq:return});
+the same latent drives the value, cost-to-go, and cut-selection heads. The model
+chooses only \emph{which} decisions the solver makes, never the bounds or
+feasibility tests, so exactness is preserved (Proposition~\ref{prop:exact}).}
+\label{fig:arch}
+\end{figure*}
 
 We view Branch-and-Cut as a sequential decision process. At each node $t$ of the
 search the solver observes a state $s_t$ (the current relaxation), takes an action
