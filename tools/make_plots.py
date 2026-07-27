@@ -94,6 +94,28 @@ def plot_solved(data, outdir):
     fig.savefig(p); plt.close(fig); print("wrote", p)
 
 
+def plot_time(data, outdir):
+    times = data.get("times")
+    if not times:
+        print("no 'times' field; skipping time plot"); return
+    order = [m for m in ["strong_branching", "scip", "pseudocost", "random",
+                         "most_fractional", "policy_only", "value_rollout",
+                         "cost_to_go", "tree_rollout", "reward_return"]
+             if m in times]
+    means = [float(np.mean(np.asarray(times[m], float))) for m in order]
+    colors = [SCIP_C if m in ("scip", "strong_branching")
+              else BASE_C if m in ("random", "most_fractional", "pseudocost")
+              else LEARNED_C for m in order]
+    fig, ax = plt.subplots(figsize=(5.4, 3.0))
+    ax.bar([_label(m) for m in order], means, color=colors)
+    ax.set_ylabel("mean solve time (s)")
+    ax.set_title("Solving time by branching rule")
+    plt.xticks(rotation=30, ha="right")
+    fig.tight_layout()
+    p = os.path.join(outdir, "fig_time.pdf")
+    fig.savefig(p); plt.close(fig); print("wrote", p)
+
+
 def plot_cuts(vals, outdir):
     names = ["no cuts", "max-violation", "learned"]
     fig, ax = plt.subplots(figsize=(4.0, 3.0))
@@ -123,6 +145,7 @@ def main():
         data = json.load(open(args.ablation))
         plot_nodes(data, args.outdir)
         plot_solved(data, args.outdir)
+        plot_time(data, args.outdir)
     if None not in (args.cut_none, args.cut_heur, args.cut_learn):
         plot_cuts([args.cut_none, args.cut_heur, args.cut_learn], args.outdir)
     if not args.ablation and args.cut_none is None:

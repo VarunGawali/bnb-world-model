@@ -447,10 +447,12 @@ time budget for all methods, including SCIP.}
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.49\linewidth]{figures/fig_ablation_nodes.pdf}\hfill
-\IfFileExists{figures/fig_solved.pdf}
-  {\includegraphics[width=0.49\linewidth]{figures/fig_solved.pdf}}{}
-\caption{Explored nodes (median, log scale) and optimality rate by branching
-rule. Node counts are compared on the both-solved subset.}
+\IfFileExists{figures/fig_time.pdf}
+  {\includegraphics[width=0.49\linewidth]{figures/fig_time.pdf}}{}
+\caption{Median explored nodes (log scale, left) and mean solve time (right) by
+branching rule on the medium tier. The learned model uses fewer nodes than the
+naive heuristics and is faster than strong branching (which is cheapest in nodes
+but most expensive per node), though it does not match pseudocost or SCIP.}
 \label{fig:results}
 \end{figure}}{}
 
