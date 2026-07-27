@@ -151,6 +151,46 @@ def plot_tradeoff(data, outdir, tag="", title=None):
     fig.savefig(p); plt.close(fig); print("wrote", p)
 
 
+TIER_COLORS = {"easy": "#4c9f70", "medium": "#3b6fb0", "hard": "#c25b56"}
+
+
+def plot_tradeoff_combined(specs, outdir):
+    """One node-vs-time scatter across all tiers, color-coded by tier.
+
+    `specs` is a list of (tier_label, json_path). Each method contributes one
+    point per tier; the full model is drawn as a star.
+    """
+    fig, ax = plt.subplots(figsize=(5.4, 4.0))
+    for label, path in specs:
+        data = json.load(open(path))
+        nodes = data["per_instance"]; times = data.get("times")
+        if not times:
+            continue
+        color = TIER_COLORS.get(label, "#666666")
+        for m in nodes:
+            if m not in times:
+                continue
+            x = float(np.median(np.asarray(nodes[m], float)))
+            y = float(np.mean(np.asarray(times[m], float)))
+            star = (m == "reward_return")
+            ax.scatter(x, y, c=color, marker="*" if star else "o",
+                       s=220 if star else 30, edgecolors="k" if star else "none",
+                       linewidths=0.5, zorder=3 if star else 2, alpha=0.9)
+        # legend proxy per tier
+        ax.scatter([], [], c=color, marker="o", s=40, label=label)
+    ax.scatter([], [], c="#666666", marker="*", s=120, edgecolors="k",
+               linewidths=0.5, label="our full model")
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("median nodes (log)")
+    ax.set_ylabel("mean time, s (log)")
+    ax.set_title("Node--time trade-off across problem sizes")
+    ax.grid(True, which="both", ls=":", lw=0.4, alpha=0.5)
+    ax.legend(frameon=False, fontsize=9, loc="upper left")
+    fig.tight_layout()
+    p = os.path.join(outdir, "fig_tradeoff_all.pdf")
+    fig.savefig(p); plt.close(fig); print("wrote", p)
+
+
 def plot_cuts(vals, outdir):
     names = ["no cuts", "max-violation", "learned"]
     fig, ax = plt.subplots(figsize=(4.0, 3.0))
@@ -177,8 +217,15 @@ def main():
                     help="suffix for the tradeoff filename, e.g. _medium, so a "
                          "per-tier run does not overwrite (fig_tradeoff_medium.pdf)")
     ap.add_argument("--title", default=None, help="title for the tradeoff plot")
+    ap.add_argument("--combined", default=None,
+                    help="combined color-coded scatter across tiers, e.g. "
+                         "'easy:results/easy.json,medium:results/medium.json'")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
+
+    if args.combined:
+        specs = [tuple(s.split(":", 1)) for s in args.combined.split(",") if s]
+        plot_tradeoff_combined(specs, args.outdir)
 
     if args.ablation:
         data = json.load(open(args.ablation))
