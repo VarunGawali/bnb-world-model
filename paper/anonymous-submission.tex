@@ -167,7 +167,6 @@ prior methods learn each decision in isolation.
 % ---------------------------------------------------------------------------
 \section{Background and Problem Formulation}
 
-\begin{definition}[Mixed-Integer Program]
 A (binary) Mixed-Integer Program minimizes a linear objective over integer
 variables subject to linear constraints,
 \begin{equation}
@@ -175,7 +174,6 @@ variables subject to linear constraints,
 \end{equation}
 with $c\in\mathbb{R}^n$, $A\in\mathbb{R}^{m\times n}$, $b\in\mathbb{R}^m$. Set
 Cover is the case $A\in\{0,1\}^{m\times n}$, $b=\mathbf 1$.
-\end{definition}
 
 Branch-and-Cut solves the LP relaxation at each node; if the solution is
 fractional it either adds valid cutting planes $\alpha^\top x \ge \beta$ that
@@ -183,7 +181,6 @@ tighten the relaxation, or branches on a fractional variable $x_j$ into the
 subproblems $x_j=0$ and $x_j=1$. The number of nodes explored before optimality
 is proved is governed by these two choices.
 
-\begin{definition}[Branch-and-Cut as an MDP]
 We model the search as an MDP $(\mathcal S,\mathcal A,P,R,\gamma)$: a state
 $s_t$ is a search node (its LP relaxation as a constraint--variable graph); an
 action $a_t$ selects a fractional variable to branch on or a cut to add; the
@@ -191,7 +188,6 @@ transition $P$ is the solver's deterministic response (child LPs, tightened
 relaxation); and the per-step reward $r_t$ is the dual-bound improvement, a
 dense proxy for progress. The ultimate objective is to prove optimality in as
 few explored nodes as possible.
-\end{definition}
 
 The transition $P$ is realized by the solver itself---solving child LPs and
 re-optimizing---so evaluating the downstream effect of an action costs as much
