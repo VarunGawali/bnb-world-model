@@ -115,6 +115,16 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens):
     if leaf_prob > _LEAF_SKIP:
         return int(masked.argmax()), past_tokens
 
+    # Confidence gate: skip the (expensive) rollout when the policy is already
+    # confident. If the softmax mass on the top candidate exceeds the threshold,
+    # the lookahead almost always agrees, so take the policy pick directly. This
+    # removes the rollout on the majority of nodes -> large per-node speedup.
+    conf = cfg.get("skip_confident")
+    if conf is not None:
+        p_top = float(torch.softmax(scores_all[aset_t], dim=0).max())
+        if p_top >= conf:
+            return int(masked.argmax()), past_tokens
+
     k = min(cfg["k"], len(action_set))
     top_k = masked.topk(k).indices
     valid_mask = torch.zeros(scores_all.size(0), dtype=torch.bool, device=device)
@@ -392,6 +402,10 @@ def main():
                     help="policy-anchored selection: blend standardized policy "
                          "prior with lambda*rollout return (0 = pure policy, "
                          "large = pure rollout). Try 0.3-1.0.")
+    ap.add_argument("--skip_confident", type=float, default=None,
+                    help="skip the rollout when the top candidate's softmax "
+                         "probability exceeds this (e.g. 0.5): big speedup, "
+                         "runs the lookahead only on genuinely close decisions.")
     ap.add_argument("--methods", default=None,
                     help="comma-separated subset of methods to run (e.g. "
                          "'reward_return' for a fast final-model-vs-SCIP head-to-"
@@ -428,7 +442,8 @@ def main():
     # Inference-time overrides (no retraining): shallow one-step lookahead
     # (--depth 1) over a small candidate set (--k 2) keeps the latent dynamics
     # in the loop but avoids compounding error and over-riding the policy.
-    if args.depth is not None or args.k is not None or args.anchor_lambda is not None:
+    if any(x is not None for x in
+           (args.depth, args.k, args.anchor_lambda, args.skip_confident)):
         for name, cfg in configs.items():
             if cfg.get("mode") == "rollout":
                 if args.depth is not None:
@@ -437,6 +452,8 @@ def main():
                     cfg["k"] = args.k
                 if args.anchor_lambda is not None:
                     cfg["anchor_lambda"] = args.anchor_lambda
+                if args.skip_confident is not None:
+                    cfg["skip_confident"] = args.skip_confident
 
     nodes, solved, times, cuts = run(
         model, device, configs,
