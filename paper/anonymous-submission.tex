@@ -127,28 +127,45 @@ feasibility tests, so exactness is preserved (Proposition~\ref{prop:exact}).}
 % ---------------------------------------------------------------------------
 \section{Related Work}
 
+\paragraph{Learned branching.}
 Learning to make solver decisions is an active area \citep{bengio2021machine}.
-For branching, \citet{khalil2016learning} learn scores from strong-branching
-labels, and \citet{gasse2019exact} represent a node as a bipartite
-constraint--variable graph and train a graph convolutional network to imitate
-strong branching; the latter architecture is the backbone we build on.
+The dominant approach is imitation: \citet{khalil2016learning} regress
+strong-branching scores from hand-crafted features, and \citet{gasse2019exact}
+represent a node as a bipartite constraint--variable graph and train a graph
+network to imitate strong branching in a single forward pass. This amortizes
+the cost of strong branching but discards the very signal that makes it
+strong---the quality of the subtree each candidate ultimately induces. The
+bipartite encoder of \citet{gasse2019exact} is the node representation we build
+on. Reinforcement learning restores a longer horizon: \citet{scavuzzo2022learning}
+train a branching policy with tree-structured returns, and
 \citet{nair2020solving} scale neural MIP solving with learned diving and
-branching, and \citet{scavuzzo2022learning} train a branching policy with
-reinforcement learning using tree-structured returns. For cutting planes,
-\citet{tang2020reinforcement} cast cut selection as a sequential decision
-problem and learn it with reinforcement learning, and learned large neighborhood
-search \citep{sonnerat2021learning} targets yet another solver decision. All of
-these methods evaluate a candidate from the state of the current node.
+branching. These methods optimize long-term reward, but remain \emph{model-free}:
+they treat the solver as a black box and never learn how a decision reshapes the
+subsequent search state.
 
-Our work is closer in spirit to model-based reinforcement learning. MuZero
-\citep{schrittwieser2020mastering} plans with a learned dynamics model that is
-never grounded in reconstructed observations, while Dreamer and its predecessors
-\citep{hafner2020dream} learn behaviors by imagination in a latent space, using
-latent overshooting to keep multi-step predictions faithful. We bring this style
-of latent-space planning inside a Branch-and-Cut solver: rather than ranking
-candidates by a static score, we simulate the subtree a decision induces and
-select the candidate whose imagined future is best, and we do so for cutting
-planes and node selection as well as for branching.
+\paragraph{Learned cutting planes.}
+Cut selection has been learned along the same lines. \citet{tang2020reinforcement}
+cast it as a sequential decision problem solved with reinforcement learning, and
+\citet{paulus2022learning} imitate a look-ahead expert that scores each cut by
+the bound improvement it yields---but the look-ahead only produces training
+labels; at inference the policy again predicts from the current node alone.
+Learned large neighborhood search \citep{sonnerat2021learning} targets yet
+another solver decision. Across branching and cutting alike, prior work scores a
+candidate either myopically or through an explicit, expensive look-ahead that
+the learned policy itself cannot invoke.
+
+\paragraph{Model-based planning.}
+CutWorld instead draws on model-based reinforcement learning. MuZero
+\citep{schrittwieser2020mastering} plans with a learned dynamics model without
+reconstructing observations, and Dreamer \citep{hafner2020dream} learns behaviors
+by imagination in latent space, using latent overshooting to keep multi-step
+predictions faithful. We bring this inside Branch-and-Cut, combining the
+bipartite representation of \citet{gasse2019exact} with a learned latent forward
+model: rather than ranking candidates by a static score or paying for explicit
+LP look-ahead, we \emph{imagine} the subtree a decision induces and recover
+strong branching's look-ahead signal at the cost of a few cheap latent rollouts.
+A single such model drives branching, cut selection, and node ordering, whereas
+prior methods learn each decision in isolation.
 
 % ---------------------------------------------------------------------------
 \section{Background and Problem Formulation}
