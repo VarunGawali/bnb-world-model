@@ -166,35 +166,55 @@ def _solve_standard_form(highspy, E, d, cost, N, M, tol):
     """
     Solve  min cost^T z  s.t.  E z = d,  z >= 0  with highspy, and return
     (basic_column_indices, z_values). Returns (None, None) if not solved.
+
+    Uses the version-stable passModel(HighsLp) API (the incremental
+    addVars/changeCols* API differs across highspy releases).
     """
-    h = highspy.Highs()
-    h.silent()
-
     inf = highspy.kHighsInf
-    # variables z >= 0 (no upper bound; box handled by the t-rows in E)
-    h.addVars(N, [0.0] * N, [inf] * N)
-    h.changeColsCostByRange(0, N - 1, cost.tolist())
 
-    # equality rows: lower == upper == d[i]
-    for i in range(M):
-        row = E[i]
-        nz = np.where(np.abs(row) > 1e-12)[0]
-        h.addRow(float(d[i]), float(d[i]), len(nz),
-                 nz.tolist(), row[nz].tolist())
+    lp = highspy.HighsLp()
+    lp.num_col_ = N
+    lp.num_row_ = M
+    lp.col_cost_  = cost.astype(np.float64).tolist()
+    lp.col_lower_ = [0.0] * N
+    lp.col_upper_ = [inf] * N
+    # equality rows: lower == upper == d
+    lp.row_lower_ = d.astype(np.float64).tolist()
+    lp.row_upper_ = d.astype(np.float64).tolist()
 
+    # Constraint matrix in column-wise (CSC) form.
+    lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
+    lp.a_matrix_.num_col_ = N
+    lp.a_matrix_.num_row_ = M
+    start, index, value = [], [], []
+    for j in range(N):
+        start.append(len(index))
+        col = E[:, j]
+        nz = np.where(np.abs(col) > 1e-12)[0]
+        for i in nz:
+            index.append(int(i))
+            value.append(float(col[i]))
+    start.append(len(index))
+    lp.a_matrix_.start_ = start
+    lp.a_matrix_.index_ = index
+    lp.a_matrix_.value_ = value
+
+    h = highspy.Highs()
+    h.setOptionValue("output_flag", False)
+    if h.passModel(lp) != highspy.HighsStatus.kOk:
+        return None, None
     h.run()
 
-    status = h.getInfoValue("primal_solution_status")[1]
-    if status != highspy.kSolutionStatusFeasible:
+    if h.getModelStatus() != highspy.HighsModelStatus.kOptimal:
         return None, None
 
     sol = h.getSolution()
     z = np.array(sol.col_value[:N], dtype=np.float64)
 
     basis = h.getBasis()
+    kBasic = highspy.HighsBasisStatus.kBasic
     col_status = list(basis.col_status)
-    # kBasic == 1 in the HiGHS basis-status enum (see bnb_solver warmstart).
-    basic_cols = np.array([j for j in range(N) if int(col_status[j]) == 1],
+    basic_cols = np.array([j for j in range(N) if col_status[j] == kBasic],
                           dtype=np.int64)
     # A valid basis for M equality rows has exactly M basic columns.
     if basic_cols.size != M:

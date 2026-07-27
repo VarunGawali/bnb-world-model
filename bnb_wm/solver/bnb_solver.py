@@ -133,14 +133,16 @@ class BnBSolver:
         self.use_global_context  = use_global_context  # inject global scalars (Gap 1)
         self.use_reward_return   = use_reward_return   # MuZero-style return (Fix 3)
 
-        # Detect highspy for LP warmstarting; fall back to scipy linprog
+        # Main LP solves use the proven scipy path. highspy (if present) is used
+        # ONLY for basis extraction in Gomory cut generation, via the stable
+        # passModel API — the incremental highspy build API (addVars/
+        # changeColsCostByRange) varies across versions and is avoided here.
         try:
             import highspy
             self._highs = highspy
-            self._use_highs_direct = True
         except ImportError:
             self._highs = None
-            self._use_highs_direct = False
+        self._use_highs_direct = False
 
     # ------------------------------------------------------------------
     # Public interface
