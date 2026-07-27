@@ -332,27 +332,19 @@ $\rho_\ell = w^\top\tanh(W_k\,\mathrm{MLP}(\phi_\ell)+W_z z)$, and cuts with
 $\sigma(\rho_\ell)>\tau$ are added, replacing fixed heuristics such as maximum
 violation.
 
-\subsection{Training}
-The components are trained in a five-stage curriculum, with the objectives:
-\begin{itemize}
-  \item \textbf{Policy} (imitation): masked cross-entropy of $\pi$ against the
-  strong-branching choice over the candidate set.
-  \item \textbf{Value}: Huber loss between $V(z)$ and the normalized dual bound.
-  \item \textbf{Dynamics}: an MSE\,$+$\,cosine latent-prediction loss on
-  $z_{t+1}$; a reconstruction loss on the predicted $h_i^{\,t+1}$; grounding and
-  reward losses on $\hat b,\hat r$; and \emph{latent overshooting}---unrolling
-  $K$ steps from the model's own predictions and supervising each against the
-  real future latent---to reduce compounding error at rollout time.
-  \item \textbf{Joint fine-tuning}: the above plus the cost-to-go loss (Huber on
-  $\log(1{+}(T{-}t))$) and a value-consistency term $\lVert V(\tilde z)-V(z)\rVert^2$
-  that trains the value head to read dynamics-\emph{predicted} latents
-  $\tilde z$ in distribution.
-  \item \textbf{Cut selection}: weighted binary cross-entropy of $\rho_\ell$
-  against a cut-quality label.
-\end{itemize}
-Class imbalance in the leaf-detection and cut-selection labels is corrected with a
-positive-class weight equal to the negative/positive ratio, and early stopping on
-a validation metric selects the best checkpoint in each stage.
+\subsection{Learning objectives}
+Each component has a supervised objective. The policy is trained by masked
+cross-entropy against the strong-branching choice over the candidate set, and
+the value head by a Huber loss against the normalized dual bound. The dynamics
+model combines an MSE-plus-cosine latent-prediction loss on $z_{t+1}$, a
+reconstruction loss on the predicted $h_i^{\,t+1}$, grounding and reward losses
+on $\hat b$ and $\hat r$, and a \emph{latent-overshooting} loss that unrolls $K$
+steps from the model's own predictions and supervises each against the real
+future latent, reducing compounding error at rollout time. The cost-to-go head
+uses a Huber loss on $\log(1{+}(T{-}t))$, paired with a value-consistency term
+$\lVert V(\tilde z)-V(z)\rVert^2$ that aligns the value head to
+dynamics-predicted latents $\tilde z$. The cut head is trained by weighted
+binary cross-entropy against a cut-quality label.
 
 % ---------------------------------------------------------------------------
 \section{Experiments}
@@ -372,6 +364,16 @@ method that is slow per node can appear to explore fewer nodes merely by timing
 out. Accordingly, all node and time comparisons are made on the subset of
 instances solved to optimality by \emph{both} the method and the baseline, which
 isolates decision quality from the timeout confound.
+
+\subsection{Training details}
+The objectives above are optimized in a five-stage curriculum so that each
+component builds on trained predecessors: (1) policy (encoder and policy head);
+(2) value (encoder and policy frozen); (3) dynamics (encoder frozen); (4) joint
+fine-tuning of all components with the cost-to-go and value-consistency terms;
+and (5) cut selection. Class imbalance in the leaf and cut labels is corrected
+with a positive-class weight equal to the negative/positive ratio, and early
+stopping on a validation metric selects each stage's best checkpoint. Full
+hyperparameters are listed in the appendix.
 
 \subsection{Ablation}
 To understand where any improvement comes from, we ablate the planner one
