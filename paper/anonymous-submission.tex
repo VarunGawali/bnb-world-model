@@ -482,6 +482,28 @@ rules capture most of the benefit and converge.}
 \label{tab:cuts}
 \end{table}
 
+\subsection{Discussion}
+Three findings stand out. First, the learned policy is a competent branching
+rule: it explores far fewer nodes than the naive heuristics and closes more
+instances, and it is markedly faster than the strong-branching oracle it
+imitates, confirming that the GNN amortizes strong branching into a cheap
+forward pass. Second, it nonetheless does not match the pseudocost rule or SCIP,
+whose reliability branching, presolving, and primal heuristics remain ahead;
+closing this gap is a matter of policy quality rather than planning, and points
+to reinforcement-learning fine-tuning with tree-structured returns
+\citep{scavuzzo2022learning} as the natural next step. Third, the latent
+lookahead does not lower the median node count below the imitation policy, but
+it reduces the variance and the worst-case node count, indicating that the
+learned dynamics is reliable enough to \emph{avoid} poor branches but not yet
+accurate enough to consistently \emph{improve} on a confident policy---hence the
+policy-anchored, confidence-gated design, and the value of a more faithful
+dynamics model as future work. In contrast, learned cut \emph{selection} yields
+a consistent gain over the max-violation heuristic (Table~\ref{tab:cuts}),
+suggesting that latent evaluation is presently more useful for scoring a small
+pool of candidate cuts than for re-ranking branching variables. Together these
+results map where a learned latent model does and does not yet help inside an
+exact solver, while preserving optimality throughout.
+
 \subsection{Reproducibility}
 Experiments were run on NVIDIA Quadro RTX 5000 (16\,GB) GPUs under CUDA~13.2,
 using PyTorch and PyTorch Geometric. All seeds, hyperparameters, and source code
