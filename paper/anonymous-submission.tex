@@ -188,10 +188,20 @@ We model the search as an MDP $(\mathcal S,\mathcal A,P,R,\gamma)$: a state
 $s_t$ is a search node (its LP relaxation as a constraint--variable graph); an
 action $a_t$ selects a fractional variable to branch on or a cut to add; the
 transition $P$ is the solver's deterministic response (child LPs, tightened
-relaxation); and the per-step reward $r_t$ is the dual-bound improvement. The
-control objective is to close the optimality gap in as few explored nodes as
-possible.
+relaxation); and the per-step reward $r_t$ is the dual-bound improvement, a
+dense proxy for progress. The ultimate objective is to prove optimality in as
+few explored nodes as possible.
 \end{definition}
+
+The transition $P$ is realized by the solver itself---solving child LPs and
+re-optimizing---so evaluating the downstream effect of an action costs as much
+as taking it, which is why prior learned policies avoid look-ahead. CutWorld's
+central idea is to learn a latent surrogate for $P$: an encoder maps states to
+a latent, and a learned dynamics model predicts how that latent transitions
+under an action, so a decision's consequences can be \emph{imagined} without
+invoking the solver. This turns look-ahead from an expensive oracle into a cheap
+forward pass, and the reward and node-count signals above become the learning
+targets for the model's reward and cost-to-go heads (Method).
 
 \begin{proposition}[Exactness]
 \label{prop:exact}
