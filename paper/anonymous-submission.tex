@@ -127,7 +127,6 @@ feasibility tests, so exactness is preserved (Proposition~\ref{prop:exact}).}
 % ---------------------------------------------------------------------------
 \section{Related Work}
 
-\paragraph{Learned branching.}
 Learning to make solver decisions is an active area \citep{bengio2021machine}.
 The dominant approach is imitation: \citet{khalil2016learning} regress
 strong-branching scores from hand-crafted features, and \citet{gasse2019exact}
@@ -143,7 +142,6 @@ branching. These methods optimize long-term reward, but remain \emph{model-free}
 they treat the solver as a black box and never learn how a decision reshapes the
 subsequent search state.
 
-\paragraph{Learned cutting planes.}
 Cut selection has been learned along the same lines. \citet{tang2020reinforcement}
 cast it as a sequential decision problem solved with reinforcement learning, and
 \citet{paulus2022learning} imitate a look-ahead expert that scores each cut by
@@ -154,7 +152,6 @@ another solver decision. Across branching and cutting alike, prior work scores a
 candidate either myopically or through an explicit, expensive look-ahead that
 the learned policy itself cannot invoke.
 
-\paragraph{Model-based planning.}
 CutWorld instead draws on model-based reinforcement learning. MuZero
 \citep{schrittwieser2020mastering} plans with a learned dynamics model without
 reconstructing observations, and Dreamer \citep{hafner2020dream} learns behaviors
