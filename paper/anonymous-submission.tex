@@ -470,9 +470,8 @@ completeness.}
 \IfFileExists{figures/medium_time.pdf}
   {\includegraphics[width=0.48\linewidth]{figures/medium_time.pdf}}{}
 \caption{Median explored nodes (log scale, left) and mean solve time (right) by
-branching rule on the medium tier. The learned model uses fewer nodes than the
-naive heuristics and is faster than strong branching (cheapest in nodes but most
-expensive per node), though it does not match pseudocost or SCIP.}
+branching rule on the easy tier. The same ordering holds as on the medium tier,
+with all learned variants preserving optimality.}
 \label{fig:results}
 \end{figure*}}{}
 
@@ -483,8 +482,9 @@ expensive per node), though it does not match pseudocost or SCIP.}
 \IfFileExists{figures/easy_time.pdf}
   {\includegraphics[width=0.48\linewidth]{figures/easy_time.pdf}}{}
 \caption{Median explored nodes (log scale, left) and mean solve time (right) by
-branching rule on the easy tier. The same ordering holds as on the medium tier,
-with all learned variants preserving optimality.}
+branching rule on the medium tier. The learned model uses fewer nodes than the
+naive heuristics and is faster than strong branching (cheapest in nodes but most
+expensive per node), though it does not match pseudocost or SCIP.}
 \label{fig:results-easy}
 \end{figure*}}{}
 
