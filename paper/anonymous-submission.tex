@@ -575,20 +575,32 @@ are provided.
 
 % ---------------------------------------------------------------------------
 \section{Conclusion}
-We have presented a latent dynamics model for Branch-and-Cut that plans the solver's
-discrete decisions, branching, node selection, and the selection of globally
-valid cutting planes, by imagining their consequences in latent space rather
-than computing them with LP solves, all while preserving the solver's optimality
-guarantee. We view this as the first realized instance of a broader agenda:
-learned learned dynamics models for optimization, in which a solver's decision dynamics are
-modeled so that its choices can be planned rather than guessed by fixed
-heuristics. Branch-and-Cut exercises the hardest version of that idea, planning
-inside an exact search tree under a strict correctness constraint, but the same
-machinery applies wherever a solver makes a sequence of discrete choices.
-Extending it to improvement search, such as learned large neighborhood search
-where the latent dynamics model imagines the effect of re-optimizing a chosen subset of
-variables, is a natural next step, and one where a forward model can be exploited
-without the exactness constraints of tree search.
+We have presented CutWorld, a latent dynamics model for Branch-and-Cut that
+plans the solver's discrete decisions, branching, node selection, and the
+selection of globally valid cutting planes, by imagining their consequences in
+latent space rather than computing them with LP solves, all while preserving the
+solver's optimality guarantee. We view this as a first realized instance of a
+broader agenda, learned dynamics models for optimization, in which a solver's
+decision dynamics are modeled so that its choices can be planned rather than
+guessed by fixed heuristics. Our study is deliberately a characterization rather
+than a claim of state of the art: the learned policy is a competent, cheap
+branching rule that beats the naive heuristics and amortizes strong branching
+into a single forward pass, and on the hard tier it explores the fewest nodes of
+any practical rule, but its per-node overhead and imitation ceiling leave it
+short of pseudocost and SCIP. The latent lookahead trims the tail of the node
+distribution rather than the median, and learned cut selection gives a
+consistent gain over the max-violation heuristic, so latent evaluation helps most
+where the candidate set is small. These results map where a learned dynamics
+model does and does not yet help inside an exact solver. Closing the branching
+gap is a matter of policy quality, pointing to reinforcement-learning
+fine-tuning with tree-structured returns and a more faithful dynamics model.
+Branch-and-Cut exercises the hardest version of the idea, planning inside an
+exact search tree under a strict correctness constraint, but the same machinery
+applies wherever a solver makes a sequence of discrete choices. Extending it to
+improvement search, such as learned large neighborhood search where the dynamics
+model imagines the effect of re-optimizing a chosen subset of variables, is a
+natural next step, and one where a forward model can be exploited without the
+exactness constraints of tree search.
 
 % ---------------------------------------------------------------------------
 \bibliographystyle{aaai2027}
