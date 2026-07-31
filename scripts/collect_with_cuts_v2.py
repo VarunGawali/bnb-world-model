@@ -33,9 +33,17 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# Make the package importable when this script is launched directly
+# (e.g. `python scripts/collect_with_cuts_v2.py`), where the repo root is not on
+# sys.path. Insert the repo root (parent of scripts/) before importing bnb_wm.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import ecole
 import numpy as np
