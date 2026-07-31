@@ -16,6 +16,8 @@ one B&B trajectory; ragged per-step arrays stored as object arrays):
     norm_dual_bounds       [T] float             normalised (value-head target)
     next_is_leaf           [T] float             1 if next node is a leaf
     depths                 [T] int
+    node_ids               [T] int               SCIP node id (P0.3 path recon)
+    parent_ids             [T] int               parent's SCIP node id
     cut_features           [T] of [n_cuts, 6]
     cut_labels             [T] of [n_cuts]
     cut_scores             [T] of [n_cuts]        (optional extra)
@@ -254,38 +256,85 @@ class SequenceDataset(Dataset):
     """
     Pre-encodes each trajectory into latent sequences for the dynamics model.
 
-    Uses the frozen encoder (from Phase 1/2) to turn every node into (z, h_vars),
-    then assembles one-step-shifted sequences. Returns a dict per trajectory:
+    P0.3 fix (Option A — root->node paths). The dynamics model is a *causal*
+    Transformer, so a training sequence is only meaningful if consecutive
+    positions are a genuine parent->child lineage. SCIP visits nodes in
+    best-/depth-first order, so the raw recorded order (z_0, z_1, ...) is NOT a
+    path — z_{t+1} is usually not the child of z_t. Training on it would feed
+    each transition a causal context of unrelated nodes.
 
-        z_seq          [T-1, H]        latents  z_0 .. z_{T-2}
-        a_seq          [T-1, H]        action embeddings (chosen var's h_vars)
-        z_next_seq     [T-1, H]        targets  z_1 .. z_{T-1}
-        bound_next_seq [T-1]           next norm dual bound (Gap 2 grounding)
+    Instead we reconstruct, from the collector's `node_ids`/`parent_ids`, every
+    true **root->leaf path** through the recorded tree and emit one sequence per
+    path. Along a path, position t's action a_t (the branching variable chosen
+    at that node) really does lead to the child latent at position t+1, so the
+    causal Transformer sees exactly the ancestry that produced each transition —
+    which is what makes the multi-step latent-rollout claim well-posed.
+
+    One dataset *item* is therefore one root->leaf path (not one file); a single
+    trajectory file yields as many items as it has recorded leaves. Paths are
+    capped to the `max_path_len` nearest ancestors so deep trees stay within the
+    Transformer's positional-embedding capacity and sequence lengths stay bounded.
+
+    Each item is a dict (P = path length, transitions = P-1):
+        z_seq          [P-1, H]        latents at the path's nodes (root..parent)
+        a_seq          [P-1, H]        action embeddings (chosen var's h_vars)
+        z_next_seq     [P-1, H]        child latents (the true next state)
+        bound_next_seq [P-1]           child norm dual bound (Gap 2 grounding)
+        reward_seq     [P-1]           child - parent dual-bound improvement
+        valid_len      int             P-1
 
       and, when include_vars is set (subsampled to keep memory bounded):
-        hv_seq         [T-1, K, H]     per-variable embeddings at t
-        hv_next_seq    [T-1, K, H]     per-variable embeddings at t+1
-        var_mask       [T-1, K] bool   valid (non-padding) positions
+        hv_seq         [P-1, K, H]     per-variable embeddings at parent nodes
+        hv_next_seq    [P-1, K, H]     per-variable embeddings at child nodes
+        var_mask       [P-1, K] bool   valid (non-padding) positions
 
-    Encoding one trajectory is a single batched encoder call.
+    Back-compat: files without `node_ids`/`parent_ids` (e.g. legacy captures or
+    the unit-test fixture) fall back to a single visitation-order sequence, the
+    pre-P0.3 behaviour, so old data and tests still load.
+
+    Encoding one trajectory is a single batched encoder call; the per-file
+    encoded bundle is computed once and every path from that file slices it.
     """
 
     def __init__(self, files, model, device, include_vars=True,
-                 max_vars_recon=64, seed=0, cache_dir=None):
+                 max_vars_recon=64, max_path_len=64, seed=0, cache_dir=None):
         self.files = list(files)
         self.model = model
         self.device = device
         self.include_vars = include_vars
         self.max_vars_recon = max_vars_recon
+        self.max_path_len = max_path_len
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
 
-        # Encode-once cache. In Phase 3 the encoder is frozen, so the per-file
-        # encoded sequence is identical every epoch — re-encoding through the GNN
-        # each epoch is the dominant cost. When cache_dir is set, epoch 1 encodes
-        # and saves each trajectory's output dict to disk; later epochs load it
-        # (no GNN forward). The cache is keyed by a fingerprint of the encoder
-        # weights + the (include_vars, max_vars_recon, seed) settings, so it is
-        # invalidated automatically if any of those change.
+        # Build a flat index of (file_idx, path) so each __getitem__ returns one
+        # root->leaf path. Path reconstruction reads only node_ids/parent_ids —
+        # no GNN forward — so this pass is cheap.
+        self.index = []            # list of (file_idx, path) ; path = list[int]
+        for fi, f in enumerate(self.files):
+            with np.load(f, allow_pickle=True) as d:
+                T = int(d["n_steps"])
+                if "node_ids" in d and "parent_ids" in d:
+                    paths = _root_to_leaf_paths(
+                        np.asarray(d["node_ids"]), np.asarray(d["parent_ids"]),
+                        self.max_path_len)
+                else:
+                    # Legacy: treat the whole visitation order as one sequence.
+                    paths = [list(range(T))] if T >= 2 else []
+            for p in paths:
+                self.index.append((fi, p))
+
+        # In-memory bundle cache for the most recently encoded file, so the
+        # several paths of one file reuse a single encoder forward when the
+        # loader draws them consecutively.
+        self._bundle_fi = None
+        self._bundle = None
+
+        # Encode-once disk cache of the per-file bundle. In Phase 3 the encoder
+        # is frozen, so the bundle is identical every epoch and re-encoding
+        # through the GNN each epoch is the dominant cost. Keyed by a fingerprint
+        # of the encoder weights + settings, so it invalidates automatically if
+        # any of those change.
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir is not None:
             fp = self._encoder_fingerprint()
@@ -302,42 +351,52 @@ class SequenceDataset(Dataset):
             h.update(v.detach().cpu().float().numpy().tobytes())
         return h.hexdigest()[:12]
 
-    def _cache_path(self, i):
+    def _cache_path(self, fi):
         # Key by file path (not list index) so train/val loaders sharing one
         # cache dir never collide on their 0-based indices.
         import hashlib
-        key = hashlib.md5(str(self.files[i]).encode()).hexdigest()[:16]
+        key = hashlib.md5(str(self.files[fi]).encode()).hexdigest()[:16]
         return self.cache_dir / f"{key}.pt"
 
     def __len__(self):
-        return len(self.files)
+        return len(self.index)
 
     @torch.no_grad()
     def __getitem__(self, i):
+        fi, path = self.index[i]
+        bundle = self._get_bundle(fi)
+        return self._slice_path(bundle, path)
+
+    def _get_bundle(self, fi):
+        """Return the per-file encoded bundle, using memory then disk cache."""
+        if fi == self._bundle_fi:
+            return self._bundle
+        bundle = None
         if self.cache_dir is not None:
-            cp = self._cache_path(i)
+            cp = self._cache_path(fi)
             if cp.exists():
-                return torch.load(cp, map_location="cpu")
-            out = self._encode(i)
-            torch.save(out, cp)
-            return out
-        return self._encode(i)
+                bundle = torch.load(cp, map_location="cpu")
+        if bundle is None:
+            bundle = self._encode_file(fi)
+            if self.cache_dir is not None:
+                torch.save(bundle, self._cache_path(fi))
+        self._bundle_fi = fi
+        self._bundle = bundle
+        return bundle
 
     @torch.no_grad()
-    def _encode(self, i):
-        d = np.load(self.files[i], allow_pickle=True)
+    def _encode_file(self, fi):
+        """
+        Encode every recorded node of one trajectory once. Returns a bundle of
+        per-node tensors (indexed by recorded step) that any path can slice:
+            z   [T, H]        graph latents
+            a   [T, H]        action embeddings (chosen branching var)
+            ndb [T]           normalised dual bounds
+            hv  [T, K, H]     per-variable embeddings (only if include_vars)
+        """
+        d = np.load(self.files[fi], allow_pickle=True)
         T = int(d["n_steps"])
-        # Need at least 2 nodes to form one transition.
-        if T < 2:
-            # Return a trivially-masked single step so collate stays uniform.
-            H = self.model.hidden_dim
-            return {
-                "z_seq": torch.zeros(1, H), "a_seq": torch.zeros(1, H),
-                "z_next_seq": torch.zeros(1, H),
-                "bound_next_seq": torch.zeros(1),
-                "reward_seq": torch.zeros(1),
-                "valid_len": 0,
-            }
+        H = self.model.hidden_dim
 
         datas = [
             build_pyg_data(d["var_features"][t], d["con_features"][t],
@@ -354,7 +413,6 @@ class SequenceDataset(Dataset):
         h_all = h_vars.cpu()
 
         branch = np.asarray(d["branching_vars"]).astype(np.int64)
-        # Action embedding at step t = chosen variable's embedding.
         a_list = []
         per_step_h = []
         for t in range(T):
@@ -365,31 +423,105 @@ class SequenceDataset(Dataset):
             a_list.append(ht[bv])
         a_all = torch.stack(a_list, dim=0)            # [T, H]
 
-        ndb = np.asarray(d["norm_dual_bounds"], dtype=np.float32)
-        out = {
-            "z_seq":          z[:-1],
-            "a_seq":          a_all[:-1],
-            "z_next_seq":     z[1:],
-            "bound_next_seq": torch.as_tensor(ndb[1:], dtype=torch.float32),
-            # Per-step reward = dual-bound improvement (Fix 3 target).
-            "reward_seq":     torch.as_tensor(ndb[1:] - ndb[:-1],
-                                              dtype=torch.float32),
-            "valid_len":      T - 1,
-        }
+        ndb = torch.as_tensor(
+            np.asarray(d["norm_dual_bounds"], dtype=np.float32))
 
-        if self.include_vars:
+        bundle = {"z": z, "a": a_all, "ndb": ndb, "H": H}
+
+        if self.include_vars and T > 0:
             n_vars = per_step_h[0].size(0)
             K = min(self.max_vars_recon, n_vars)
             # Fixed variable subset for the whole trajectory (same set each step,
-            # since the var_dynamics head is shared across variables).
-            sub = self.rng.choice(n_vars, size=K, replace=False)
+            # since the var_dynamics head is shared across variables). Seed with
+            # the file index so the subset is deterministic across epochs/cache.
+            sub = np.random.default_rng(self.seed + fi).choice(
+                n_vars, size=K, replace=False)
             sub = torch.as_tensor(np.sort(sub), dtype=torch.long)
-            hv = torch.stack([h[sub] for h in per_step_h], dim=0)   # [T, K, H]
-            out["hv_seq"]      = hv[:-1]
-            out["hv_next_seq"] = hv[1:]
-            out["var_mask"]    = torch.ones(T - 1, K, dtype=torch.bool)
+            bundle["hv"] = torch.stack([h[sub] for h in per_step_h], dim=0)  # [T,K,H]
 
+        return bundle
+
+    def _slice_path(self, bundle, path):
+        """Slice a root->leaf path out of a per-file bundle into a training item."""
+        H = bundle["H"]
+        # Need >= 2 nodes (one transition). Emit a trivially-masked item otherwise
+        # so collate stays uniform.
+        if len(path) < 2:
+            return {
+                "z_seq": torch.zeros(1, H), "a_seq": torch.zeros(1, H),
+                "z_next_seq": torch.zeros(1, H),
+                "bound_next_seq": torch.zeros(1),
+                "reward_seq": torch.zeros(1),
+                "valid_len": 0,
+            }
+        src = torch.as_tensor(path[:-1], dtype=torch.long)   # root..parent
+        dst = torch.as_tensor(path[1:],  dtype=torch.long)   # child..leaf
+        z, a, ndb = bundle["z"], bundle["a"], bundle["ndb"]
+        out = {
+            "z_seq":          z[src],
+            "a_seq":          a[src],
+            "z_next_seq":     z[dst],
+            "bound_next_seq": ndb[dst],
+            # Per-step reward = child-vs-parent dual-bound improvement (Fix 3).
+            "reward_seq":     ndb[dst] - ndb[src],
+            "valid_len":      int(src.numel()),
+        }
+        if self.include_vars and "hv" in bundle:
+            hv = bundle["hv"]
+            out["hv_seq"]      = hv[src]
+            out["hv_next_seq"] = hv[dst]
+            out["var_mask"]    = torch.ones(src.numel(), hv.size(1),
+                                            dtype=torch.bool)
         return out
+
+
+def _root_to_leaf_paths(node_ids, parent_ids, max_path_len):
+    """
+    Reconstruct every root->leaf path through the recorded B&B tree.
+
+    node_ids[t] / parent_ids[t] are SCIP's node id and its parent's id for the
+    t-th recorded node. Only a subset of tree nodes is recorded (SB branched
+    there, within max_steps), so an edge exists between recorded nodes u,v iff
+    v.parent_id == u.node_id. A leaf is a recorded node that is nobody's
+    recorded parent; walking parent pointers up from each leaf (stopping when the
+    parent is not itself recorded) yields that leaf's path. Fragments whose root
+    has an unrecorded parent simply start at that fragment root.
+
+    Returns a list of paths, each a list of recorded-step indices ordered
+    root..leaf, truncated to the last `max_path_len` nodes and dropped if it has
+    fewer than 2 nodes (no transition to learn).
+    """
+    node_ids = np.asarray(node_ids, dtype=np.int64)
+    parent_ids = np.asarray(parent_ids, dtype=np.int64)
+    T = len(node_ids)
+    id2idx = {int(nid): t for t, nid in enumerate(node_ids)}  # last wins on dup
+
+    parent_of = [None] * T          # parent's step index, or None if unrecorded
+    is_parent = [False] * T
+    for t in range(T):
+        pid = int(parent_ids[t])
+        if pid in id2idx and id2idx[pid] != t:
+            pidx = id2idx[pid]
+            parent_of[t] = pidx
+            is_parent[pidx] = True
+
+    paths = []
+    for leaf in range(T):
+        if is_parent[leaf]:
+            continue                # not a leaf
+        path = []
+        cur = leaf
+        seen = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            path.append(cur)
+            cur = parent_of[cur]
+        path.reverse()              # root..leaf
+        if len(path) >= 2:
+            if len(path) > max_path_len:
+                path = path[-max_path_len:]
+            paths.append(path)
+    return paths
 
 
 def make_sequence_collate(include_vars=True):
