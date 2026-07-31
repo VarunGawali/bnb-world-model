@@ -171,8 +171,14 @@ class DynamicsTransformer(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_seq = max_seq   # positional-embedding / causal-mask capacity
 
-        # Project [z_t || a_t] (2*hidden_dim) -> d_model
-        self.input_proj = nn.Linear(2 * hidden_dim, hidden_dim)
+        # Project [z_t || a_t || dir_t] -> d_model. The trailing scalar is the
+        # branch direction of the transition this action produces: +1 = up branch
+        # (lower bound tightened), -1 = down branch (upper bound tightened),
+        # 0 = root/unknown. Without it, a node whose up- and down-children are
+        # both recorded feeds two transitions with identical (z, a) but different
+        # next states, so the deterministic head could only learn their average
+        # (P0.12). The direction disambiguates which child a token predicts.
+        self.input_proj = nn.Linear(2 * hidden_dim + 1, hidden_dim)
 
         # Learned positional embeddings
         self.pos_emb = nn.Embedding(max_seq, hidden_dim)
@@ -204,10 +210,34 @@ class DynamicsTransformer(nn.Module):
         """Predict h_vars_{t+1} given current h_vars, predicted z_{t+1}, action a."""
         return self.var_dynamics(h_vars, z_next, a)
 
+    def _tokens(
+        self,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        d: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Build input tokens from latents, actions and the direction scalar.
+
+        `d` may be omitted (defaults to 0 = unknown/root) or given with or
+        without a trailing feature axis; it is broadcast to match z/a so the same
+        helper serves both the parallel [B, T, H] and single-step [B, H] paths.
+        """
+        if d is None:
+            d = z.new_zeros(*z.shape[:-1], 1)
+        else:
+            if not torch.is_tensor(d):
+                d = z.new_full((*z.shape[:-1], 1), float(d))
+            else:
+                d = d.to(z.dtype)
+                if d.dim() == z.dim() - 1:
+                    d = d.unsqueeze(-1)
+        return self.input_proj(torch.cat([z, a, d], dim=-1))
+
     def forward(
         self,
         z_seq: torch.Tensor,
         a_seq: torch.Tensor,
+        d_seq: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Parallel (training) forward over a full trajectory.
@@ -215,13 +245,15 @@ class DynamicsTransformer(nn.Module):
         Args:
             z_seq : [B, T, H]  graph embeddings at steps 0..T-1
             a_seq : [B, T, H]  action embeddings at steps 0..T-1
+            d_seq : [B, T]     branch direction of each transition (+1/-1/0),
+                               optional (defaults to 0 = unknown)
 
         Returns:
             z_pred : [B, T, H]  predicted z at steps 1..T
                      z_pred[:, t, :] is the prediction for z_{t+1}
         """
         B, T, _ = z_seq.shape
-        tokens = self.input_proj(torch.cat([z_seq, a_seq], dim=-1))  # [B, T, H]
+        tokens = self._tokens(z_seq, a_seq, d_seq)                   # [B, T, H]
         pos    = self.pos_emb(torch.arange(T, device=z_seq.device))  # [T, H]
         x = tokens + pos
 
@@ -236,6 +268,7 @@ class DynamicsTransformer(nn.Module):
         z_t: torch.Tensor,
         a_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
+        d_t: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Single-step inference. Maintains an explicit token buffer so
@@ -245,14 +278,14 @@ class DynamicsTransformer(nn.Module):
             z_t         : [B, H]        current graph embedding
             a_t         : [B, H]        current action embedding
             past_tokens : [B, t, H]     buffer of previous tokens (or None)
+            d_t         : [B] / scalar  branch direction of this action
+                                        (+1/-1/0), optional (defaults to 0)
 
         Returns:
             z_next      : [B, H]        predicted next embedding
             new_tokens  : [B, t+1, H]   updated token buffer
         """
-        token = self.input_proj(
-            torch.cat([z_t, a_t], dim=-1)
-        ).unsqueeze(1)                             # [B, 1, H]
+        token = self._tokens(z_t, a_t, d_t).unsqueeze(1)   # [B, 1, H]
 
         if past_tokens is None:
             tokens = token
@@ -281,6 +314,7 @@ class DynamicsTransformer(nn.Module):
         z0: torch.Tensor,
         a_seq: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
+        d_seq: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Autoregressive latent rollout for training-time latent overshooting.
@@ -303,7 +337,8 @@ class DynamicsTransformer(nn.Module):
         z_cur = z0
         tokens = past_tokens
         for j in range(a_seq.size(1)):
-            z_cur, tokens = self.step(z_cur, a_seq[:, j], tokens)
+            d_j = d_seq[:, j] if d_seq is not None else None
+            z_cur, tokens = self.step(z_cur, a_seq[:, j], tokens, d_j)
             preds.append(z_cur)
         return torch.stack(preds, dim=1)   # [B, k, H]
 
@@ -313,6 +348,7 @@ class DynamicsTransformer(nn.Module):
         a_t: torch.Tensor,
         h_vars_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
+        d_t: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Single-step inference that also predicts the next per-variable
@@ -323,13 +359,14 @@ class DynamicsTransformer(nn.Module):
             a_t         : [B, H]        current action embedding
             h_vars_t    : [V, H]        current per-variable embeddings
             past_tokens : [B, t, H]     token buffer (or None)
+            d_t         : [B] / scalar  branch direction (+1/-1/0), optional
 
         Returns:
             z_next      : [B, H]        predicted next graph embedding
             h_vars_next : [V, H]        predicted next per-variable embeddings
             new_tokens  : [B, t+1, H]   updated token buffer
         """
-        z_next, tokens = self.step(z_t, a_t, past_tokens)
+        z_next, tokens = self.step(z_t, a_t, past_tokens, d_t)
         # Predict per-variable evolution conditioned on the new graph latent
         # and the action taken. z_next[0]/a_t[0]: single-graph rollout.
         h_vars_next = self.var_dynamics(h_vars_t, z_next[0], a_t[0])
@@ -340,6 +377,7 @@ class DynamicsTransformer(nn.Module):
         z_seq: torch.Tensor,
         a_seq: torch.Tensor,
         h_vars_seq: torch.Tensor,
+        d_seq: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Parallel (training) forward returning BOTH the next graph latents and
@@ -351,11 +389,12 @@ class DynamicsTransformer(nn.Module):
             h_vars_seq : [B, T, V, H]   per-variable embeddings at steps 0..T-1
                          (padded to a common V; caller supplies a var mask
                           when computing the reconstruction loss)
+            d_seq      : [B, T]         branch directions (+1/-1/0), optional
 
         Returns:
             z_pred      : [B, T, H]      predicted z at steps 1..T
             h_vars_pred : [B, T, V, H]   predicted h_vars at steps 1..T
         """
-        z_pred = self.forward(z_seq, a_seq)                          # [B, T, H]
+        z_pred = self.forward(z_seq, a_seq, d_seq)                   # [B, T, H]
         h_vars_pred = self.var_dynamics(h_vars_seq, z_pred, a_seq)   # broadcast over V
         return z_pred, h_vars_pred

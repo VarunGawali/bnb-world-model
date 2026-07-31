@@ -330,15 +330,19 @@ class Trainer:
         z_seq      = d["z_seq"].to(self.device)
         a_seq      = d["a_seq"].to(self.device)
         z_next_seq = d["z_next_seq"].to(self.device)
+        # Branch direction per transition (+1/-1/0). Absent for legacy batches.
+        d_seq = d.get("dir_seq")
+        if d_seq is not None:
+            d_seq = d_seq.to(self.device)
 
         has_vars = d.get("hv_seq") is not None
         if has_vars:
             hv_seq = d["hv_seq"].to(self.device)
             z_pred, hv_pred = self.model.dynamics.forward_with_vars(
-                z_seq, a_seq, hv_seq
+                z_seq, a_seq, hv_seq, d_seq
             )
         else:
-            z_pred = self.model.dynamics_forward(z_seq, a_seq)
+            z_pred = self.model.dynamics_forward(z_seq, a_seq, d_seq)
 
         # Time-padding mask (present when batching variable-length trajectories).
         tmask = d.get("time_mask")
@@ -369,7 +373,8 @@ class Trainer:
             k = min(self.overshoot_depth, a_seq.size(1))
             if k > 0:
                 preds = self.model.dynamics.rollout(
-                    z_seq[:, 0], a_seq[:, :k]
+                    z_seq[:, 0], a_seq[:, :k],
+                    d_seq=d_seq[:, :k] if d_seq is not None else None,
                 )                                        # [B, k, H]
                 tgt = z_next_seq[:, :k]                   # real z_1 .. z_k
                 if tmask is not None:

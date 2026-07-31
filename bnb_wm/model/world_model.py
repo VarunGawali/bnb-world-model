@@ -193,22 +193,25 @@ class BnBWorldModel(nn.Module):
         self,
         z_seq: torch.Tensor,
         a_seq: torch.Tensor,
+        d_seq: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Parallel training forward over full trajectories.
 
         Args:
             z_seq : [B, T, H]  encoder embeddings along trajectory
             a_seq : [B, T, H]  action embeddings along trajectory
+            d_seq : [B, T]     branch directions (+1/-1/0), optional
         Returns:
             z_pred : [B, T, H]  predicted next embeddings (z_{t+1})
         """
-        return self.dynamics(z_seq, a_seq)
+        return self.dynamics(z_seq, a_seq, d_seq)
 
     def dynamics_step(
         self,
         z_t: torch.Tensor,
         a_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
+        d_t: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Single-step inference with token buffer (replaces GRU step).
 
@@ -216,11 +219,12 @@ class BnBWorldModel(nn.Module):
             z_t         : [B, H]
             a_t         : [B, H]
             past_tokens : [B, t, H] or None
+            d_t         : [B] / scalar  branch direction (+1/-1/0), optional
         Returns:
             z_next      : [B, H]
             past_tokens : [B, t+1, H]
         """
-        return self.dynamics.step(z_t, a_t, past_tokens)
+        return self.dynamics.step(z_t, a_t, past_tokens, d_t)
 
     def add_global_context(
         self,
@@ -257,12 +261,13 @@ class BnBWorldModel(nn.Module):
         a_t: torch.Tensor,
         h_vars_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
+        d_t: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Single-step latent transition that also predicts next h_vars.
 
         Returns (z_next [B,H], h_vars_next [V,H], past_tokens [B,t+1,H]).
         """
-        return self.dynamics.step_full(z_t, a_t, h_vars_t, past_tokens)
+        return self.dynamics.step_full(z_t, a_t, h_vars_t, past_tokens, d_t)
 
     # ------------------------------------------------------------------
     # Real latent rollout for candidate selection

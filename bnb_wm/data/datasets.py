@@ -281,6 +281,7 @@ class SequenceDataset(Dataset):
         z_next_seq     [P-1, H]        child latents (the true next state)
         bound_next_seq [P-1]           child norm dual bound (Gap 2 grounding)
         reward_seq     [P-1]           child - parent dual-bound improvement
+        dir_seq        [P-1]           branch direction +1/-1/0 (P0.12)
         valid_len      int             P-1
 
       and, when include_vars is set (subsampled to keep memory bounded):
@@ -426,7 +427,15 @@ class SequenceDataset(Dataset):
         ndb = torch.as_tensor(
             np.asarray(d["norm_dual_bounds"], dtype=np.float32))
 
-        bundle = {"z": z, "a": a_all, "ndb": ndb, "H": H}
+        # Branch direction of each node relative to its parent (+1 up / -1 down /
+        # 0 root). Legacy files without it fall back to 0 (a constant feature).
+        if "branch_dirs" in d:
+            bdir = torch.as_tensor(
+                np.asarray(d["branch_dirs"], dtype=np.float32))
+        else:
+            bdir = torch.zeros(T, dtype=torch.float32)
+
+        bundle = {"z": z, "a": a_all, "ndb": ndb, "dir": bdir, "H": H}
 
         if self.include_vars and T > 0:
             n_vars = per_step_h[0].size(0)
@@ -452,11 +461,12 @@ class SequenceDataset(Dataset):
                 "z_next_seq": torch.zeros(1, H),
                 "bound_next_seq": torch.zeros(1),
                 "reward_seq": torch.zeros(1),
+                "dir_seq": torch.zeros(1),
                 "valid_len": 0,
             }
         src = torch.as_tensor(path[:-1], dtype=torch.long)   # root..parent
         dst = torch.as_tensor(path[1:],  dtype=torch.long)   # child..leaf
-        z, a, ndb = bundle["z"], bundle["a"], bundle["ndb"]
+        z, a, ndb, bdir = bundle["z"], bundle["a"], bundle["ndb"], bundle["dir"]
         out = {
             "z_seq":          z[src],
             "a_seq":          a[src],
@@ -464,6 +474,9 @@ class SequenceDataset(Dataset):
             "bound_next_seq": ndb[dst],
             # Per-step reward = child-vs-parent dual-bound improvement (Fix 3).
             "reward_seq":     ndb[dst] - ndb[src],
+            # Direction of the branch that leads parent(src) -> child(dst): it is
+            # the child's own incoming branch direction (P0.12).
+            "dir_seq":        bdir[dst],
             "valid_len":      int(src.numel()),
         }
         if self.include_vars and "hv" in bundle:
@@ -540,6 +553,7 @@ def make_sequence_collate(include_vars=True):
         z_next  = torch.zeros(B, Tmax, H)
         bound   = torch.zeros(B, Tmax)
         reward  = torch.zeros(B, Tmax)
+        direction = torch.zeros(B, Tmax)
         tmask   = torch.zeros(B, Tmax, dtype=torch.bool)
 
         has_vars = include_vars and ("hv_seq" in batch[0])
@@ -559,6 +573,8 @@ def make_sequence_collate(include_vars=True):
             bound[i, :L]  = b["bound_next_seq"][:L]
             if "reward_seq" in b:
                 reward[i, :L] = b["reward_seq"][:L]
+            if "dir_seq" in b:
+                direction[i, :L] = b["dir_seq"][:L]
             tmask[i, :L]  = True
             if has_vars and "hv_seq" in b:
                 k = b["hv_seq"].size(1)
@@ -568,7 +584,8 @@ def make_sequence_collate(include_vars=True):
 
         out = {
             "z_seq": z_seq, "a_seq": a_seq, "z_next_seq": z_next,
-            "bound_next_seq": bound, "reward_seq": reward, "time_mask": tmask,
+            "bound_next_seq": bound, "reward_seq": reward,
+            "dir_seq": direction, "time_mask": tmask,
         }
         if has_vars:
             out["hv_seq"] = hv_seq

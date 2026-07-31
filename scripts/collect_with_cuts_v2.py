@@ -65,24 +65,51 @@ class AbsoluteDualBound:
 
 
 class NodeIdentity:
-    """P0.3: SCIP node number + parent number at the current node.
+    """P0.3/P0.12: SCIP node number, parent number, and branch direction.
 
-    These let the dataset reconstruct real tree edges: a recorded node v is a
-    child of recorded node u iff v.parent_id == u.node_id. That edge is a true
-    branch transition; consecutive *visitation* order is not.
+    node/parent id let the dataset reconstruct real tree edges: a recorded node
+    v is a child of recorded node u iff v.parent_id == u.node_id. That edge is a
+    true branch transition; consecutive *visitation* order is not.
+
+    direction is the branch that created this node relative to its parent:
+        +1  up branch   (lower bound tightened, SCIP_BOUNDTYPE_LOWER)
+        -1  down branch (upper bound tightened, SCIP_BOUNDTYPE_UPPER)
+         0  root / unknown
+    Without it a node whose up- and down-children are both recorded yields two
+    transitions with identical (state, chosen-variable) but different children,
+    so the deterministic dynamics head could only learn their average.
     """
     def before_reset(self, model: Any) -> None: ...
-    def extract(self, model: Any, done: bool) -> tuple[int, int]:
+
+    @staticmethod
+    def _direction(node: Any) -> int:
+        # getParentBranchings() -> (vars, bounds, boundtypes) applied when
+        # branching parent -> node, or None at the root. boundtype LOWER (0)
+        # means the lower bound was raised (up branch); UPPER (1) the upper
+        # bound was lowered (down branch). Take the first branching change.
+        try:
+            pb = node.getParentBranchings()
+        except Exception:
+            return 0
+        if not pb:
+            return 0
+        boundtypes = pb[2]
+        if boundtypes is None or len(boundtypes) == 0:
+            return 0
+        # SCIP_BOUNDTYPE_LOWER == 0 -> up (+1); SCIP_BOUNDTYPE_UPPER == 1 -> down.
+        return 1 if int(boundtypes[0]) == 0 else -1
+
+    def extract(self, model: Any, done: bool) -> tuple[int, int, int]:
         if done:
-            return (-1, -1)
+            return (-1, -1, 0)
         scip = model.as_pyscipopt()
         node = scip.getCurrentNode()
         if node is None:
-            return (-1, -1)
+            return (-1, -1, 0)
         nid = int(node.getNumber())
         parent = node.getParent()
         pid = int(parent.getNumber()) if parent is not None else -1
-        return (nid, pid)
+        return (nid, pid, self._direction(node))
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +287,7 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
 
     keys = ("var_features", "con_features", "edge_indices", "edge_values",
             "action_sets", "branching_vars", "local_branching_label",
-            "dual_bounds", "depths", "node_ids", "parent_ids")
+            "dual_bounds", "depths", "node_ids", "parent_ids", "branch_dirs")
     buf: dict[str, list[Any]] = {k: [] for k in keys}
 
     # --- root cut collection (once), valid Gomory, matches deploy (P0.4/P0.6) ---
@@ -286,7 +313,7 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
         chosen = int(aset[best_local])
 
         vf, cf, ei, ev = _node_bipartite_arrays(obs)
-        nid, pid = info.get("node", (-1, -1))
+        nid, pid, bdir = info.get("node", (-1, -1, 0))
         buf["var_features"].append(vf); buf["con_features"].append(cf)
         buf["edge_indices"].append(ei); buf["edge_values"].append(ev)
         buf["action_sets"].append(aset.astype(np.int32))
@@ -296,6 +323,7 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
         buf["depths"].append(int(nid))              # kept for back-compat readers
         buf["node_ids"].append(int(nid))
         buf["parent_ids"].append(int(pid))
+        buf["branch_dirs"].append(int(bdir))
 
         try:
             obs, action_set, _, done, info = env.step(chosen)
@@ -356,6 +384,7 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
         "depths": np.asarray(buf["depths"], dtype=np.int32),
         "node_ids": node_ids.astype(np.int64),
         "parent_ids": parent_ids.astype(np.int64),
+        "branch_dirs": np.asarray(buf["branch_dirs"], dtype=np.int8),
         "cut_features": cut_features, "cut_labels": cut_labels, "cut_scores": cut_scores,
         "cut_lhs": cut_lhs, "cut_rhs": cut_rhs, "n_cuts": n_cuts,
     }
