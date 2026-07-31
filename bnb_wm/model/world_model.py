@@ -285,6 +285,7 @@ class BnBWorldModel(nn.Module):
         ctg_weight: float = 0.0,
         branch_factor: int = 1,
         use_reward_return: bool = False,
+        expand_both_children: bool = True,
     ) -> float:
         """
         Estimate the quality of branching on `cand_idx` by rolling the learned
@@ -293,10 +294,13 @@ class BnBWorldModel(nn.Module):
         Unlike the earlier heuristic (which reused the same action embedding
         at every step), this performs a genuine rollout:
 
-            1. branch on cand_idx  -> predict z_1, h_vars_1
-            2. run the policy on h_vars_1 to pick the *next* branching var
+            1. branch on cand_idx  -> predict the up (+1) and down (-1) children
+               z_1, h_vars_1 for each, feeding the direction token the dynamics
+               model was trained on
+            2. run the policy on each child to pick the *next* branching var
             3. roll forward with that chosen action -> z_2, h_vars_2
-            4. repeat; accumulate discounted value estimates
+            4. repeat; accumulate discounted value estimates, summing the two
+               children (both are solved) and averaging over candidate variables
 
         The score combines two learned signals about the simulated subtree:
             + discounted value        (higher dual bound is better)
@@ -334,6 +338,20 @@ class BnBWorldModel(nn.Module):
                                    single value bootstrap at each leaf. If False
                                    (default) the legacy form sums the value at
                                    every step (the ablation baseline).
+            expand_both_children : bool  P0.12. Branching on a variable creates
+                                   TWO children — the up branch (direction +1,
+                                   lower bound raised) and the down branch
+                                   (direction -1, upper bound lowered). With this
+                                   True (default) each branching expands both,
+                                   feeding the matching direction token the
+                                   dynamics model was trained on, and sums the two
+                                   subtrees (both must be solved to close the
+                                   node). With False the rollout follows a single
+                                   direction-agnostic child (direction 0) — the
+                                   pre-P0.12 behaviour, retained as an ablation.
+                                   Note that after direction-conditioned training
+                                   direction 0 is off-distribution, so False is
+                                   only meaningful as a "direction ignored" baseline.
 
         Returns:
             score : float   higher is better (branch on the max-score candidate)
@@ -341,54 +359,70 @@ class BnBWorldModel(nn.Module):
         # Per-variable batch vector (single graph): every variable maps to graph 0.
         bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=z.device)
         b = max(1, branch_factor)
-        size_estimate = [0.0]   # captured from the candidate's immediate child
+        # Directions expanded per branching: both children, or a single
+        # direction-agnostic child (legacy). size accumulates across children, so
+        # it is a list we add into rather than overwrite.
+        directions = (1.0, -1.0) if expand_both_children else (0.0,)
+        size_estimate = [0.0]   # subtree size summed over the root's children
 
-        def expand(z_cur, h_cur, tokens_cur, a_idx, depth_left, g, is_root):
-            # Apply the action -> predicted next state (z and per-variable h).
+        def branch(z_cur, h_cur, tokens_cur, a_idx, depth_left, g, is_root):
+            """Value of branching on variable a_idx from the current node.
+
+            Explores every child in `directions`, summing their continuations —
+            both branches are part of the subtree that this decision creates.
+            """
             a_emb = h_cur[a_idx].unsqueeze(0)                    # [1, H]
-            z_n, h_n, tok = self.dynamics.step_full(
-                z_cur, a_emb, h_cur, tokens_cur
-            )
-            if use_reward_return:
-                # Immediate predicted reward (dual-bound improvement) for this
-                # transition; the value is bootstrapped only at the leaf below.
-                node_score = g * self.dynamics_reward_pred(z_n).item()
-            else:
-                # Legacy: sum the value at every step.
-                node_score = g * self.value(
-                    z_n, h_n, bvec, frac_mask=valid_mask
-                ).item()
-            if ctg_weight != 0.0:
-                ctg = self.cost_to_go(z_n, h_n, bvec, frac_mask=valid_mask).item()
-                node_score -= ctg_weight * g * ctg
-            if is_root and size_weight != 0.0:
-                size_estimate[0] = self.subtree_size(
-                    z_n, h_n, bvec, frac_mask=valid_mask
-                ).item()
-
-            if depth_left <= 1:
+            subtree = 0.0
+            for direction in directions:
+                z_n, h_n, tok = self.dynamics.step_full(
+                    z_cur, a_emb, h_cur, tokens_cur, direction
+                )
                 if use_reward_return:
-                    # Bootstrap the leaf with the value estimate.
-                    node_score += g * self.value(
+                    # Immediate predicted reward (dual-bound improvement) for this
+                    # transition; the value is bootstrapped only at the leaf below.
+                    child_score = g * self.dynamics_reward_pred(z_n).item()
+                else:
+                    # Legacy: sum the value at every step.
+                    child_score = g * self.value(
                         z_n, h_n, bvec, frac_mask=valid_mask
                     ).item()
-                return node_score
+                if ctg_weight != 0.0:
+                    ctg = self.cost_to_go(
+                        z_n, h_n, bvec, frac_mask=valid_mask).item()
+                    child_score -= ctg_weight * g * ctg
+                if is_root and size_weight != 0.0:
+                    size_estimate[0] += self.subtree_size(
+                        z_n, h_n, bvec, frac_mask=valid_mask
+                    ).item()
 
-            # Expand the top-b next actions on the PREDICTED state and average
-            # their continuations (b=1 recovers the single greedy path).
-            scores = self.policy(h_n, z_n.expand(h_n.size(0), -1))
-            if valid_mask is not None:
-                masked = torch.full_like(scores, -1e4)
-                masked[valid_mask] = scores[valid_mask]
-            else:
-                masked = scores
-            k = min(b, masked.size(0))
-            next_actions = masked.topk(k).indices
-            child = [
-                expand(z_n, h_n, tok, int(na), depth_left - 1, g * gamma, False)
-                for na in next_actions
-            ]
-            return node_score + sum(child) / len(child)
+                if depth_left <= 1:
+                    if use_reward_return:
+                        # Bootstrap the leaf with the value estimate.
+                        child_score += g * self.value(
+                            z_n, h_n, bvec, frac_mask=valid_mask
+                        ).item()
+                else:
+                    # Expand the top-b next *variables* on the PREDICTED child
+                    # state and average their continuations (b=1 recovers the
+                    # single greedy path). Averaging over candidate variables is
+                    # an expectation over the policy's choice; the sum over
+                    # directions above is because both children are always solved.
+                    scores = self.policy(h_n, z_n.expand(h_n.size(0), -1))
+                    if valid_mask is not None:
+                        masked = torch.full_like(scores, -1e4)
+                        masked[valid_mask] = scores[valid_mask]
+                    else:
+                        masked = scores
+                    k = min(b, masked.size(0))
+                    next_actions = masked.topk(k).indices
+                    cont = [
+                        branch(z_n, h_n, tok, int(na),
+                               depth_left - 1, g * gamma, False)
+                        for na in next_actions
+                    ]
+                    child_score += sum(cont) / len(cont)
+                subtree += child_score
+            return subtree
 
-        total = expand(z, h_vars, past_tokens, cand_idx, depth, 1.0, True)
+        total = branch(z, h_vars, past_tokens, cand_idx, depth, 1.0, True)
         return total - size_weight * size_estimate[0]
