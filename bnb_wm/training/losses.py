@@ -92,11 +92,18 @@ def var_reconstruction_loss(h_pred, h_target, var_mask=None):
     else:
         mse = F.mse_loss(h_pred, h_target)
 
-    cos = 1.0 - F.cosine_similarity(
+    # P2.6: cosine term must average over valid positions only. Padding rows are
+    # zero vectors (cosine 0 -> term 1.0), so including them dilutes the signal.
+    cos_per = 1.0 - F.cosine_similarity(
         h_pred.reshape(-1, h_pred.size(-1)),
         h_target.reshape(-1, h_target.size(-1)),
         dim=-1,
-    ).mean()
+    )                                                    # [B*T*V]
+    if var_mask is not None:
+        mflat = var_mask.reshape(-1)
+        cos = cos_per[mflat].mean() if bool(mflat.any()) else cos_per.new_zeros(())
+    else:
+        cos = cos_per.mean()
     return mse + 0.1 * cos
 
 

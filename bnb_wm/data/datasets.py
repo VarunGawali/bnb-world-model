@@ -146,9 +146,17 @@ def build_pyg_data(vf, cf, ei, ev):
         torch.ones(n_cons,  dtype=torch.long),
     ])
     # Constraints placed after variables; ei[1] = variable idx, ei[0] = con idx.
-    edge_index = torch.stack([ei_t[0] + n_vars, ei_t[1]], dim=0)
+    # P0.2: emit edges in BOTH directions. The encoder splits edges into a
+    # constraint->variable pass and a variable->constraint pass by matching
+    # node_type[src]/node_type[dst]; if only the con->var direction is present
+    # the variable->constraint pass sees zero edges and constraints never
+    # aggregate from their variables. Duplicate edge_attr for the reverse edges.
+    con_to_var = torch.stack([ei_t[0] + n_vars, ei_t[1]], dim=0)
+    var_to_con = torch.stack([ei_t[1], ei_t[0] + n_vars], dim=0)
+    edge_index = torch.cat([con_to_var, var_to_con], dim=1)
+    edge_attr  = torch.cat([ea_t, ea_t], dim=0)
 
-    return Data(x=x, edge_index=edge_index, node_type=node_type, edge_attr=ea_t)
+    return Data(x=x, edge_index=edge_index, node_type=node_type, edge_attr=edge_attr)
 
 
 # ---------------------------------------------------------------------------

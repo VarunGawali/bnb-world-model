@@ -12,7 +12,7 @@ acterised, not a bug as stated · **ENH** = not a bug, a paper-grade improvement
 | # | Verdict | Where | Fix |
 |---|---|---|---|
 | P0.1 SB indexing | **REAL(subtle)** | `collect_*_benchmark_sets.py:970-976` — shape-based disambiguation `if scores.shape[0]==len(action_set)` is wrong when every var is a candidate (set-cover roots). | Always `best_local = int(scores[action_set].argmax())`; assert `0 <= best_local < len(action_set)`. |
-| P0.2 one-way edges | **REAL** | `datasets.py:147` emits constraint->variable only; `encoder.py:161` `v2c_mask` selects 0 edges, so constraints never see variables. | Add reverse edges + duplicated `edge_attr` in `build_pyg_data` (and solver/benchmark graph builders). Unit-test both directions. Retrain. |
+| P0.2 one-way edges | **FIXED** | `datasets.py:147` emitted constraint->variable only; `encoder.py:161` `v2c_mask` selected 0 edges, so constraints never saw variables. | Reverse (variable->constraint) edges + duplicated `edge_attr` added in all three builders — `build_pyg_data`, `benchmark._format_obs`, `bnb_solver` graph construction — so train/deploy match. Unit test `test_build_pyg_data_edges_are_bidirectional` asserts both passes see every edge. Requires retrain (done automatically on the new run). |
 | P0.3 wrong transitions | **FIXED (Option A)** | Collector records Ecole `Branching` visitation order; npz has `depths` but no `node_id/parent_id`. `datasets.py` used `z[1:]` as "next". | Collector records `node_ids`/`parent_ids` (v2). `SequenceDataset` now reconstructs every true **root->leaf path** (`_root_to_leaf_paths`) and emits one training sequence per path, so each causal-Transformer position is a real parent->child lineage. One dataset item = one path (was one file); paths capped to `max_path_len=64` nearest ancestors. Legacy files without ids fall back to visitation-order (one sequence). Tested: `tests/test_dataset.py` (path topology, capping, cycle-safety, index counts). |
 
 **P0.12 branch-direction action encoding — FIXED.** The action `a_t` was the *chosen branching variable's* embedding only, with no branch **direction** (up/down), so a node with both children recorded yielded two transitions with identical `(z_t, a_t)` but different `z_{t+1}` — the deterministic head could only learn their average. Fix (per request: append the direction scalar to the action token):
@@ -42,7 +42,7 @@ Note: widening `input_proj` changes the dynamics checkpoint shape — Phase-3 we
 | P1.3 independent cut head | **ENH** | Budgeted slate policy (diversity/parallelism + marginal gain) instead of independent per-cut BCE. |
 | P1.4 single-cut labels | **ENH** | Record bound gain, LP time, stability, persistence, descendant effect, set-level gain. |
 | P1.5 checkpoint by Top-1 | **REAL(minor)** | Gate selection on exactness first, then gap/nodes/time/cuts/memory — not policy Top-1. |
-| P1.6 both children same score | **REAL** | `bnb_solver.py:339/364` — score `x_j=0` and `x_j=1` children separately. |
+| P1.6 both children same score | **FIXED** | Was: one `child_priority` shared by both children. Now scored per child inside the branch loop, rolling the dynamics forward in each child's branch direction (+1 up / -1 down), reusing the P0.12 direction-conditioned step. |
 | P1.7 branch & cut separate | **REAL** | Unified controller: cut slate -> re-solve -> branch, shared search-cost objective (needs P0). |
 | P1.8 fragmented benchmarks | **ENH** | One per-instance record: obj, gap, proven-optimal, nodes, time, cuts, LP iters, peak RAM/GPU. |
 | P1.9 wrong eval split | **REAL** | Held-out Easy/Medium/Hard files, fixed seeds, identical limits for every baseline. |
@@ -57,7 +57,7 @@ Note: widening `input_proj` changes the dynamics checkpoint shape — Phase-3 we
 | P2.3 seeding/provenance | **ENH** | Seed torch/CUDA/DataLoader/SCIP; log versions, commit, dataset/ckpt hashes. |
 | P2.4 smoke tests only | **ENH** | Tests: cut validity, parent-child transitions, bidirectional edges, schema, Phase-5 load, SCIP-obj match. |
 | P2.5 cut memory unmeasured | **ENH** | Track stored/active cuts, nnz, bytes, peak process/GPU memory. |
-| P2.6 masked-cosine bug | **REAL(minor)** | `losses.py:95-99` — cosine term ignores `var_mask`, dilutes loss with padding. Mask it. |
+| P2.6 masked-cosine bug | **FIXED** | `var_reconstruction_loss` cosine term now averages over valid (`var_mask`) positions only, instead of including zeroed padding rows. |
 | P2.7 config ignored | **ENH** | Wire YAML into evaluate/benchmark/solver. |
 | P2.8 build backend | **ENH** | `setuptools.build_meta`; clean ecole/pyscipopt/highspy extras. |
 

@@ -313,36 +313,13 @@ class BnBSolver:
                 h_vars, z, x_lp, node
             )
 
-            # Node priority for the search queue (min-heap pops smallest first).
-            with torch.no_grad():
-                bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
-                frac_t = torch.tensor(
-                    np.abs(x_lp - np.round(x_lp)) > 1e-4, dtype=torch.bool, device=self.device
-                )
-                if self.node_selection == "cost_to_go":
-                    # Gap 5: learned best-first search. Predict the child's
-                    # cost-to-go by rolling one dynamics step forward from this
-                    # node along the branching action, then order the frontier
-                    # so the node predicted to close in the fewest remaining
-                    # nodes is explored first. Node order never affects
-                    # correctness, only efficiency, so exactness is preserved.
-                    a_emb = h_vars[branch_var].unsqueeze(0)
-                    z_child, h_child, _ = self.model.dynamics_step_full(
-                        z, a_emb, h_vars, node.past_tokens
-                    )
-                    ctg = self.model.cost_to_go_pred(
-                        z_child, h_child, bvec, frac_t
-                    ).item()
-                    # Node.__lt__ is a MAX-heap on priority (higher popped
-                    # first), so negate: the SMALLEST predicted remaining work
-                    # gets the highest priority and is explored first.
-                    child_priority = -ctg
-                else:
-                    # Best-bound (default): explore the strongest LP bound first.
-                    v_score = self.model.value_pred(z, h_vars, bvec, frac_t).item()
-                    child_priority = -lp_obj + 0.01 * v_score
+            # Shared context for child scoring (same for both children).
+            bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
+            frac_t = torch.tensor(
+                np.abs(x_lp - np.round(x_lp)) > 1e-4, dtype=torch.bool, device=self.device
+            )
 
-            # Branch: x[branch_var] <= 0  and  x[branch_var] >= 1
+            # Branch: x[branch_var] <= 0  (down)  and  x[branch_var] >= 1  (up).
             for fix_val in (0.0, 1.0):
                 vlb = node.var_lb.copy()
                 vub = node.var_ub.copy()
@@ -354,6 +331,39 @@ class BnBSolver:
                 # Quick infeasibility check: lb > ub on any variable
                 if np.any(vlb > vub + 1e-9):
                     continue
+
+                # P1.6: score EACH child separately (the old code shared one
+                # priority for both). The down branch (x<=0) and up branch (x>=1)
+                # are distinct states, so we roll the dynamics forward in the
+                # matching direction (+1 up / -1 down) — the direction-conditioned
+                # transition the model was trained on (P0.12).
+                direction = 1.0 if fix_val == 1.0 else -1.0
+                with torch.no_grad():
+                    if self.node_selection == "cost_to_go":
+                        # Gap 5: learned best-first search. Predict this child's
+                        # cost-to-go by rolling one dynamics step forward along
+                        # its branch, then order the frontier so the node
+                        # predicted to close in the fewest remaining nodes is
+                        # explored first. Node order never affects correctness,
+                        # only efficiency, so exactness is preserved.
+                        a_emb = h_vars[branch_var].unsqueeze(0)
+                        z_child, h_child, _ = self.model.dynamics_step_full(
+                            z, a_emb, h_vars, node.past_tokens, direction
+                        )
+                        ctg = self.model.cost_to_go_pred(
+                            z_child, h_child, bvec, frac_t
+                        ).item()
+                        # Node.__lt__ is a MAX-heap on priority (higher popped
+                        # first), so negate: the SMALLEST predicted remaining
+                        # work gets the highest priority and is explored first.
+                        child_priority = -ctg
+                    else:
+                        # Best-bound (default): explore the strongest LP bound
+                        # first. Both children inherit this node's LP bound, so
+                        # the priority is the same for both here by construction.
+                        v_score = self.model.value_pred(
+                            z, h_vars, bvec, frac_t).item()
+                        child_priority = -lp_obj + 0.01 * v_score
 
                 child = Node(
                     lb=lp_obj,
@@ -653,7 +663,13 @@ class BnBSolver:
         edge_attr  = np.stack([coeff, norm_coeff, sign_coeff], axis=1)  # [E, 3]
 
         # Node ordering: variables first [0..n-1], constraints after [n..n+m-1]
-        edge_index = np.vstack([con_idx + n, var_idx]).astype(np.int64)  # [2, E]
+        # P0.2: bidirectional edges (must match build_pyg_data / _format_obs).
+        # Without the variable->constraint direction the encoder's v2c pass sees
+        # no edges. Duplicate edge_attr for the reverse edges.
+        con_to_var = np.vstack([con_idx + n, var_idx]).astype(np.int64)   # [2, E]
+        var_to_con = np.vstack([var_idx, con_idx + n]).astype(np.int64)   # [2, E]
+        edge_index = np.hstack([con_to_var, var_to_con])                 # [2, 2E]
+        edge_attr  = np.concatenate([edge_attr, edge_attr], axis=0)      # [2E, 3]
 
         # --- Padding constraints to 19-dim (pad with zeros after 5 features) ---
         cf_pad = np.zeros((m, 19), dtype=np.float32)

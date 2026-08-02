@@ -11,7 +11,27 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 
 from bnb_wm.data import TransitionDataset, SequenceDataset, pyg_collate
-from bnb_wm.data.datasets import _root_to_leaf_paths
+from bnb_wm.data.datasets import _root_to_leaf_paths, build_pyg_data
+
+
+def test_build_pyg_data_edges_are_bidirectional():
+    # 3 vars, 2 cons, 2 edges: con0-var1, con1-var2 (constraint_idx, variable_idx).
+    n_vars, n_cons = 3, 2
+    vf = np.random.randn(n_vars, 19).astype(np.float32)
+    cf = np.random.randn(n_cons, 5).astype(np.float32)
+    ei = np.array([[0, 1], [1, 2]], dtype=np.int64)     # [2, E]
+    ev = np.array([1.5, -2.0], dtype=np.float32)
+    data = build_pyg_data(vf, cf, ei, ev)
+
+    src, dst = data.edge_index
+    nt = data.node_type
+    c2v = ((nt[src] == 1) & (nt[dst] == 0)).sum().item()
+    v2c = ((nt[src] == 0) & (nt[dst] == 1)).sum().item()
+    # P0.2: both passes must see every edge, and edge_attr is duplicated.
+    assert c2v == ei.shape[1], f"con->var edges {c2v} != {ei.shape[1]}"
+    assert v2c == ei.shape[1], f"var->con edges {v2c} != {ei.shape[1]}"
+    assert data.edge_index.shape[1] == 2 * ei.shape[1]
+    assert data.edge_attr.shape[0] == data.edge_index.shape[1]
 
 
 def _make_fake_npz(path, n_steps=5, n_vars=10, n_cons=6, n_edges=20,

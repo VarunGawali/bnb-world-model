@@ -100,10 +100,15 @@ def _format_obs(obs, device):
         torch.zeros(n_vars, dtype=torch.long, device=device),
         torch.ones(n_cons,  dtype=torch.long, device=device),
     ])
-    edge_index = torch.stack([ei_t[0] + n_vars, ei_t[1]], dim=0)
+    # P0.2: bidirectional edges (must match build_pyg_data). Reverse edges let
+    # the encoder's variable->constraint pass see edges; duplicate edge_attr.
+    con_to_var = torch.stack([ei_t[0] + n_vars, ei_t[1]], dim=0)
+    var_to_con = torch.stack([ei_t[1], ei_t[0] + n_vars], dim=0)
+    edge_index = torch.cat([con_to_var, var_to_con], dim=1)
+    edge_attr  = torch.cat([ea_t, ea_t], dim=0)
 
     data = Data(
-        x=x, edge_index=edge_index, node_type=node_type, edge_attr=ea_t
+        x=x, edge_index=edge_index, node_type=node_type, edge_attr=edge_attr
     )
     return Batch.from_data_list([data])
 
