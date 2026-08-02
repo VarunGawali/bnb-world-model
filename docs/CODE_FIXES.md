@@ -54,7 +54,7 @@ Note: widening `input_proj` changes the dynamics checkpoint shape — Phase-3 we
 |---|---|---|
 | P2.1 silent no-cuts if highspy missing | **REAL** | Mandatory highspy for cut experiments; fail loud. |
 | P2.2 warm-start disabled | **REAL** | Enable/validate HiGHS warm-start; report LP iters/time with vs without. |
-| P2.3 seeding/provenance | **ENH** | Seed torch/CUDA/DataLoader/SCIP; log versions, commit, dataset/ckpt hashes. |
+| P2.3 seeding/provenance | **DONE** | `training/repro.py`: `seed_everything` (Python/NumPy/torch/CUDA + DataLoader `worker_init_fn`, opt-in deterministic) and `write_provenance` (git commit+dirty, versions, argv, seed, config). Wired into `train.py` (`--seed`/`--deterministic`); provenance.json in the ckpt dir. |
 | P2.4 smoke tests only | **ENH** | Tests: cut validity, parent-child transitions, bidirectional edges, schema, Phase-5 load, SCIP-obj match. |
 | P2.5 cut memory unmeasured | **ENH** | Track stored/active cuts, nnz, bytes, peak process/GPU memory. |
 | P2.6 masked-cosine bug | **FIXED** | `var_reconstruction_loss` cosine term now averages over valid (`var_mask`) positions only, instead of including zeroed padding rows. |

@@ -46,6 +46,7 @@ except Exception:
 from bnb_wm.model.world_model import BnBWorldModel
 from bnb_wm.training.trainer import Trainer
 from bnb_wm.training.checkpoint import load_weights_only
+from bnb_wm.training.repro import seed_everything, write_provenance
 from bnb_wm.data import (
     list_trajectory_files,
     split_files,
@@ -107,6 +108,10 @@ def main():
                     help="warm-start: load these weights before the phase loop, "
                          "e.g. to re-run only --phases 3,4 on top of an existing "
                          "model (reuses phases 1,2). Architecture must match.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="base RNG seed for Python/NumPy/torch/CUDA + workers")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="request deterministic algorithms (slower, exact repro)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -114,9 +119,23 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    # P2.3: seed everything and record provenance before any data touch.
+    worker_init_fn = seed_everything(args.seed, deterministic=args.deterministic)
+    print(f"Seed: {args.seed} (deterministic={args.deterministic})")
+
     data_root = args.data_root or cfg["paths"]["data_root"]
     ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    prov = write_provenance(ckpt_dir, {
+        "seed": args.seed,
+        "deterministic": args.deterministic,
+        "config": args.config,
+        "data_root": str(data_root),
+        "phases": phases,
+        "with_cuts": args.with_cuts,
+    })
+    print(f"Provenance written to {prov}")
 
     # ---- data ----
     files = list_trajectory_files(data_root)
@@ -148,7 +167,8 @@ def main():
         ds = TransitionDataset(file_list, with_cuts=args.with_cuts)
         return DataLoader(ds, batch_size=bs, shuffle=shuffle,
                           collate_fn=transition_collate,
-                          num_workers=args.num_workers)
+                          num_workers=args.num_workers,
+                          worker_init_fn=worker_init_fn)
 
     # ---- class-imbalance correction (pos_weight) + early stopping ----
     patience = tcfg.get("patience")
