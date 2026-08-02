@@ -47,6 +47,36 @@ from .labels import steps_to_go, subtree_sizes_from_depths
 # File discovery / splitting
 # ---------------------------------------------------------------------------
 
+def gap_to_primal_norm(d):
+    """
+    P0.11: fixed cross-instance value target — fraction of the root->optimum gap
+    that a node's dual bound has closed:
+
+        norm[t] = (dual_bounds[t] - root_bound) / (primal_bound - root_bound)
+
+    This is 0 at the root and 1 at the primal (optimum), on the SAME scale for
+    every instance — unlike the old per-trajectory min-max `norm_dual_bounds`,
+    whose 0/1 endpoints meant a different absolute bound in every file, so the
+    value head was regressed against an instance-dependent target.
+
+    Falls back to the stored `norm_dual_bounds` when the anchors are absent
+    (legacy files) or degenerate (primal == root).
+
+    Args:
+        d : an opened npz (np.load) for one trajectory
+    Returns:
+        [T] float32 in ~[0, 1]
+    """
+    if "root_bound" in d and "primal_bound" in d and "dual_bounds" in d:
+        db = np.asarray(d["dual_bounds"], dtype=np.float64)
+        root = float(np.asarray(d["root_bound"]))
+        primal = float(np.asarray(d["primal_bound"]))
+        denom = primal - root
+        if abs(denom) > 1e-9:
+            return np.clip((db - root) / denom, 0.0, 1.0).astype(np.float32)
+    return np.asarray(d["norm_dual_bounds"], dtype=np.float32)
+
+
 def list_trajectory_files(data_root, pattern="traj_*.npz"):
     """Return sorted trajectory file paths under `data_root` (searched recursively)."""
     root = Path(data_root)
@@ -221,7 +251,7 @@ class TransitionDataset(Dataset):
                 np.asarray(d["action_sets"][t], dtype=np.int64),
                 dtype=torch.long),
             "local_label": int(d["local_branching_label"][t]),
-            "norm_db":     float(d["norm_dual_bounds"][t]),
+            "norm_db":     float(gap_to_primal_norm(d)[t]),   # P0.11
             "is_leaf":     float(d["next_is_leaf"][t]),
             "depth":       int(d["depths"][t]),
             "n_frac":      n_frac,
@@ -432,8 +462,7 @@ class SequenceDataset(Dataset):
             a_list.append(ht[bv])
         a_all = torch.stack(a_list, dim=0)            # [T, H]
 
-        ndb = torch.as_tensor(
-            np.asarray(d["norm_dual_bounds"], dtype=np.float32))
+        ndb = torch.as_tensor(gap_to_primal_norm(d))          # P0.11
 
         # Branch direction of each node relative to its parent (+1 up / -1 down /
         # 0 root). Legacy files without it fall back to 0 (a constant feature).

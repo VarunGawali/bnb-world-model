@@ -353,17 +353,18 @@ class BnBSolver:
                 # transition the model was trained on (P0.12).
                 direction = 1.0 if fix_val == 1.0 else -1.0
                 with torch.no_grad():
+                    # One direction-conditioned dynamics step from parent->child.
+                    # Its updated token buffer is written onto the child (P0.9) so
+                    # that when the child later branches, its latent lookahead has
+                    # the true history that led to it — not an empty buffer.
+                    a_emb = h_vars[branch_var].unsqueeze(0)
+                    z_child, h_child, child_tokens = self.model.dynamics_step_full(
+                        z, a_emb, h_vars, node.past_tokens, direction
+                    )
                     if self.node_selection == "cost_to_go":
-                        # Gap 5: learned best-first search. Predict this child's
-                        # cost-to-go by rolling one dynamics step forward along
-                        # its branch, then order the frontier so the node
-                        # predicted to close in the fewest remaining nodes is
-                        # explored first. Node order never affects correctness,
-                        # only efficiency, so exactness is preserved.
-                        a_emb = h_vars[branch_var].unsqueeze(0)
-                        z_child, h_child, _ = self.model.dynamics_step_full(
-                            z, a_emb, h_vars, node.past_tokens, direction
-                        )
+                        # Gap 5: learned best-first search. Order the frontier by
+                        # this child's predicted cost-to-go. Node order never
+                        # affects correctness, only efficiency, so exactness holds.
                         ctg = self.model.cost_to_go_pred(
                             z_child, h_child, bvec, frac_t
                         ).item()
@@ -388,6 +389,7 @@ class BnBSolver:
                     priority=child_priority,
                     inherited_cuts=child_cuts,
                     warm_basis=node_basis,   # child warmstarts from current node's basis
+                    past_tokens=child_tokens,   # P0.9: propagate updated history
                 )
                 heapq.heappush(heap, child)
 

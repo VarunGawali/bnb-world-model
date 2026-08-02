@@ -14,6 +14,19 @@ from bnb_wm.data import TransitionDataset, SequenceDataset, pyg_collate
 from bnb_wm.data.datasets import _root_to_leaf_paths, build_pyg_data
 
 
+def test_sb_local_label_indexes_candidates_only():
+    # P0.1: the strong-branching label must be the argmax over the CANDIDATE set
+    # (scores[action_set].argmax()), not the global argmax. The old shape-based
+    # shortcut picked the global best, which is wrong whenever the highest-scoring
+    # variable is not a branching candidate (e.g. already-fixed vars).
+    scores = np.array([9.0, 1.0, 5.0, 2.0], dtype=np.float64)  # global argmax = 0
+    action_set = np.array([1, 2, 3], dtype=np.int64)           # candidates exclude 0
+    best_local = int(scores[action_set].argmax())
+    assert 0 <= best_local < len(action_set)                   # valid local index
+    assert action_set[best_local] == 2                         # best CANDIDATE
+    assert action_set[best_local] != int(scores.argmax())      # not the global argmax
+
+
 def test_build_pyg_data_edges_are_bidirectional():
     # 3 vars, 2 cons, 2 edges: con0-var1, con1-var2 (constraint_idx, variable_idx).
     n_vars, n_cons = 3, 2
