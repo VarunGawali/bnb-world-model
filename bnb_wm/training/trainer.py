@@ -787,6 +787,10 @@ class Trainer:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 no_improve = 0
+                # P0.8: mark the cut head as trained so the saved checkpoint (and
+                # any solver loading it) knows cut_mode=learned is now valid.
+                if hasattr(self.model, "cut_head_trained"):
+                    self.model.cut_head_trained.fill_(True)
                 save_checkpoint(
                     self.model, optimizer, epoch,
                     {"val_loss": val_loss},

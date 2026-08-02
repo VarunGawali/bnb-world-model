@@ -3,20 +3,22 @@ bnb_solver.py — Neural-guided Branch-and-Cut solver.
 
 Implements a complete Python-owned B&B loop with:
     - LP relaxation at each node via scipy.optimize.linprog (HiGHS backend)
-    - Branch-and-cut with globally valid cuts (pairwise CG cuts for Set Cover)
+    - Branch-and-cut with globally valid Gomory cuts (from bnb_wm/solver/gomory.py,
+      the same generator used at data collection and deploy)
     - BnBWorldModel driving all search decisions:
+        * BipartiteGNN (GATv2, bidirectional passes) -> node encoder
         * CuttingPlaneHead  -> which cuts to add (branch-and-cut selection)
         * PolicyHead        -> branching variable selection
-        * ValueHead         -> node priority (best-first search)
+        * ValueHead / CostToGoHead -> node priority (best-first search)
         * IntegralityHead   -> prune near-leaf nodes early
-        * DynamicsTransformer -> 1-step latent lookahead for branching
+        * DynamicsTransformer -> direction-conditioned latent lookahead
 
 Branch-and-cut design:
-    Cuts selected at a node are GLOBALLY VALID (pairwise Chvátal-Gomory
-    intersection cuts for Set Cover). They are propagated to ALL descendant
-    nodes via the Node.inherited_cuts list — this is full branch-and-cut,
-    not cut-and-branch. No cut validity re-check is needed because the cuts
-    are valid for any integer-feasible solution regardless of branching.
+    Cuts selected at a node are GLOBALLY VALID Gomory cuts (same generator as
+    collect/train/deploy). They are propagated to ALL descendant nodes via the
+    Node.inherited_cuts list — this is full branch-and-cut, not cut-and-branch.
+    No cut validity re-check is needed because the cuts are valid for any
+    integer-feasible solution regardless of branching.
 
 Constraint format assumed:
     min  c^T x
@@ -135,6 +137,18 @@ class BnBSolver:
         self.use_reward_return   = use_reward_return   # MuZero-style return (Fix 3)
         # Cut-selection mode for the ablation: "learned" (CuttingPlaneHead),
         # "heuristic" (max-violation over the valid Gomory pool), "none".
+        # P0.8: `learned` requires a Phase-5-trained cut head. Running the
+        # untrained head produces arbitrary selections that silently corrupt
+        # results, so fall back to the verified heuristic and warn instead.
+        if cut_mode == "learned" and not bool(
+                getattr(model, "cut_head_trained", torch.tensor(False))):
+            import warnings
+            warnings.warn(
+                "cut_mode='learned' but the model's cut head is untrained "
+                "(no Phase-5 checkpoint); falling back to cut_mode='heuristic'. "
+                "Load a Phase-5 checkpoint to use learned cut selection.",
+                RuntimeWarning, stacklevel=2)
+            cut_mode = "heuristic"
         self.cut_mode            = cut_mode
         self._cuts_added         = 0                    # per-solve cut counter
         # Branching mode for the ablation: "rollout" (latent world-model
@@ -805,7 +819,7 @@ class BnBSolver:
         return best_var
 
     # ------------------------------------------------------------------
-    # Cut generation — Chvátal-Gomory intersection cuts
+    # Cut generation — valid Gomory fractional cuts (solver/gomory.py)
     # ------------------------------------------------------------------
 
     def _generate_cg_cuts(

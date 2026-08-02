@@ -56,6 +56,10 @@ class BnBWorldModel(nn.Module):
         self.cost_to_go     = CostToGoHead(hidden_dim)
         self.integrality    = IntegralityHead(hidden_dim)
         self.cutting_planes = CuttingPlaneHead(hidden_dim, cut_feat_dim)
+        # P0.8: persisted flag — set True only when Phase 5 (cut selection) has
+        # trained this head. Saved/restored with the state_dict so the solver can
+        # refuse `cut_mode=learned` on a model whose cut head is untrained.
+        self.register_buffer("cut_head_trained", torch.tensor(False))
         self.dynamics       = DynamicsTransformer(
             hidden_dim=hidden_dim, n_layers=n_dyn_layers,
             n_heads=n_dyn_heads, max_seq=max_seq,

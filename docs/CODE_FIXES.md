@@ -28,9 +28,9 @@ Note: widening `input_proj` changes the dynamics checkpoint shape — Phase-3 we
 | P0.5 cuts not applied | **REAL** | `collect_*.py:919` `separating/maxrounds=0`; cuts only scored in a `startDive`/`endDive` that is undone (`:789-834`). Recorded state never contains a cut. | For cut labels: score valid cuts by add-row -> re-solve LP bound gain (dive is fine for *labels*). For the unified model: apply selected cuts for real via a SCIP separator (see FIX_PLAN §3). |
 | P0.6 train/serve cut mismatch | **REAL** | Collector = intersection cuts; deploy (`gomory.py`) = Gomory cuts. Different generators & feature distributions. | One generator (Gomory/GMI) with identical filters/features/normalisation at collect, train, val, deploy. |
 | P0.7 cut labels | **CONTEXT** | `collect_*.py:685-700` labels top-k by measured **bound improvement**, not violation (violation only pre-filters, `:454`). | His "top-k violation" wording is off, but labels are moot until cuts are valid (P0.4). Keep bound-gain labels, recompute on valid cuts. |
-| P0.8 Phase-5 optional | **REAL** | `cut_mode=learned` can run without a Phase-5 checkpoint. | Require a trained cut head for `cut_mode=learned`; else fall back to `none`/verified heuristic and warn. |
+| P0.8 Phase-5 optional | **FIXED** | Was: `cut_mode=learned` ran with an untrained cut head. | `BnBWorldModel` carries a persisted `cut_head_trained` buffer set True by Phase-5 training and saved in the checkpoint; the solver warns and falls back to `heuristic` when `cut_mode=learned` on a model whose cut head is untrained. |
 | P0.9 history not propagated | **REAL** | `bnb_solver.py:358` builds child `Node(...)` with no `past_tokens` (defaults None, `:61`). | Write updated token history onto each child; or disable history until P0.3 data exists (then it's honest single-step). |
-| P0.10 broken CLI / missing generate | **REAL** | `scripts/generate_data.py:15` imports non-existent `bnb_wm.data.generate`. | Add `bnb_wm/data/generate.py` (the rewritten collector) or point the CLI at the real script; delete dead scripts; CI-smoke the README commands. |
+| P0.10 broken CLI / missing generate | **FIXED** | Was: `scripts/generate_data.py` imported non-existent `bnb_wm.data.generate`; `scripts/train.py` had a broken one-arg `SequenceDataset` call. | Deleted both dead scripts. Canonical CLIs: `generate_instances.py` (instances), `collect_with_cuts_v2.py` (trajectories), root `train.py` (training). README Quickstart rewritten to match. |
 | P0.11 leaf/bound targets | **REAL** | `collect_*.py:1041-1042` `next_is_leaf[-1]=1` only; `:1040` bound min-max normalised **per trajectory**. | Derive real leaf labels from tree (`node with no recorded children` = leaf). Store raw `dual_bounds` + `root_bound` + `primal_bound`; normalise with a fixed cross-instance scheme (e.g. gap to optimum). |
 
 ## P1 — needed for paper-grade results
@@ -46,7 +46,7 @@ Note: widening `input_proj` changes the dynamics checkpoint shape — Phase-3 we
 | P1.7 branch & cut separate | **REAL** | Unified controller: cut slate -> re-solve -> branch, shared search-cost objective (needs P0). |
 | P1.8 fragmented benchmarks | **ENH** | One per-instance record: obj, gap, proven-optimal, nodes, time, cuts, LP iters, peak RAM/GPU. |
 | P1.9 wrong eval split | **REAL** | Held-out Easy/Medium/Hard files, fixed seeds, identical limits for every baseline. |
-| P1.10 stale docs | **REAL(docs)** | `bnb_solver.py:6,15-16` still say "pairwise CG intersection". Sync to Gomory + GATv2 + Transformer. |
+| P1.10 stale docs | **FIXED** | `bnb_solver.py` docstrings synced: valid Gomory cuts (not "pairwise CG intersection"), bidirectional GATv2 encoder, direction-conditioned DynamicsTransformer. |
 
 ## P2 — reproducibility & quality
 

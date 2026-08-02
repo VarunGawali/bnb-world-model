@@ -34,7 +34,7 @@ bnb-world-model/
 │   ├── training/     # losses, trainer (4 phases), checkpoint utils
 │   ├── evaluate/     # top-k metrics, rank CDF, macro benchmark
 │   └── solver/       # standalone B&B solver (work in progress)
-├── scripts/          # train.py, generate_data.py, evaluate.py
+├── scripts/          # generate_instances.py, collect_with_cuts_v2.py, evaluate.py
 ├── configs/          # default.yaml (all hyperparameters)
 ├── notebooks/        # exploration and result plots
 └── tests/            # pytest smoke tests
@@ -56,20 +56,32 @@ conda install -c conda-forge ecole pyscipopt
 
 ## Quickstart
 
-### Generate Data
+### 1. Generate instances
 ```bash
-python scripts/generate_data.py --problem set_cover --n 1000
+python scripts/generate_instances.py \
+  --out-root data/instances \
+  --n-train 2000 --n-val 200 --n-test 200 --jitter
 ```
 
-### Train
+### 2. Collect trajectories (branching + valid Gomory cut labels)
 ```bash
-# Run all four phases sequentially
-python scripts/train.py --phase all
+python scripts/collect_with_cuts_v2.py \
+  --instances-root data/instances \
+  --data-dir data/trajectories \
+  --split train --n-instances-per-class 2000
+```
 
-# Or run one phase at a time
-python scripts/train.py --phase 1   # policy head
-python scripts/train.py --phase 2   # value head
-python scripts/train.py --phase 4   # joint fine-tuning
+### 3. Train (canonical entry point: root `train.py`)
+```bash
+# Phases 1->4 (policy -> value -> dynamics -> joint)
+python train.py --config configs/default.yaml --data_root data/trajectories
+
+# Add learned cut selection (Phase 5)
+python train.py --config configs/default.yaml --data_root data/trajectories \
+  --with_cuts --phases 1,2,3,4,5
+
+# Fast smoke pass to validate the pipeline
+python train.py --data_root data/trajectories --max_files 8 --max_epochs 1
 ```
 
 ### Evaluate
