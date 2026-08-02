@@ -37,7 +37,7 @@ Note: widening `input_proj` changes the dynamics checkpoint shape — Phase-3 we
 
 | # | Verdict | Fix |
 |---|---|---|
-| P1.1 stale frac_mask in lookahead | **REAL** | Imagined states must not use the live fractional mask; use predicted `h_vars` (or predict the mask). |
+| P1.1 stale frac_mask in lookahead | **FIXED** | `rollout_candidate` no longer passes the real node's `valid_mask` to value/cost-to-go/subtree heads on imagined states (uses `frac_mask=None`, relying on predicted `h_vars`), and ranks imagined next-branching vars by the policy's scores over all vars instead of the stale mask. `valid_mask` kept for caller compatibility. |
 | P1.2 tier imbalance | **ENH** | Stratified train/val/test per tier; report tiers separately; inverse-frequency sampling. |
 | P1.3 independent cut head | **ENH** | Budgeted slate policy (diversity/parallelism + marginal gain) instead of independent per-cut BCE. |
 | P1.4 single-cut labels | **ENH** | Record bound gain, LP time, stability, persistence, descendant effect, set-level gain. |

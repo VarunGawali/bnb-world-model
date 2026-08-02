@@ -322,7 +322,11 @@ class BnBWorldModel(nn.Module):
             cand_idx    : int      first action (candidate under evaluation)
             depth       : int      rollout horizon
             gamma       : float    per-step discount
-            valid_mask  : [V] bool valid branching candidates (fractional vars)
+            valid_mask  : [V] bool valid branching candidates at the REAL node.
+                          P1.1: intentionally NOT applied to imagined rollout
+                          states (their fractional set differs); kept only for
+                          caller/API compatibility. Candidate pre-selection at the
+                          real node happens in the caller.
             past_tokens : token buffer for the dynamics Transformer
             size_weight : float    weight on the predicted-subtree-size penalty
                                    (0 recovers the pure value-based rollout)
@@ -388,22 +392,22 @@ class BnBWorldModel(nn.Module):
                 else:
                     # Legacy: sum the value at every step.
                     child_score = g * self.value(
-                        z_n, h_n, bvec, frac_mask=valid_mask
+                        z_n, h_n, bvec, frac_mask=None
                     ).item()
                 if ctg_weight != 0.0:
                     ctg = self.cost_to_go(
-                        z_n, h_n, bvec, frac_mask=valid_mask).item()
+                        z_n, h_n, bvec, frac_mask=None).item()
                     child_score -= ctg_weight * g * ctg
                 if is_root and size_weight != 0.0:
                     size_estimate[0] += self.subtree_size(
-                        z_n, h_n, bvec, frac_mask=valid_mask
+                        z_n, h_n, bvec, frac_mask=None
                     ).item()
 
                 if depth_left <= 1:
                     if use_reward_return:
                         # Bootstrap the leaf with the value estimate.
                         child_score += g * self.value(
-                            z_n, h_n, bvec, frac_mask=valid_mask
+                            z_n, h_n, bvec, frac_mask=None
                         ).item()
                 else:
                     # Expand the top-b next *variables* on the PREDICTED child
@@ -411,14 +415,13 @@ class BnBWorldModel(nn.Module):
                     # single greedy path). Averaging over candidate variables is
                     # an expectation over the policy's choice; the sum over
                     # directions above is because both children are always solved.
+                    # P1.1: the imagined child's fractional set differs from the
+                    # real node's, so the live `valid_mask` is stale here and must
+                    # not be applied. Rank next branching variables by the policy's
+                    # own scores on the PREDICTED embeddings (h_n) over all vars.
                     scores = self.policy(h_n, z_n.expand(h_n.size(0), -1))
-                    if valid_mask is not None:
-                        masked = torch.full_like(scores, -1e4)
-                        masked[valid_mask] = scores[valid_mask]
-                    else:
-                        masked = scores
-                    k = min(b, masked.size(0))
-                    next_actions = masked.topk(k).indices
+                    k = min(b, scores.size(0))
+                    next_actions = scores.topk(k).indices
                     cont = [
                         branch(z_n, h_n, tok, int(na),
                                depth_left - 1, g * gamma, False)
