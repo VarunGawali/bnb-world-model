@@ -53,6 +53,28 @@ _USE_REWARD_RETURN = True
 _LEAF_PROB_SKIP = 0.8
 
 
+def apply_config(cfg: dict | None):
+    """
+    P2.7: override the rollout/lookahead constants from a loaded YAML config so
+    the benchmark honours `configs/*.yaml` instead of these hardcoded defaults.
+
+    Reads the `benchmark:` section (falling back to `solver:` for shared knobs).
+    Unknown/missing keys keep their module default. Call once before benchmarking.
+    """
+    if not cfg:
+        return
+    global _LOOKAHEAD_K, _LOOKAHEAD_DEPTH, _LOOKAHEAD_GAMMA, _SIZE_WEIGHT
+    global _CTG_WEIGHT, _BRANCH_FACTOR, _USE_REWARD_RETURN
+    b = {**cfg.get("solver", {}), **cfg.get("benchmark", {})}   # benchmark wins
+    _LOOKAHEAD_K       = int(b.get("lookahead_k", _LOOKAHEAD_K))
+    _LOOKAHEAD_DEPTH   = int(b.get("lookahead_depth", _LOOKAHEAD_DEPTH))
+    _LOOKAHEAD_GAMMA   = float(b.get("lookahead_gamma", _LOOKAHEAD_GAMMA))
+    _SIZE_WEIGHT       = float(b.get("size_weight", _SIZE_WEIGHT))
+    _CTG_WEIGHT        = float(b.get("ctg_weight", _CTG_WEIGHT))
+    _BRANCH_FACTOR     = int(b.get("branch_factor", _BRANCH_FACTOR))
+    _USE_REWARD_RETURN = bool(b.get("use_reward_return", _USE_REWARD_RETURN))
+
+
 def _format_obs(obs, device):
     """Convert an Ecole NodeBipartite observation to a PyG Batch with edge_attr."""
     vf_raw = (obs.variable_features if hasattr(obs, "variable_features")
@@ -196,6 +218,7 @@ def run_macro_benchmark(
     n_instances: int = 10,
     time_limit: int = 60,
     generator_kwargs: dict = None,
+    config: dict = None,
 ):
     """
     Run macro benchmark: SCIP vs Random vs GNN (full model).
@@ -214,6 +237,8 @@ def run_macro_benchmark(
     """
     if ecole is None or SCIPModel is None:
         raise ImportError("Ecole and PySCIPOpt are required for benchmarking.")
+
+    apply_config(config)      # P2.7: honour YAML lookahead/rollout knobs
 
     gkw = generator_kwargs or {}
 

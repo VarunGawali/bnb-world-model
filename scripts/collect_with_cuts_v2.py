@@ -443,12 +443,24 @@ def main() -> None:
     p.add_argument("--expert-cut-k", type=int, default=5)
     p.add_argument("--cut-lp-iterations", type=int, default=200)
     p.add_argument("--cut-improvement-eps", type=float, default=1e-6)
+    p.add_argument("--allow-missing-highspy", action="store_true",
+                   help="permit a branching-only run with empty cut labels when "
+                        "highspy is not importable (default: fail loud)")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
     args.instances_root = args.instances_root.resolve()
     args.data_dir = args.data_dir.resolve()
+    # P2.1: cut experiments require HiGHS. Fail loud rather than silently write a
+    # dataset with empty cut labels that looks fine until Phase 5 trains on nothing.
+    if highspy is None and not args.allow_missing_highspy:
+        raise SystemExit(
+            "ERROR (P2.1): highspy is not importable, so cut labels would be "
+            "empty. Install it (`pip install highspy`) for cut collection, or "
+            "pass --allow-missing-highspy to deliberately collect branching-only "
+            "data with no cuts.")
     if highspy is None:
-        print("WARNING: highspy not importable — cut labels will be empty (P2.1).")
+        print("WARNING: highspy missing and --allow-missing-highspy set — "
+              "cut labels will be empty (branching-only run).")
 
     t0 = time.perf_counter()
     all_m = {}
