@@ -107,17 +107,31 @@ class NodeIdentity:
         # SCIP_BOUNDTYPE_LOWER == 0 -> up (+1); SCIP_BOUNDTYPE_UPPER == 1 -> down.
         return 1 if int(boundtypes[0]) == 0 else -1
 
-    def extract(self, model: Any, done: bool) -> tuple[int, int, int]:
+    def extract(self, model: Any, done: bool):
+        """Return (node_id, parent_id, direction, depth, local_lb).
+
+        P0.11: depth is the TRUE tree depth (`getDepth()`), not the node id; and
+        local_lb is this node's LOCAL LP lower bound (`getLowerbound()`), not the
+        global dual bound, so the value target is the node's own LP relaxation.
+        """
         if done:
-            return (-1, -1, 0)
+            return (-1, -1, 0, -1, float("nan"))
         scip = model.as_pyscipopt()
         node = scip.getCurrentNode()
         if node is None:
-            return (-1, -1, 0)
+            return (-1, -1, 0, -1, float("nan"))
         nid = int(node.getNumber())
         parent = node.getParent()
         pid = int(parent.getNumber()) if parent is not None else -1
-        return (nid, pid, self._direction(node))
+        try:
+            depth = int(node.getDepth())
+        except Exception:
+            depth = -1
+        try:
+            local_lb = float(node.getLowerbound())
+        except Exception:
+            local_lb = float(scip.getDualbound())
+        return (nid, pid, self._direction(node), depth, local_lb)
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +298,35 @@ def _make_env(args: argparse.Namespace) -> Any:
     )
 
 
+def _optimal_objective(lp_path: Path, args: argparse.Namespace) -> float:
+    """
+    P0.11: solve the instance to optimality (independent of the SB trajectory)
+    and return the optimal objective — the true cross-instance value anchor.
+
+    Uses a fresh pyscipopt model so it does not disturb the collection env.
+    Returns NaN if the solve does not prove optimality within the time limit,
+    in which case the caller falls back to the last observed bound and flags
+    `optimal_valid=False` so downstream code can exclude it from normalisation.
+    """
+    try:
+        import pyscipopt
+    except Exception:
+        return float("nan")
+    try:
+        m = pyscipopt.Model()
+        m.hideOutput(True)
+        m.readProblem(str(lp_path))
+        m.setParam("limits/time", float(args.optimal_time_limit))
+        m.optimize()
+        status = m.getStatus()
+        obj = float(m.getObjVal()) if m.getNSols() > 0 else float("nan")
+        m.freeProb()
+        # Only trust the value if optimality was actually proven.
+        return obj if status == "optimal" else float("nan")
+    except Exception:
+        return float("nan")
+
+
 def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any] | None:
     try:
         obs, action_set, _, done, info = env.reset(ecole.scip.Model.from_file(str(lp_path)))
@@ -297,6 +340,9 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
             "action_sets", "branching_vars", "local_branching_label",
             "dual_bounds", "depths", "node_ids", "parent_ids", "branch_dirs")
     buf: dict[str, list[Any]] = {k: [] for k in keys}
+    # P0.11: the true optimal objective, for a fixed cross-instance value anchor.
+    # Solved once, independently of the (possibly truncated) SB trajectory.
+    optimal_obj = _optimal_objective(lp_path, args)
 
     # --- root cut collection (once), valid Gomory, matches deploy (P0.4/P0.6) ---
     root_cuts = {"features": np.zeros((0, 6), np.float32), "labels": np.zeros(0, np.float32),
@@ -321,14 +367,19 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
         chosen = int(aset[best_local])
 
         vf, cf, ei, ev = _node_bipartite_arrays(obs)
-        nid, pid, bdir = info.get("node", (-1, -1, 0))
+        nid, pid, bdir, depth, local_lb = info.get(
+            "node", (-1, -1, 0, -1, float("nan")))
+        # P0.11: per-node value target = this node's LOCAL LP lower bound; fall
+        # back to the global dual bound only if the local one is unavailable.
+        if not np.isfinite(local_lb):
+            local_lb = float(info.get("dual_bound", 0.0))
         buf["var_features"].append(vf); buf["con_features"].append(cf)
         buf["edge_indices"].append(ei); buf["edge_values"].append(ev)
         buf["action_sets"].append(aset.astype(np.int32))
         buf["branching_vars"].append(chosen)
         buf["local_branching_label"].append(best_local)
-        buf["dual_bounds"].append(float(info.get("dual_bound", 0.0)))
-        buf["depths"].append(int(nid))              # kept for back-compat readers
+        buf["dual_bounds"].append(float(local_lb))    # P0.11: node-local LP bound
+        buf["depths"].append(int(depth))              # P0.11: true tree depth
         buf["node_ids"].append(int(nid))
         buf["parent_ids"].append(int(pid))
         buf["branch_dirs"].append(int(bdir))
@@ -383,11 +434,17 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
         "branching_vars": np.asarray(buf["branching_vars"], dtype=np.int32),
         "local_branching_label": np.asarray(buf["local_branching_label"], dtype=np.int32),
         "dual_bounds": db.astype(np.float32),
-        # P0.11: keep a fixed cross-instance norm anchored to the instance's own
-        # observed bound range; also expose the anchors so training can renorm.
+        # P0.11: per-trajectory min-max kept only as a legacy fallback; the
+        # dataset normalises with the true anchors below (gap_to_primal_norm).
         "norm_dual_bounds": ((db - db.min()) / (np.ptp(db) + 1e-8)).astype(np.float32),
+        # P0.11: real anchors. root_bound = root node's local LP bound; primal =
+        # the TRUE optimum from a full independent solve (not the last dual bound).
+        # `optimal_valid` flags whether the solve actually reached optimality.
         "root_bound": np.asarray(float(db[0]), dtype=np.float32),
-        "primal_bound": np.asarray(float(db[-1]), dtype=np.float32),
+        "primal_bound": np.asarray(
+            float(optimal_obj if np.isfinite(optimal_obj) else db[-1]),
+            dtype=np.float32),
+        "optimal_valid": np.asarray(bool(np.isfinite(optimal_obj))),
         "next_is_leaf": next_is_leaf,
         "depths": np.asarray(buf["depths"], dtype=np.int32),
         "node_ids": node_ids.astype(np.int64),
@@ -443,6 +500,9 @@ def main() -> None:
     p.add_argument("--expert-cut-k", type=int, default=5)
     p.add_argument("--cut-lp-iterations", type=int, default=200)
     p.add_argument("--cut-improvement-eps", type=float, default=1e-6)
+    p.add_argument("--optimal-time-limit", type=float, default=120.0,
+                   help="P0.11: per-instance time budget for the independent "
+                        "solve-to-optimality that provides the true primal anchor")
     p.add_argument("--allow-missing-highspy", action="store_true",
                    help="permit a branching-only run with empty cut labels when "
                         "highspy is not importable (default: fail loud)")

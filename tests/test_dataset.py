@@ -130,8 +130,22 @@ def test_sequence_dataset_legacy_files_fall_back_to_one_sequence():
     with tempfile.TemporaryDirectory() as tmpdir:
         p = Path(tmpdir) / "traj_00000.npz"
         _make_fake_npz(p, n_steps=5)                 # no node_ids/parent_ids
-        ds = SequenceDataset([p], _DummyModel(), device="cpu")
+        ds = SequenceDataset([p], _DummyModel(), device="cpu",
+                             allow_visitation_fallback=True)
         assert len(ds) == 1                          # whole visitation order
+
+
+def test_sequence_dataset_refuses_idless_files_by_default():
+    # P0.3: without node_ids/parent_ids, refuse rather than silently train on
+    # wrong (visitation-order) transitions.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = Path(tmpdir) / "traj_00000.npz"
+        _make_fake_npz(p, n_steps=5)
+        try:
+            SequenceDataset([p], _DummyModel(), device="cpu")
+            assert False, "expected ValueError on id-less file"
+        except ValueError:
+            pass
 
 
 def test_transition_dataset_length():

@@ -67,7 +67,12 @@ def gap_to_primal_norm(d):
     Returns:
         [T] float32 in ~[0, 1]
     """
-    if "root_bound" in d and "primal_bound" in d and "dual_bounds" in d:
+    # Only trust the primal anchor when the collector actually proved optimality
+    # (P0.11 `optimal_valid`); otherwise `primal_bound` is a fallback, not the
+    # true optimum, and would give a meaningless scale.
+    optimal_valid = bool(np.asarray(d["optimal_valid"])) if "optimal_valid" in d else True
+    if (optimal_valid and "root_bound" in d and "primal_bound" in d
+            and "dual_bounds" in d):
         db = np.asarray(d["dual_bounds"], dtype=np.float64)
         root = float(np.asarray(d["root_bound"]))
         primal = float(np.asarray(d["primal_bound"]))
@@ -327,16 +332,18 @@ class SequenceDataset(Dataset):
         hv_next_seq    [P-1, K, H]     per-variable embeddings at child nodes
         var_mask       [P-1, K] bool   valid (non-padding) positions
 
-    Back-compat: files without `node_ids`/`parent_ids` (e.g. legacy captures or
-    the unit-test fixture) fall back to a single visitation-order sequence, the
-    pre-P0.3 behaviour, so old data and tests still load.
+    Files without `node_ids`/`parent_ids` are REFUSED by default (a `ValueError`),
+    because visitation order would train the dynamics on wrong transitions;
+    `allow_visitation_fallback=True` opts into the legacy single-sequence
+    behaviour for old data / the unit-test fixture, knowingly accepting it.
 
     Encoding one trajectory is a single batched encoder call; the per-file
     encoded bundle is computed once and every path from that file slices it.
     """
 
     def __init__(self, files, model, device, include_vars=True,
-                 max_vars_recon=64, max_path_len=64, seed=0, cache_dir=None):
+                 max_vars_recon=64, max_path_len=64, seed=0, cache_dir=None,
+                 allow_visitation_fallback=False):
         self.files = list(files)
         self.model = model
         self.device = device
@@ -345,6 +352,12 @@ class SequenceDataset(Dataset):
         self.max_path_len = max_path_len
         self.seed = seed
         self.rng = np.random.default_rng(seed)
+        # P0.3: files without node_ids/parent_ids cannot form true parent->child
+        # paths. Silently falling back to SCIP visitation order trains the
+        # dynamics model on WRONG transitions, so by default we refuse. Set
+        # allow_visitation_fallback=True only for legacy data / the unit-test
+        # fixture, knowingly accepting incorrect (visitation-order) dynamics.
+        self.allow_visitation_fallback = allow_visitation_fallback
 
         # Build a flat index of (file_idx, path) so each __getitem__ returns one
         # root->leaf path. Path reconstruction reads only node_ids/parent_ids —
@@ -357,9 +370,16 @@ class SequenceDataset(Dataset):
                     paths = _root_to_leaf_paths(
                         np.asarray(d["node_ids"]), np.asarray(d["parent_ids"]),
                         self.max_path_len)
-                else:
+                elif self.allow_visitation_fallback:
                     # Legacy: treat the whole visitation order as one sequence.
                     paths = [list(range(T))] if T >= 2 else []
+                else:
+                    raise ValueError(
+                        f"{f} has no node_ids/parent_ids, so true parent->child "
+                        "paths cannot be built and visitation order would train "
+                        "the dynamics on WRONG transitions (P0.3). Recollect with "
+                        "the current collector, or pass "
+                        "allow_visitation_fallback=True to knowingly accept it.")
             for p in paths:
                 self.index.append((fi, p))
 
