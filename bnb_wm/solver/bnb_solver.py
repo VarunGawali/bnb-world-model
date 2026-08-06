@@ -917,7 +917,11 @@ class BnBSolver:
             parallelism = float((lhs / lhs_norm) @ c_norm)
             obj_cutoff  = violation * abs(float(c @ lhs) / (lhs_norm ** 2 + 1e-8))
 
-            support = lhs > 0.5
+            # P0.6: support = NONZERO coefficients (must match the collector's
+            # `abs(lhs) > 1e-9`). The old `lhs > 0.5` dropped negative and small
+            # coefficients, so the deployed support_frac feature came from a
+            # different distribution than the one the cut head was trained on.
+            support = np.abs(lhs) > 1e-9
             support_frac = (
                 float((frac[support] > 0.05).mean()) if support.sum() > 0 else 0.0
             )
