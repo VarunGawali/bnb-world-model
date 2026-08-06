@@ -10,11 +10,17 @@ from .datasets import (
     split_files,
     compute_label_stats,
     build_pyg_data,
+    gap_to_primal_norm,
     TransitionDataset,
     transition_collate,
     SequenceDataset,
     make_sequence_collate,
 )
+
+# P0.10: `pyg_collate` is the historical name still referenced by
+# scripts/evaluate.py and the tests; the canonical implementation is
+# `transition_collate`. Export an alias so those imports resolve.
+pyg_collate = transition_collate
 
 __all__ = [
     "steps_to_go",
@@ -24,8 +30,10 @@ __all__ = [
     "split_files",
     "compute_label_stats",
     "build_pyg_data",
+    "gap_to_primal_norm",
     "TransitionDataset",
     "transition_collate",
+    "pyg_collate",
     "SequenceDataset",
     "make_sequence_collate",
 ]
