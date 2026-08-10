@@ -26,7 +26,8 @@ from .losses import (
     cost_to_go_loss as _cost_to_go_loss,
     cutting_plane_loss,
 )
-from .checkpoint import save_checkpoint
+import json
+from .checkpoint import save_checkpoint, load_weights_only
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +354,81 @@ class Trainer:
                     total = total + 0.5 * F.huber_loss(bp, bt, delta=1.0)
         return total / len(anchors)
 
+    @torch.no_grad()
+    def dynamics_rollout_diagnostic(self, loader, max_depth=8, save_path=None):
+        """
+        k-step rollout drift diagnostic (multi-step-lookahead health check).
+
+        Free-runs the dynamics from each sequence's start — feeding predictions
+        back in — and measures, at every rollout depth k, how far the predicted
+        latent has drifted from the real one and how wrong the decoded dual bound
+        has become. A model with good multi-step lookahead keeps both roughly
+        flat as k grows; a drifting model's curves blow up. This is the single
+        number that tells us whether the residual/overshoot/grounding upgrades
+        actually flattened the drift — and it doubles as a paper figure.
+
+        Returns (and optionally saves as JSON) a dict:
+            depth       : [1..K]
+            latent_mse  : mean squared error of z_hat_k vs real z_k, per depth
+            bound_mae   : mean |bound_pred(z_hat_k) - real bound|, per depth
+            count       : number of (masked) samples contributing at each depth
+        """
+        self.model.eval()
+        K = int(max_depth)
+        lat_se = [0.0] * K   # summed latent squared error per depth
+        bnd_ae = [0.0] * K   # summed bound absolute error per depth
+        cnt    = [0.0] * K   # sample counts per depth
+
+        for batch in loader:
+            d = batch if isinstance(batch, dict) else dict(zip(
+                ("z_seq", "a_seq", "z_next_seq"), batch))
+            z_seq      = d["z_seq"].to(self.device)
+            a_seq      = d["a_seq"].to(self.device)
+            z_next_seq = d["z_next_seq"].to(self.device)
+            d_seq = d.get("dir_seq")
+            d_seq = d_seq.to(self.device) if d_seq is not None else None
+            tmask = d.get("time_mask")
+            tmask = tmask.to(self.device) if tmask is not None else None
+            bnd_t = d.get("bound_next_seq")
+            bnd_t = bnd_t.to(self.device) if bnd_t is not None else None
+
+            T = z_seq.size(1)
+            k = min(K, T)
+            if k <= 0:
+                continue
+            preds = self.model.dynamics.rollout(
+                z_seq[:, 0], a_seq[:, :k],
+                d_seq=d_seq[:, :k] if d_seq is not None else None)   # [B, k, H]
+
+            for j in range(k):
+                m = (tmask[:, j].float() if tmask is not None
+                     else torch.ones(z_seq.size(0), device=self.device))
+                lat = ((preds[:, j] - z_next_seq[:, j]) ** 2).mean(-1)   # [B]
+                lat_se[j] += float((lat * m).sum().item())
+                cnt[j]    += float(m.sum().item())
+                if bnd_t is not None:
+                    bp = self.model.dynamics_bound_pred(preds[:, j])     # [B]
+                    bnd_ae[j] += float(((bp - bnd_t[:, j]).abs() * m).sum().item())
+
+        depth = list(range(1, K + 1))
+        latent_mse = [lat_se[j] / cnt[j] if cnt[j] > 0 else float("nan")
+                      for j in range(K)]
+        bound_mae = [bnd_ae[j] / cnt[j] if cnt[j] > 0 else float("nan")
+                     for j in range(K)]
+        out = {"depth": depth, "latent_mse": latent_mse,
+               "bound_mae": bound_mae, "count": cnt}
+
+        print("\n[Phase3] k-step rollout drift (free-running):")
+        print("  depth |  latent_mse |  bound_mae |   n")
+        for j in range(K):
+            print(f"  {depth[j]:5d} | {latent_mse[j]:11.5f} | "
+                  f"{bound_mae[j]:10.5f} | {int(cnt[j])}")
+        if save_path is not None:
+            with open(save_path, "w") as f:
+                json.dump(out, f, indent=2)
+            print(f"  saved -> {save_path}")
+        return out
+
     def _dynamics_batch_loss(self, batch):
         """
         Compute the Phase-3 dynamics loss for one batch.
@@ -583,6 +659,19 @@ class Trainer:
         save_checkpoint(
             self.model, optimizer, epochs, {}, self.ckpt_dir / "phase3_final.pt"
         )
+
+        # k-step rollout drift diagnostic on the BEST weights — tells us whether
+        # the residual/overshoot/grounding upgrades flattened the multi-step
+        # drift curve, and is saved for the paper figure.
+        best = self.ckpt_dir / "phase3_best.pt"
+        if best.exists():
+            load_weights_only(self.model, best, device=self.device)
+        diag_depth = max(8, (self.overshoot_depth or 0) + 2)
+        self._overshoot_k = 0     # diagnostic must not affect training state
+        self.history["p3_rollout_diag"] = self.dynamics_rollout_diagnostic(
+            val_loader, max_depth=diag_depth,
+            save_path=self.ckpt_dir / "phase3_rollout_diag.json")
+
         for p in self.model.parameters():
             p.requires_grad = True
 
