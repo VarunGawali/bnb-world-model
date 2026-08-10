@@ -312,6 +312,7 @@ def _optimal_objective(lp_path: Path, args: argparse.Namespace) -> float:
         import pyscipopt
     except Exception:
         return float("nan")
+    m = None
     try:
         m = pyscipopt.Model()
         m.hideOutput(True)
@@ -319,12 +320,19 @@ def _optimal_objective(lp_path: Path, args: argparse.Namespace) -> float:
         m.setParam("limits/time", float(args.optimal_time_limit))
         m.optimize()
         status = m.getStatus()
-        obj = float(m.getObjVal()) if m.getNSols() > 0 else float("nan")
-        m.freeProb()
-        # Only trust the value if optimality was actually proven.
-        return obj if status == "optimal" else float("nan")
-    except Exception:
+        # Only trust the value if optimality was actually proven within the limit.
+        if status == "optimal" and m.getNSols() > 0:
+            return float(m.getObjVal())
         return float("nan")
+    except Exception as e:
+        print(f"  optimal-solve failed {lp_path.name}: {e}")
+        return float("nan")
+    finally:
+        if m is not None:
+            try:
+                m.freeProb()
+            except Exception:
+                pass
 
 
 def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any] | None:
@@ -398,6 +406,20 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
     db = np.asarray(buf["dual_bounds"], dtype=np.float64)
     node_ids = np.asarray(buf["node_ids"], dtype=np.int64)
     parent_ids = np.asarray(buf["parent_ids"], dtype=np.int64)
+
+    # P0.11 robustness guard: the per-node bounds (transformed space) and the
+    # optimum (original space, from a separate solve) must be consistent for the
+    # gap normalisation to be meaningful. For a minimisation problem every node's
+    # LP lower bound must be <= the optimum. If a presolve objective offset or a
+    # sense mismatch breaks that, we do NOT trust the anchor — mark it invalid so
+    # the dataset falls back to per-trajectory normalisation instead of writing a
+    # silently-wrong cross-instance target.
+    _tol = 1e-6 * (abs(float(optimal_obj)) + 1.0) if np.isfinite(optimal_obj) else 0.0
+    if np.isfinite(optimal_obj) and float(db.max()) > float(optimal_obj) + _tol:
+        print(f"  [{lp_path.name}] anchor/bound space mismatch "
+              f"(max local LB {db.max():.4g} > optimum {optimal_obj:.4g}); "
+              f"marking optimal_valid=False")
+        optimal_obj = float("nan")
     # P0.11: real leaf = recorded node that is nobody's recorded parent.
     child_of = set(int(p) for p in parent_ids.tolist())
     next_is_leaf = np.array([0.0 if int(nid) in child_of else 1.0
