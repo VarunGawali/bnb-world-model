@@ -12,6 +12,17 @@ from torch.utils.data import DataLoader
 
 from bnb_wm.data import TransitionDataset, SequenceDataset, pyg_collate
 from bnb_wm.data.datasets import _root_to_leaf_paths, build_pyg_data
+from bnb_wm.data.labels import subtree_sizes_from_tree
+
+
+def test_subtree_sizes_from_tree():
+    # root id1 -> {id2, id3}; id2 -> {id4, id5}
+    sizes = subtree_sizes_from_tree([1, 2, 3, 4, 5], [0, 1, 1, 2, 2])
+    assert sizes.tolist() == [5, 3, 1, 1, 1]                 # inclusive counts
+    assert subtree_sizes_from_tree([1, 2, 3], [0, 1, 2]).tolist() == [3, 2, 1]
+    # unrecorded-parent fragment root, and malformed cycle must not hang/crash
+    assert subtree_sizes_from_tree([5, 6], [9, 5]).tolist() == [2, 1]
+    assert subtree_sizes_from_tree([1, 2], [2, 1]).tolist() == [1, 1]
 
 
 def test_sb_local_label_indexes_candidates_only():

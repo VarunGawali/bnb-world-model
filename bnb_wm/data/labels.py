@@ -96,3 +96,57 @@ def subtree_sizes_from_depths(depths):
             sizes[anc] += 1
         stack.append(t)
     return sizes
+
+
+def subtree_sizes_from_tree(node_ids, parent_ids):
+    """
+    Exact recorded-subtree size per node from the true tree links — no DFS
+    assumption, unlike `subtree_sizes_from_depths`.
+
+    For each recorded node, returns the number of recorded nodes in the subtree
+    rooted there (inclusive: itself + all recorded descendants). Because only
+    branchable nodes are recorded, this COUNTS RECORDED NODES ONLY — it
+    undercounts fathomed leaves the Ecole stream never yields — but it is
+    tree-consistent and strictly better than the visitation-order `n_steps - t`
+    proxy for the cost-to-go / subtree-size targets.
+
+    Used for both the CostToGoHead target (nodes remaining to close this node's
+    subtree) and the SubtreeSizeHead target, replacing the fabricated proxies.
+
+    Args:
+        node_ids, parent_ids : per-recorded-node SCIP ids (parent id may point to
+                               an unrecorded fragment root; those links are ignored).
+    Returns:
+        np.ndarray [T] of inclusive recorded-subtree sizes (>= 1).
+    """
+    node_ids = np.asarray(node_ids, dtype=np.int64)
+    parent_ids = np.asarray(parent_ids, dtype=np.int64)
+    T = node_ids.size
+    if T == 0:
+        return np.zeros(0, dtype=np.int64)
+
+    id2idx = {int(n): i for i, n in enumerate(node_ids)}   # last wins on dup
+    children = [[] for _ in range(T)]
+    parent_idx = [None] * T
+    for i in range(T):
+        pi = id2idx.get(int(parent_ids[i]))
+        if pi is not None and pi != i:
+            children[pi].append(i)
+            parent_idx[i] = pi
+
+    # Iterative post-order accumulation so a node's size is added to its parent
+    # only after its own subtree is fully counted (safe for any tree shape).
+    sizes = np.ones(T, dtype=np.int64)
+    order, stack = [], [i for i in range(T) if parent_idx[i] is None]
+    seen = set()
+    while stack:
+        u = stack.pop()
+        if u in seen:                      # guard against malformed cycles
+            continue
+        seen.add(u)
+        order.append(u)
+        stack.extend(children[u])
+    for u in reversed(order):              # children before parents
+        if parent_idx[u] is not None:
+            sizes[parent_idx[u]] += sizes[u]
+    return sizes

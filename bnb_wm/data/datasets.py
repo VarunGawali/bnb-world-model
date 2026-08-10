@@ -40,7 +40,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torch_geometric.data import Data, Batch
 
-from .labels import steps_to_go, subtree_sizes_from_depths
+from .labels import (
+    steps_to_go, subtree_sizes_from_depths, subtree_sizes_from_tree,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +208,10 @@ class TransitionDataset(Dataset):
         n_vars, action_set, local_label            (policy)
         norm_db                                     (value)
         is_leaf, depth, n_frac                      (integrality / joint)
-        steps_to_go                                 (cost-to-go, Gap 3)
-        subtree_size                                (only if the trajectory is
-                                                     DFS-ordered; else absent)
+        steps_to_go                                 (cost-to-go: tree subtree
+                                                     size, or n_steps-t legacy)
+        subtree_size                                (tree subtree size, when
+                                                     node/parent ids present)
         cut_features, cut_labels                    (cuts, if present)
     """
 
@@ -223,6 +226,7 @@ class TransitionDataset(Dataset):
             self.index.extend((fi, t) for t in range(n))
         self._cache_fi = None
         self._cache_d = None
+        self._cache_sizes = None        # per-file tree subtree sizes (or None)
 
     def __len__(self):
         return len(self.index)
@@ -231,7 +235,20 @@ class TransitionDataset(Dataset):
         if fi != self._cache_fi:
             self._cache_d = np.load(self.files[fi], allow_pickle=True)
             self._cache_fi = fi
+            self._cache_sizes = self._compute_subtree_sizes(self._cache_d)
         return self._cache_d
+
+    @staticmethod
+    def _compute_subtree_sizes(d):
+        """Recorded-subtree sizes for the file, preferring the TRUE tree
+        (node_ids/parent_ids) over the DFS-depth heuristic. Returns [T] or None.
+
+        The tree version is exact for any node order (no DFS assumption) and is
+        the correct target for both cost-to-go and subtree size; the depth
+        heuristic is only a legacy fallback for id-less files."""
+        if "node_ids" in d and "parent_ids" in d:
+            return subtree_sizes_from_tree(d["node_ids"], d["parent_ids"])
+        return subtree_sizes_from_depths(d["depths"])
 
     def __getitem__(self, i):
         fi, t = self.index[i]
@@ -260,13 +277,19 @@ class TransitionDataset(Dataset):
             "is_leaf":     float(d["next_is_leaf"][t]),
             "depth":       int(d["depths"][t]),
             "n_frac":      n_frac,
-            "steps_to_go": float(n_steps - t),          # Gap 3 target (no DFS)
         }
 
-        # Subtree size only when the trajectory is a valid DFS pre-order.
-        sizes = subtree_sizes_from_depths(d["depths"])
+        # Cost-to-go and subtree-size targets from the TRUE tree when available
+        # (recorded-subtree node count), falling back to the visitation-order
+        # `n_steps - t` proxy only for id-less legacy files. Using the tree
+        # target trains the cost-to-go head (which drives node selection and the
+        # rollout score) on real remaining-work, not visitation position.
+        sizes = self._cache_sizes
         if sizes is not None:
+            meta["steps_to_go"]  = float(sizes[t])   # nodes to close this subtree
             meta["subtree_size"] = float(sizes[t])
+        else:
+            meta["steps_to_go"]  = float(n_steps - t)   # legacy proxy (Gap 3)
 
         if self.with_cuts:
             # Always present (possibly empty) so the Phase-5 loop, which reads
