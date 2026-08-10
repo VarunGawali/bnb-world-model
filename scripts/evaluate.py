@@ -15,14 +15,15 @@ import argparse
 import sys
 from pathlib import Path
 
-import random
 import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from bnb_wm.model import BnBWorldModel
-from bnb_wm.data import TransitionDataset, pyg_collate
+from bnb_wm.data import (
+    TransitionDataset, pyg_collate, list_trajectory_files, split_files,
+)
 from bnb_wm.training.checkpoint import load_weights_only
 from bnb_wm.evaluate.metrics import topk_accuracy, rank_cdf, compute_spearman
 from bnb_wm.evaluate.benchmark import run_macro_benchmark
@@ -48,12 +49,14 @@ def main():
     model.eval()
     print(f"Loaded checkpoint: {args.checkpoint}\n")
 
-    # Build val loader
-    all_paths = sorted((Path(args.data) / args.problem).glob("*.npz"))
-    random.seed(42)
-    random.shuffle(all_paths)
-    n = len(all_paths)
-    val_paths = all_paths[int(0.8 * n) : int(0.9 * n)]
+    # Build val loader from the canonical trajectory layout (recursive
+    # traj_*.npz across tiers), split identically to train.py so the eval set is
+    # the SAME held-out files the model was validated on — not a fresh random
+    # glob of a flat directory that no longer exists (P0.10/P1.9).
+    all_paths = list_trajectory_files(args.data)
+    if not all_paths:
+        raise SystemExit(f"No traj_*.npz found under {args.data}")
+    _, val_paths, _ = split_files(all_paths, 0.8, 0.1, 0.1)
 
     val_loader = DataLoader(
         TransitionDataset(val_paths),

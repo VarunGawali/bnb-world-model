@@ -19,7 +19,8 @@ significance) drive changes to how the benchmark is run — see the note at the 
 - 3.2 Motivation for chosen datasets: **yes** — Set Cover is a standard learn-to-branch
   benchmark; easy/medium/hard tiers test size generalization.
 - 3.3 Novel datasets in a data appendix: **partial** — we release the trajectory-collection
-  notebook/script that generates the traces (`notebooks/collect_with_cuts.ipynb`).
+  scripts that generate the traces (`scripts/generate_instances.py` +
+  `scripts/collect_with_cuts_v2.py`).
 - 3.4 Novel datasets public upon publication: **yes**
 - 3.5 Existing-literature datasets cited: **yes** — instances via Ecole `SetCoverGenerator` (cite Ecole/Gasse et al.).
 - 3.6 Existing datasets publicly available: **yes**
