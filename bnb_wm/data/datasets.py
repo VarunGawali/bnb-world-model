@@ -240,12 +240,23 @@ class TransitionDataset(Dataset):
 
     @staticmethod
     def _compute_subtree_sizes(d):
-        """Recorded-subtree sizes for the file, preferring the TRUE tree
-        (node_ids/parent_ids) over the DFS-depth heuristic. Returns [T] or None.
+        """Subtree sizes for the recorded nodes, best source first. Returns [T].
 
-        The tree version is exact for any node order (no DFS assumption) and is
-        the correct target for both cost-to-go and subtree size; the depth
-        heuristic is only a legacy fallback for id-less files."""
+        1. FULL tree (`full_*`, collector v3): sizes over EVERY processed node —
+           includes fathomed leaves — mapped back to the recorded nodes. Most
+           accurate cost-to-go / subtree-size target.
+        2. Recorded tree (`node_ids`/`parent_ids`): recorded-node subtree count
+           (undercounts fathomed leaves), exact for any order.
+        3. DFS-depth heuristic: legacy fallback for id-less files (or None).
+        """
+        if "full_node_ids" in d and "full_parent_ids" in d and "node_ids" in d:
+            full_sizes = subtree_sizes_from_tree(
+                d["full_node_ids"], d["full_parent_ids"])
+            f2i = {int(nid): i for i, nid in enumerate(np.asarray(d["full_node_ids"]))}
+            rec = np.asarray(d["node_ids"], dtype=np.int64)
+            return np.array(
+                [int(full_sizes[f2i[int(nid)]]) if int(nid) in f2i else 1
+                 for nid in rec], dtype=np.int64)
         if "node_ids" in d and "parent_ids" in d:
             return subtree_sizes_from_tree(d["node_ids"], d["parent_ids"])
         return subtree_sizes_from_depths(d["depths"])
@@ -274,7 +285,10 @@ class TransitionDataset(Dataset):
                 dtype=torch.long),
             "local_label": int(d["local_branching_label"][t]),
             "norm_db":     float(gap_to_primal_norm(d)[t]),   # P0.11
-            "is_leaf":     float(d["next_is_leaf"][t]),
+            # True terminal leaf label from the full tree (collector v3) when
+            # present; else the "no recorded child" proxy.
+            "is_leaf":     float((d["true_next_is_leaf"] if "true_next_is_leaf" in d
+                                  else d["next_is_leaf"])[t]),
             "depth":       int(d["depths"][t]),
             "n_frac":      n_frac,
         }
