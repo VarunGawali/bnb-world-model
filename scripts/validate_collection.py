@@ -124,6 +124,21 @@ def validate_file(path, strict=False):
     if not _root_to_leaf_ok(node_ids, np.asarray(d["parent_ids"], dtype=np.int64)):
         errs.append("parent_ids contain a cycle — path reconstruction unsafe")
 
+    # full-tree capture (collector v3 Stage 1), only when present.
+    if "full_node_ids" in d:
+        full = set(np.asarray(d["full_node_ids"]).tolist())
+        rec = set(node_ids.tolist())
+        missing = rec - full
+        if missing:
+            errs.append(f"{len(missing)} recorded nodes absent from full tree "
+                        "(event handler missed nodes — widen event mask)")
+        if "true_next_is_leaf" in d:
+            tnl = set(np.unique(np.asarray(d["true_next_is_leaf"]).astype(int)).tolist())
+            if not tnl <= {0, 1}:
+                errs.append(f"true_next_is_leaf not binary: {tnl}")
+        else:
+            errs.append("full_node_ids present but true_next_is_leaf missing")
+
     # cut sanity (P0.4/P0.7).
     ncuts = np.asarray(d["n_cuts"], dtype=np.int64)
     total_cuts = int(ncuts.sum())

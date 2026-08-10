@@ -135,6 +135,88 @@ class NodeIdentity:
 
 
 # ---------------------------------------------------------------------------
+# Collector v3 Stage 1 (EXPERIMENTAL, opt-in via --record-full-tree):
+# full B&B tree capture via a pyscipopt event handler. See docs/COLLECTOR_V3.md.
+# MUST be validated on-machine — which node events fire for which nodes is
+# SCIP-version-dependent. Guarded behind the flag so the default path is unchanged.
+# ---------------------------------------------------------------------------
+
+def _install_tree_recorder(ecole_model: Any):
+    """Attach a node-tree event handler to an Ecole SCIP model BEFORE reset.
+
+    Returns the handler (holding .records = list of (nid, pid, depth, lb)) or
+    None if pyscipopt's event API is unavailable / raises. Never disturbs the
+    default collection path — callers only use it when --record-full-tree is set.
+    """
+    try:
+        from pyscipopt import Eventhdlr, SCIP_EVENTTYPE
+    except Exception:
+        return None
+
+    class _NodeTreeRecorder(Eventhdlr):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def eventinit(self):
+            # NODEFOCUSED fires when a node becomes the focus node. If bound-
+            # pruned nodes turn out NOT to focus on this SCIP build, widen this
+            # mask (e.g. add NODEBRANCHED / NODEFEASIBLE / NODEINFEASIBLE) and
+            # re-validate — see docs/COLLECTOR_V3.md.
+            self.model.catchEvent(SCIP_EVENTTYPE.NODEFOCUSED, self)
+
+        def eventexit(self):
+            self.model.dropEvent(SCIP_EVENTTYPE.NODEFOCUSED, self)
+
+        def eventexec(self, event):
+            node = self.model.getCurrentNode()
+            if node is None:
+                return {}
+            parent = node.getParent()
+            self.records.append((
+                int(node.getNumber()),
+                int(parent.getNumber()) if parent is not None else -1,
+                int(node.getDepth()),
+                float(node.getLowerbound()),
+            ))
+            return {}
+
+    try:
+        scip = ecole_model.as_pyscipopt()
+        rec = _NodeTreeRecorder()
+        scip.includeEventhdlr(rec, "nodetree_v3",
+                              "records the full B&B node tree (collector v3)")
+        return rec
+    except Exception as e:
+        print(f"  [full-tree] event handler not installed: {e}")
+        return None
+
+
+def _full_tree_arrays(records, recorded_node_ids):
+    """Build the full_* schema + true leaf labels from the event-handler log.
+
+    A recorded node is a TRUE leaf iff it has no child anywhere in the full
+    processed tree (so fathomed children now count). Returns a dict of arrays,
+    or None if nothing was recorded.
+    """
+    if not records:
+        return None
+    ids = np.array([r[0] for r in records], dtype=np.int64)
+    pids = np.array([r[1] for r in records], dtype=np.int64)
+    depths = np.array([r[2] for r in records], dtype=np.int32)
+    lbs = np.array([r[3] for r in records], dtype=np.float32)
+    parents_with_children = set(int(p) for p in pids.tolist() if p >= 0)
+    true_leaf = np.array(
+        [0.0 if int(nid) in parents_with_children else 1.0
+         for nid in recorded_node_ids], dtype=np.float32)
+    return {
+        "full_node_ids": ids, "full_parent_ids": pids,
+        "full_depths": depths, "full_lower_bounds": lbs,
+        "true_next_is_leaf": true_leaf,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Graph extraction (carried over from the working collector, trimmed)
 # ---------------------------------------------------------------------------
 
@@ -337,7 +419,12 @@ def _optimal_objective(lp_path: Path, args: argparse.Namespace) -> float:
 
 def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any] | None:
     try:
-        obs, action_set, _, done, info = env.reset(ecole.scip.Model.from_file(str(lp_path)))
+        ecole_model = ecole.scip.Model.from_file(str(lp_path))
+        # Opt-in full-tree capture (collector v3 Stage 1). Installed BEFORE reset
+        # so no processed node is missed. Default path unchanged when flag off.
+        tree_rec = (_install_tree_recorder(ecole_model)
+                    if getattr(args, "record_full_tree", False) else None)
+        obs, action_set, _, done, info = env.reset(ecole_model)
     except Exception as e:
         print(f"  reset failed {lp_path.name}: {e}")
         return None
@@ -446,7 +533,7 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
             cut_lhs[t] = np.zeros((0, buf["var_features"][t].shape[0]), np.float32)
             cut_rhs[t] = np.zeros(0, np.float32)
 
-    return {
+    traj = {
         "n_steps": np.asarray(n),
         "var_features": np.asarray(buf["var_features"], dtype=object),
         "con_features": np.asarray(buf["con_features"], dtype=object),
@@ -475,6 +562,15 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
         "cut_features": cut_features, "cut_labels": cut_labels, "cut_scores": cut_scores,
         "cut_lhs": cut_lhs, "cut_rhs": cut_rhs, "n_cuts": n_cuts,
     }
+
+    # Collector v3 Stage 1: attach the full processed tree + true leaf labels when
+    # --record-full-tree captured anything. Dataset uses these when present.
+    if tree_rec is not None:
+        ft = _full_tree_arrays(tree_rec.records, node_ids)
+        if ft is not None:
+            traj.update(ft)
+
+    return traj
 
 
 def _collect(diff: str, args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -525,6 +621,11 @@ def main() -> None:
     p.add_argument("--optimal-time-limit", type=float, default=120.0,
                    help="P0.11: per-instance time budget for the independent "
                         "solve-to-optimality that provides the true primal anchor")
+    p.add_argument("--record-full-tree", action="store_true",
+                   help="EXPERIMENTAL (collector v3): also capture the full B&B "
+                        "tree via a pyscipopt event handler for true leaf labels "
+                        "and both-child topology. Validate on-machine before use "
+                        "(see docs/COLLECTOR_V3.md).")
     p.add_argument("--allow-missing-highspy", action="store_true",
                    help="permit a branching-only run with empty cut labels when "
                         "highspy is not importable (default: fail loud)")
