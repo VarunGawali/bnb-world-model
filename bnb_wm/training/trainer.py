@@ -293,6 +293,66 @@ class Trainer:
     # ------------------------------------------------------------------
     # Phase 3 — Dynamics
     # ------------------------------------------------------------------
+    def _transition_loss(self, z_pred, z_next, logvar, tmask):
+        """Base one-step transition loss: masked MSE, or Gaussian NLL when the
+        model is heteroscedastic (logvar given)."""
+        if logvar is not None:
+            logvar = logvar.clamp(-8.0, 8.0)     # numerical stability
+            per = 0.5 * (torch.exp(-logvar) * (z_pred - z_next) ** 2 + logvar)
+            if tmask is None:
+                return per.mean()
+            m = tmask.unsqueeze(-1).float()
+            return (per * m).sum() / (m.sum().clamp_min(1.0) * z_pred.size(-1))
+        if tmask is None:
+            return _dynamics_loss(z_pred, z_next)
+        m = tmask.unsqueeze(-1).float()
+        return ((z_pred - z_next) ** 2 * m).sum() / \
+            (m.sum().clamp_min(1.0) * z_pred.size(-1))
+
+    def _overshoot_and_ground(self, z_seq, a_seq, d_seq, z_next_seq, tmask,
+                              bound_tgt):
+        """Multi-anchor latent overshooting with dual-bound grounding.
+
+        Rolls the dynamics forward `_overshoot_k` steps from several anchor
+        positions and supervises the free-running predictions (and their
+        predicted bound) against the real future. Returns a scalar loss (0 if
+        overshooting is disabled).
+        """
+        k_max = int(getattr(self, "_overshoot_k", 0) or 0)
+        if k_max <= 0:
+            return z_seq.new_zeros(())
+        T, H = z_seq.size(1), z_seq.size(-1)
+        anchors = [a for a in getattr(self, "_overshoot_anchors", None)
+                   or sorted({0, T // 3, (2 * T) // 3}) if a < T - 1]
+        if not anchors:
+            return z_seq.new_zeros(())
+        total = z_seq.new_zeros(())
+        for a0 in anchors:
+            kk = min(k_max, T - a0)
+            d_slice = d_seq[:, a0:a0 + kk] if d_seq is not None else None
+            preds = self.model.dynamics.rollout(
+                z_seq[:, a0], a_seq[:, a0:a0 + kk], d_seq=d_slice)   # [B, kk, H]
+            tgt = z_next_seq[:, a0:a0 + kk]
+            if tmask is not None:
+                om = tmask[:, a0:a0 + kk].unsqueeze(-1).float()
+                total = total + ((preds - tgt) ** 2 * om).sum() / \
+                    (om.sum().clamp_min(1.0) * H)
+            else:
+                total = total + F.mse_loss(preds, tgt)
+            # Grounding: the rolled-out latents must still decode to the right
+            # dual bound (keeps compounding predictions on the manifold).
+            if bound_tgt is not None:
+                bp = self.model.dynamics_bound_pred(preds)          # [B, kk]
+                bt = bound_tgt[:, a0:a0 + kk]
+                if tmask is not None:
+                    om2 = tmask[:, a0:a0 + kk].float()
+                    per = F.huber_loss(bp, bt, delta=1.0, reduction="none")
+                    total = total + 0.5 * (per * om2).sum() / \
+                        om2.sum().clamp_min(1.0)
+                else:
+                    total = total + 0.5 * F.huber_loss(bp, bt, delta=1.0)
+        return total / len(anchors)
+
     def _dynamics_batch_loss(self, batch):
         """
         Compute the Phase-3 dynamics loss for one batch.
@@ -335,27 +395,29 @@ class Trainer:
         if d_seq is not None:
             d_seq = d_seq.to(self.device)
 
-        has_vars = d.get("hv_seq") is not None
-        if has_vars:
-            hv_seq = d["hv_seq"].to(self.device)
-            z_pred, hv_pred = self.model.dynamics.forward_with_vars(
-                z_seq, a_seq, hv_seq, d_seq
-            )
-        else:
-            z_pred = self.model.dynamics_forward(z_seq, a_seq, d_seq)
-
         # Time-padding mask (present when batching variable-length trajectories).
         tmask = d.get("time_mask")
         if tmask is not None:
             tmask = tmask.to(self.device)
 
-        if tmask is None:
-            loss = _dynamics_loss(z_pred, z_next_seq)
+        # Base transition prediction. A heteroscedastic model also predicts a
+        # per-dim log-variance and is trained with Gaussian NLL, modelling the
+        # transition's aleatoric uncertainty instead of forcing a mean fit.
+        hetero = getattr(self.model.dynamics, "heteroscedastic", False)
+        logvar = None
+        if hetero:
+            z_pred, logvar = self.model.dynamics.forward(
+                z_seq, a_seq, d_seq, return_logvar=True)
         else:
-            # Masked MSE over valid time positions only.
-            m = tmask.unsqueeze(-1).float()                 # [B, T, 1]
-            denom = m.sum().clamp_min(1.0) * z_pred.size(-1)
-            loss = ((z_pred - z_next_seq) ** 2 * m).sum() / denom
+            z_pred = self.model.dynamics_forward(z_seq, a_seq, d_seq)
+
+        has_vars = d.get("hv_seq") is not None
+        if has_vars:
+            hv_seq = d["hv_seq"].to(self.device)
+            # Same as forward_with_vars but reusing the z_pred computed above.
+            hv_pred = self.model.dynamics.var_dynamics(hv_seq, z_pred, a_seq)
+
+        loss = self._transition_loss(z_pred, z_next_seq, logvar, tmask)
 
         if has_vars:
             # var_mask already spans only valid time positions.
@@ -365,24 +427,19 @@ class Trainer:
                 d["var_mask"].to(self.device),
             )
 
-        # Latent overshooting (Technique 1): unroll the dynamics autoregressively
-        # from z_0, feeding its own predictions back in, and supervise each
-        # predicted step against the real future latent. Trains the model in the
-        # same compounding regime it faces during the inference rollout.
-        if self.overshoot_depth and self.overshoot_depth > 0:
-            k = min(self.overshoot_depth, a_seq.size(1))
-            if k > 0:
-                preds = self.model.dynamics.rollout(
-                    z_seq[:, 0], a_seq[:, :k],
-                    d_seq=d_seq[:, :k] if d_seq is not None else None,
-                )                                        # [B, k, H]
-                tgt = z_next_seq[:, :k]                   # real z_1 .. z_k
-                if tmask is not None:
-                    om = tmask[:, :k].unsqueeze(-1).float()
-                    denom = om.sum().clamp_min(1.0) * preds.size(-1)
-                    loss = loss + ((preds - tgt) ** 2 * om).sum() / denom
-                else:
-                    loss = loss + F.mse_loss(preds, tgt)
+        # Multi-anchor latent overshooting (+ rollout grounding). Unroll the
+        # dynamics autoregressively — feeding its own predictions back in — from
+        # SEVERAL start anchors (not just z_0), and supervise each predicted step
+        # against the real future latent. This trains the free-running-from-
+        # anywhere regime inference actually uses. The rolled-out latents are
+        # also grounded against the real dual bound so compounding predictions
+        # stay decodable (anti-drift). The horizon `_overshoot_k` follows an
+        # epoch curriculum set in train_dynamics.
+        bound_tgt = d.get("bound_next_seq")
+        if bound_tgt is not None:
+            bound_tgt = bound_tgt.to(self.device)
+        loss = loss + self._overshoot_and_ground(
+            z_seq, a_seq, d_seq, z_next_seq, tmask, bound_tgt)
 
         # Gap 2: ground the predicted latent against the next real dual bound.
         if d.get("bound_next_seq") is not None:
@@ -453,12 +510,26 @@ class Trainer:
         best_val_loss = float("inf")
         no_improve = 0
 
+        # Overshoot curriculum: ramp the rollout horizon 1 -> overshoot_depth
+        # over the first ~60% of epochs, so long-horizon free-running is trained
+        # only once the one-step model is reasonable (stable, standard practice).
+        ramp_epochs = max(1, int(0.6 * epochs))
+
         for epoch in range(1, epochs + 1):
+            if self.overshoot_depth and self.overshoot_depth > 0:
+                self._overshoot_k = max(1, min(
+                    self.overshoot_depth,
+                    round(self.overshoot_depth * epoch / ramp_epochs)))
+            else:
+                self._overshoot_k = 0
+
             self.model.train()
             total_loss = n = 0
 
             for batch in tqdm(
-                train_loader, desc=f"Dyn Train Epoch {epoch}", leave=False
+                train_loader,
+                desc=f"Dyn Train Epoch {epoch} (k={self._overshoot_k})",
+                leave=False,
             ):
                 optimizer.zero_grad(set_to_none=True)
                 with autocast("cuda", enabled=self.amp):

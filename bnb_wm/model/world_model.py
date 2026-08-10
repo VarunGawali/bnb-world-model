@@ -43,6 +43,8 @@ class BnBWorldModel(nn.Module):
         n_dyn_heads: int = 4,
         max_seq: int = 512,
         cut_feat_dim: int = 6,
+        dyn_residual: bool = True,
+        dyn_heteroscedastic: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -63,6 +65,7 @@ class BnBWorldModel(nn.Module):
         self.dynamics       = DynamicsTransformer(
             hidden_dim=hidden_dim, n_layers=n_dyn_layers,
             n_heads=n_dyn_heads, max_seq=max_seq,
+            residual=dyn_residual, heteroscedastic=dyn_heteroscedastic,
         )
         # Grounding head (Gap 2): predicts the next node's normalised dual bound
         # from the predicted latent, so the dynamics is anchored to a real

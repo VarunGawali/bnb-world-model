@@ -166,10 +166,23 @@ class DynamicsTransformer(nn.Module):
         n_heads: int = 4,
         max_seq: int = 512,
         dropout: float = 0.1,
+        residual: bool = True,
+        heteroscedastic: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_seq = max_seq   # positional-embedding / causal-mask capacity
+        # Residual latent prediction (monotone-safe stabiliser): predict the
+        # CHANGE from z_t, z_{t+1} = LayerNorm(z_t + delta), instead of the
+        # absolute latent. Predicting a correction reduces the variance that
+        # accumulates over an autoregressive rollout, so multi-step lookahead
+        # drifts less. No tunable knob that can regress.
+        self.residual = residual
+        # Heteroscedastic transition (off by default): also predict a per-dim
+        # log-variance and train with Gaussian NLL, modelling the aleatoric
+        # uncertainty of the transition (unobserved LP details) WITHOUT the
+        # sampling / KL / posterior-collapse risk of a full stochastic RSSM.
+        self.heteroscedastic = heteroscedastic
 
         # Project [z_t || a_t || dir_t] -> d_model. The trailing scalar is the
         # branch direction of the transition this action produces: +1 = up branch
@@ -194,6 +207,11 @@ class DynamicsTransformer(nn.Module):
 
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        # LayerNorm applied to (z_t + delta) so the residual prediction stays on
+        # the encoder's scale; only used when `residual`.
+        self.res_norm = nn.LayerNorm(hidden_dim)
+        # Per-dim log-variance head (only used when `heteroscedastic`).
+        self.logvar_proj = nn.Linear(hidden_dim, hidden_dim) if heteroscedastic else None
 
         # Per-variable transition head (enables real latent rollout)
         self.var_dynamics = _VarDynamics(hidden_dim, dropout)
@@ -233,12 +251,24 @@ class DynamicsTransformer(nn.Module):
                     d = d.unsqueeze(-1)
         return self.input_proj(torch.cat([z, a, d], dim=-1))
 
+    def _decode(self, feat: torch.Tensor, z_in: torch.Tensor) -> torch.Tensor:
+        """Map transformer features to the next latent.
+
+        Residual: z_{t+1} = LayerNorm(z_t + delta). Absolute (legacy): just delta.
+        `feat` and `z_in` share shape [..., H].
+        """
+        delta = self.out_proj(feat)
+        if self.residual:
+            return self.res_norm(z_in + delta)
+        return delta
+
     def forward(
         self,
         z_seq: torch.Tensor,
         a_seq: torch.Tensor,
         d_seq: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_logvar: bool = False,
+    ):
         """
         Parallel (training) forward over a full trajectory.
 
@@ -251,6 +281,8 @@ class DynamicsTransformer(nn.Module):
         Returns:
             z_pred : [B, T, H]  predicted z at steps 1..T
                      z_pred[:, t, :] is the prediction for z_{t+1}
+            (z_pred, logvar) if return_logvar and the model is heteroscedastic;
+            logvar is [B, T, H] per-dim log-variance of the transition.
         """
         B, T, _ = z_seq.shape
         tokens = self._tokens(z_seq, a_seq, d_seq)                   # [B, T, H]
@@ -261,7 +293,11 @@ class DynamicsTransformer(nn.Module):
             x = attn(x)
             x = ffn(x)
 
-        return self.out_proj(self.out_norm(x))   # [B, T, H]
+        feat = self.out_norm(x)
+        z_pred = self._decode(feat, z_seq)                           # [B, T, H]
+        if return_logvar and self.logvar_proj is not None:
+            return z_pred, self.logvar_proj(feat)
+        return z_pred
 
     def step(
         self,
@@ -306,7 +342,8 @@ class DynamicsTransformer(nn.Module):
             x = attn(x)
             x = ffn(x)
 
-        z_next = self.out_proj(self.out_norm(x[:, -1, :]))   # [B, H]
+        feat = self.out_norm(x[:, -1, :])                    # [B, H]
+        z_next = self._decode(feat, z_t)                     # residual on z_t
         return z_next, tokens
 
     def rollout(

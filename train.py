@@ -72,6 +72,10 @@ def build_model(cfg, device):
         n_dyn_layers=m["n_dyn_layers"],
         n_dyn_heads=m["n_dyn_heads"],
         max_seq=m["max_seq"],
+        # Multi-step-rollout stabilisers: residual latent prediction on by
+        # default; heteroscedastic (Gaussian-NLL) transition off by default.
+        dyn_residual=m.get("dyn_residual", True),
+        dyn_heteroscedastic=m.get("dyn_heteroscedastic", False),
     )
     return model.to(device)
 

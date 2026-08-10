@@ -8,6 +8,12 @@ model:
   n_dyn_layers: 4         # Transformer dynamics depth
   n_dyn_heads: 4          # Transformer attention heads
   max_seq: 512            # maximum B&B trajectory length
+  # Multi-step-rollout stabilisers (see dynamics.py). residual: predict
+  # z_{t+1}=LayerNorm(z_t+delta) — on by default, reduces compounding drift.
+  # heteroscedastic: also predict per-dim variance, train with Gaussian NLL —
+  # off by default (safe stochastic-aware option, no KL/sampling).
+  dyn_residual: true
+  dyn_heteroscedastic: false
 
 training:
   # Epoch numbers are CAPS, not fixed durations: early stopping (patience below)
