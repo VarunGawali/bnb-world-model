@@ -494,17 +494,19 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
     node_ids = np.asarray(buf["node_ids"], dtype=np.int64)
     parent_ids = np.asarray(buf["parent_ids"], dtype=np.int64)
 
-    # P0.11 robustness guard: the per-node bounds (transformed space) and the
-    # optimum (original space, from a separate solve) must be consistent for the
-    # gap normalisation to be meaningful. For a minimisation problem every node's
-    # LP lower bound must be <= the optimum. If a presolve objective offset or a
-    # sense mismatch breaks that, we do NOT trust the anchor — mark it invalid so
-    # the dataset falls back to per-trajectory normalisation instead of writing a
-    # silently-wrong cross-instance target.
+    # P0.11 robustness guard. A single NODE's local LP lower bound may LEGITIMATELY
+    # exceed the optimum — those are prune-able nodes B&B branched before proving
+    # optimality (their subtree can't beat the incumbent). What must hold for a
+    # minimisation problem is that the BEST (lowest) observed LP bound — a valid
+    # global lower bound, ~the root relaxation — is <= the optimum. If even that
+    # exceeds the optimum, the per-node bounds (transformed space) and the anchor
+    # (original space, separate solve) are in inconsistent objective spaces or the
+    # sense is wrong, so we don't trust the anchor and fall back to per-traj norm.
+    global_lb = float(db.min())
     _tol = 1e-6 * (abs(float(optimal_obj)) + 1.0) if np.isfinite(optimal_obj) else 0.0
-    if np.isfinite(optimal_obj) and float(db.max()) > float(optimal_obj) + _tol:
+    if np.isfinite(optimal_obj) and global_lb > float(optimal_obj) + _tol:
         print(f"  [{lp_path.name}] anchor/bound space mismatch "
-              f"(max local LB {db.max():.4g} > optimum {optimal_obj:.4g}); "
+              f"(global LB {global_lb:.4g} > optimum {optimal_obj:.4g}); "
               f"marking optimal_valid=False")
         optimal_obj = float("nan")
     # P0.11: real leaf = recorded node that is nobody's recorded parent.
@@ -566,6 +568,9 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
     # Collector v3 Stage 1: attach the full processed tree + true leaf labels when
     # --record-full-tree captured anything. Dataset uses these when present.
     if tree_rec is not None:
+        # Diagnostic (opt-in path only): reveal whether the event handler fired.
+        print(f"  [full-tree] {lp_path.name}: captured {len(tree_rec.records)} "
+              f"nodes (recorded branchable: {n})")
         ft = _full_tree_arrays(tree_rec.records, node_ids)
         if ft is not None:
             traj.update(ft)
