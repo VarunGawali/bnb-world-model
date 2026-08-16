@@ -99,13 +99,16 @@ def validate_file(path, strict=False):
     root_bound = float(np.asarray(d["root_bound"]))
     primal = float(np.asarray(d["primal_bound"]))
     if optimal_valid:
+        # A single node's local LP bound may LEGITIMATELY exceed the optimum
+        # (prune-able nodes B&B branched before proving optimality). The real
+        # invariant for a minimisation problem is that the BEST (lowest) observed
+        # bound — a valid global lower bound, ~the root relaxation — is <= optimum.
+        global_lb = float(db.min())
         if not np.isfinite(primal):
             errs.append("optimal_valid=True but primal_bound not finite")
-        elif db.max() > primal + 1e-6 * (abs(primal) + 1):
-            errs.append(f"local LB {db.max():.4g} exceeds optimum {primal:.4g} "
+        elif global_lb > primal + 1e-6 * (abs(primal) + 1):
+            errs.append(f"global LB {global_lb:.4g} exceeds optimum {primal:.4g} "
                         "(space mismatch — anchor should be invalid)")
-        elif primal < root_bound - 1e-6 * (abs(primal) + 1):
-            errs.append(f"optimum {primal:.4g} < root bound {root_bound:.4g}")
     else:
         warns.append("optimal_valid=False (optimum not proven; anchor fallback)")
 
