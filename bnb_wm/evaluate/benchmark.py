@@ -82,12 +82,15 @@ def _format_obs(obs, device):
     cf_raw = (obs.constraint_features if hasattr(obs, "constraint_features")
               else obs.row_features)
 
-    vf = np.nan_to_num(
-        np.array(vf_raw, dtype=np.float32), nan=0.0, posinf=1e6, neginf=-1e6
-    )
-    cf = np.nan_to_num(
-        np.array(cf_raw, dtype=np.float32), nan=0.0, posinf=1e6, neginf=-1e6
-    )
+    # Clip to FEATURE_CLIP (±1e4), matching build_pyg_data so the encoder's
+    # fixed input standardisation sees the same range at train and deploy.
+    from bnb_wm.data.datasets import FEATURE_CLIP as _FC
+    vf = np.clip(np.nan_to_num(
+        np.array(vf_raw, dtype=np.float32), nan=0.0, posinf=_FC, neginf=-_FC
+    ), -_FC, _FC)
+    cf = np.clip(np.nan_to_num(
+        np.array(cf_raw, dtype=np.float32), nan=0.0, posinf=_FC, neginf=-_FC
+    ), -_FC, _FC)
     ei = np.array(obs.edge_features.indices, dtype=np.int64)   # [2, E]
 
     # Edge values: constraint coefficients from Ecole

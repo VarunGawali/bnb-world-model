@@ -51,6 +51,7 @@ from bnb_wm.data import (
     list_trajectory_files,
     split_files,
     compute_label_stats,
+    compute_feature_stats,
     TransitionDataset,
     transition_collate,
     SequenceDataset,
@@ -189,6 +190,15 @@ def main():
     if args.init_checkpoint:
         load_weights_only(model, args.init_checkpoint, device=device)
         print(f"Warm-started from {args.init_checkpoint}")
+    else:
+        # Input standardisation (prenorm): compute per-feature mean/std from the
+        # training set and bake them into the encoder buffers before Phase 1.
+        # Skipped on warm-start (those weights already carry their own stats).
+        fs = compute_feature_stats(tr_files, max_files=200)
+        if fs is not None:
+            model.encoder.set_feature_stats(*fs)
+            print(f"Feature standardisation set (var σ range "
+                  f"{fs[1].min():.3g}–{fs[1].max():.3g})")
     trainer = Trainer(model, device, ckpt_dir, amp=tcfg.get("amp", True))
 
     # ---- Phase 1: policy ----

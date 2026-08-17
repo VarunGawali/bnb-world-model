@@ -49,6 +49,46 @@ from .labels import (
 # File discovery / splitting
 # ---------------------------------------------------------------------------
 
+# Feature clip range, shared by build_pyg_data and compute_feature_stats so
+# training and deployment clip node features identically before standardisation.
+FEATURE_CLIP = 1e4
+
+
+def compute_feature_stats(files, max_files=200):
+    """
+    Per-feature mean/std of the variable (19-dim) and constraint (5-dim) node
+    features over a sample of trajectory files, for input standardisation
+    ("prenorm"). Features are clipped to FEATURE_CLIP first, matching
+    build_pyg_data. Returns (var_mean, var_std, con_mean, con_std) float32.
+
+    Cheap: one pass over up to `max_files` files. std is floored to 1e-6 so
+    constant features (e.g. always-zero flags) don't divide by ~0.
+    """
+    vsum = vsq = csum = csq = None
+    vcnt = ccnt = 0
+    for f in list(files)[:max_files]:
+        d = np.load(f, allow_pickle=True)
+        for t in range(int(d["n_steps"])):
+            vf = np.clip(np.nan_to_num(np.asarray(d["var_features"][t], np.float64)),
+                         -FEATURE_CLIP, FEATURE_CLIP)
+            cf = np.clip(np.nan_to_num(np.asarray(d["con_features"][t], np.float64)),
+                         -FEATURE_CLIP, FEATURE_CLIP)
+            vsum = vf.sum(0) if vsum is None else vsum + vf.sum(0)
+            vsq  = (vf**2).sum(0) if vsq is None else vsq + (vf**2).sum(0)
+            vcnt += vf.shape[0]
+            csum = cf.sum(0) if csum is None else csum + cf.sum(0)
+            csq  = (cf**2).sum(0) if csq is None else csq + (cf**2).sum(0)
+            ccnt += cf.shape[0]
+    if vcnt == 0 or ccnt == 0:
+        return None
+    var_mean = vsum / vcnt
+    var_std  = np.sqrt(np.maximum(vsq / vcnt - var_mean**2, 0.0))
+    con_mean = csum / ccnt
+    con_std  = np.sqrt(np.maximum(csq / ccnt - con_mean**2, 0.0))
+    return (var_mean.astype(np.float32), np.maximum(var_std, 1e-6).astype(np.float32),
+            con_mean.astype(np.float32), np.maximum(con_std, 1e-6).astype(np.float32))
+
+
 def gap_to_primal_norm(d):
     """
     P0.11: fixed cross-instance value target — fraction of the root->optimum gap
@@ -152,10 +192,16 @@ def build_pyg_data(vf, cf, ei, ev):
         edge_index : [2, E]  variable and constraint nodes, constraints offset
         edge_attr  : [E, 3]  [coeff, coeff / |RHS|, sign(coeff)]
     """
-    vf = np.nan_to_num(np.asarray(vf, dtype=np.float32), nan=0.0,
-                       posinf=1e6, neginf=-1e6)
-    cf = np.nan_to_num(np.asarray(cf, dtype=np.float32), nan=0.0,
-                       posinf=1e6, neginf=-1e6)
+    # Clip to a sane range (was ±1e6): the encoder standardises features with
+    # fixed per-feature stats, and a single 1e6 outlier would otherwise dominate
+    # the scale. FEATURE_CLIP is shared with compute_feature_stats so train and
+    # deploy clip identically.
+    vf = np.clip(np.nan_to_num(np.asarray(vf, dtype=np.float32), nan=0.0,
+                               posinf=FEATURE_CLIP, neginf=-FEATURE_CLIP),
+                 -FEATURE_CLIP, FEATURE_CLIP)
+    cf = np.clip(np.nan_to_num(np.asarray(cf, dtype=np.float32), nan=0.0,
+                               posinf=FEATURE_CLIP, neginf=-FEATURE_CLIP),
+                 -FEATURE_CLIP, FEATURE_CLIP)
     ei = np.asarray(ei, dtype=np.int64)                      # [2, E]
     ev = np.asarray(ev, dtype=np.float32).reshape(-1)
     ev = np.nan_to_num(ev, nan=0.0, posinf=1e6, neginf=-1e6)

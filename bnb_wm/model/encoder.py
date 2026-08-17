@@ -97,6 +97,17 @@ class BipartiteGNN(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
 
+        # Fixed per-feature input standardisation ("prenorm"). Buffers hold the
+        # training-set mean/std; set once via set_feature_stats before training
+        # and saved with the checkpoint, so train and deploy standardise
+        # identically. Init to 0/1 (a no-op) until populated. A FIXED transform
+        # (not BatchNorm) — no train/eval or frozen-encoder pitfalls.
+        self.register_buffer("var_mean", torch.zeros(var_dim))
+        self.register_buffer("var_std",  torch.ones(var_dim))
+        self.register_buffer("con_mean", torch.zeros(con_dim))
+        self.register_buffer("con_std",  torch.ones(con_dim))
+        self.con_dim = con_dim
+
         # Input projections
         self.var_proj = nn.Linear(var_dim, hidden_dim)
         self.con_proj = nn.Linear(con_dim, hidden_dim)
@@ -125,6 +136,18 @@ class BipartiteGNN(nn.Module):
         # Graph-level readout
         self.pool = CrossAttentionPool(hidden_dim)
 
+    @torch.no_grad()
+    def set_feature_stats(self, var_mean, var_std, con_mean, con_std):
+        """Populate the input-standardisation buffers from arrays (numpy or
+        tensor). std is floored to avoid divide-by-zero on constant features."""
+        def _t(a, ref):
+            t = torch.as_tensor(a, dtype=ref.dtype, device=ref.device)
+            return t.reshape(ref.shape)
+        self.var_mean.copy_(_t(var_mean, self.var_mean))
+        self.var_std.copy_(_t(var_std, self.var_std).clamp_min(1e-6))
+        self.con_mean.copy_(_t(con_mean, self.con_mean))
+        self.con_std.copy_(_t(con_std, self.con_std).clamp_min(1e-6))
+
     def forward(
         self,
         x: torch.Tensor,
@@ -148,8 +171,11 @@ class BipartiteGNN(nn.Module):
         var_mask = node_type == 0
         con_mask = node_type == 1
 
-        h_v = F.relu(self.var_proj(x[var_mask]))
-        h_c = F.relu(self.con_proj(x[con_mask][:, :5]))
+        # Standardise inputs per feature before projecting (prenorm).
+        xv = (x[var_mask] - self.var_mean) / self.var_std
+        xc = (x[con_mask][:, :self.con_dim] - self.con_mean) / self.con_std
+        h_v = F.relu(self.var_proj(xv))
+        h_c = F.relu(self.con_proj(xc))
 
         h = torch.zeros(x.size(0), self.hidden_dim, device=x.device, dtype=h_v.dtype)
         h[var_mask] = h_v
