@@ -14,13 +14,14 @@ B&B Node (bipartite graph)
         │
         ▼
   BipartiteGNN encoder
-  (SAGEConv, 3 layers, hidden=128)
+  (GATv2, bidirectional, 3 layers, hidden=128,
+   cross-attention [CLS] readout)
         │
    ┌────┴────────────────┐
    ▼                     ▼
 h_vars [n_vars, 128]    z [1, 128]
    │                     │
-PolicyHead           ValueHead / IntegralityHead / DynamicsGRU
+PolicyHead           ValueHead / IntegralityHead / DynamicsTransformer
 (branching scores)   (dual bound / leaf prob / next latent state)
 ```
 
@@ -95,7 +96,7 @@ python scripts/evaluate.py --checkpoint checkpoints/phase4_best.pt
 |-------|-------------|--------|------------|
 | 1 | Policy head | — | Top-1 accuracy vs. strong branching |
 | 2 | Value head | Encoder + Policy | Spearman ρ on dual bound |
-| 3 | Dynamics GRU | Encoder | Latent MSE + cosine loss |
+| 3 | Dynamics Transformer | Encoder | Latent MSE + cosine + overshoot + bound grounding |
 | 4 | All (joint) | — | Total loss, Top-1 accuracy |
 
 ## Results (Set Cover, 500×1000, density=0.05)

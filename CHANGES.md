@@ -124,10 +124,13 @@ original notebook implementation (`MTP_model_code_1.ipynb`).
   selection, node priority, and near-leaf detection — through a Python
   branch-and-cut loop that uses HiGHS (via scipy) for LP relaxations only.
 
-- **Globally valid Chvátal-Gomory cuts propagated to all descendants**
-  Pairwise CG intersection cuts are generated at each node and inherited by
-  all descendant nodes. This is true branch-and-cut (not cut-and-branch):
-  cuts tighten the LP bound across the entire subtree, not just locally.
+- **Globally valid Gomory (GMI) cuts propagated to all descendants**
+  Valid Gomory fractional cuts (from `bnb_wm/solver/gomory.py`, the same
+  generator used at data collection) are generated and inherited by all
+  descendant nodes. This is true branch-and-cut (not cut-and-branch): cuts
+  tighten the LP bound across the entire subtree, not just locally. (The earlier
+  "pairwise CG intersection" cuts were invalid — they could remove feasible
+  integer points — and were removed.)
 
 - **LP warmstarting via HiGHS direct API**
   Child node LP solves previously cold-started from scratch. With the highspy
