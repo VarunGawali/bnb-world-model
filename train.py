@@ -46,7 +46,9 @@ except Exception:
 from bnb_wm.model.world_model import BnBWorldModel
 from bnb_wm.training.trainer import Trainer
 from bnb_wm.training.checkpoint import load_weights_only
-from bnb_wm.training.repro import seed_everything, write_provenance
+from bnb_wm.training.repro import (
+    seed_everything, write_provenance, dataset_fingerprint, file_md5,
+)
 from bnb_wm.data import (
     list_trajectory_files,
     split_files,
@@ -132,16 +134,6 @@ def main():
     ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    prov = write_provenance(ckpt_dir, {
-        "seed": args.seed,
-        "deterministic": args.deterministic,
-        "config": args.config,
-        "data_root": str(data_root),
-        "phases": phases,
-        "with_cuts": args.with_cuts,
-    })
-    print(f"Provenance written to {prov}")
-
     # ---- data ----
     files = list_trajectory_files(data_root)
     if not files:
@@ -153,6 +145,20 @@ def main():
         import numpy as np
         idx = np.random.default_rng(0).permutation(len(files))[: args.max_files]
         files = [files[i] for i in sorted(idx)]
+    # Provenance now that the file set is known — include the dataset fingerprint
+    # (P2.3) so a run and its checkpoints are tied to the exact data + config.
+    prov = write_provenance(ckpt_dir, {
+        "seed": args.seed,
+        "deterministic": args.deterministic,
+        "config": args.config,
+        "config_md5": file_md5(args.config),
+        "data_root": str(data_root),
+        "dataset": dataset_fingerprint(files),
+        "phases": phases,
+        "with_cuts": args.with_cuts,
+    })
+    print(f"Provenance written to {prov}")
+
     tr_files, va_files, _ = split_files(
         files,
         cfg["data"]["train_split"], cfg["data"]["val_split"],

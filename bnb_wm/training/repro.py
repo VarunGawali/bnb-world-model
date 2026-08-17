@@ -112,6 +112,42 @@ def _versions() -> dict:
     return vers
 
 
+def dataset_fingerprint(files) -> dict:
+    """
+    P2.3: a cheap, deterministic fingerprint of the training dataset — the file
+    count, total bytes, and an md5 over each file's (name, size). This ties a run
+    (and its checkpoints) to the exact data it trained on, without hashing GBs of
+    contents. Two runs match iff they saw the same files at the same sizes.
+    """
+    import hashlib
+    h = hashlib.md5()
+    files = sorted(str(f) for f in files)
+    total = 0
+    for f in files:
+        try:
+            sz = Path(f).stat().st_size
+        except Exception:
+            sz = -1
+        total += max(sz, 0)
+        h.update(Path(f).name.encode())
+        h.update(str(sz).encode())
+    return {"n_files": len(files), "total_bytes": total,
+            "md5": h.hexdigest()}
+
+
+def file_md5(path) -> str | None:
+    """Full md5 of one file's contents (e.g. a checkpoint), or None on error."""
+    import hashlib
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 def write_provenance(out_dir, extra: dict | None = None) -> Path:
     """
     Write `<out_dir>/provenance.json` capturing commit, versions, and `extra`

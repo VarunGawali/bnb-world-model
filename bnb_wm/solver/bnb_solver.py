@@ -166,6 +166,15 @@ class BnBSolver:
             self._highs = None
         self._use_highs_direct = False
 
+        # P2.1: cut generation needs HiGHS (for the LP basis). If cuts are
+        # requested but HiGHS is missing, fail loud rather than silently solving
+        # with zero cuts — a "cut" experiment that never cuts is a silent lie.
+        if self.cut_mode != "none" and self._highs is None:
+            raise RuntimeError(
+                "cut_mode=%r requires highspy (basis access for Gomory cuts), "
+                "but it is not importable. Install highspy, or set cut_mode='none' "
+                "to run branching-only." % self.cut_mode)
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
