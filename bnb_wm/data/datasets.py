@@ -165,9 +165,28 @@ def compute_label_stats(files, with_cuts=False):
     }
 
 
-def split_files(files, train=0.8, val=0.1, test=0.1, seed=0):
-    """Deterministically split a file list into (train, val, test)."""
+def split_files(files, train=0.8, val=0.1, test=0.1, seed=0, stratify=True):
+    """
+    Deterministically split a file list into (train, val, test).
+
+    P1.2: by default STRATIFY by difficulty tier (the file's parent directory,
+    e.g. SC-easy / SC-medium / SC-hard) so every tier is proportionally present
+    in each split — a plain random split can starve the thin SC-hard tier from
+    val/test. Set stratify=False for a single-group random split.
+    """
     files = list(files)
+    if stratify:
+        groups = {}
+        for f in files:
+            groups.setdefault(Path(f).parent.name, []).append(f)
+        # If everything is in one group, stratification is a no-op; fall through.
+        if len(groups) > 1:
+            tr, va, te = [], [], []
+            for _, gfiles in sorted(groups.items()):
+                g_tr, g_va, g_te = split_files(
+                    gfiles, train, val, test, seed, stratify=False)
+                tr += g_tr; va += g_va; te += g_te
+            return tr, va, te
     rng = np.random.default_rng(seed)
     idx = rng.permutation(len(files))
     n_train = int(round(train * len(files)))
@@ -696,7 +715,10 @@ def make_sequence_collate(include_vars=True):
         direction = torch.zeros(B, Tmax)
         tmask   = torch.zeros(B, Tmax, dtype=torch.bool)
 
-        has_vars = include_vars and ("hv_seq" in batch[0])
+        # P2.6: detect var-recon from ANY item, not just batch[0] — a degenerate
+        # (valid_len=0) first item lacks hv_seq and would otherwise silently drop
+        # var reconstruction for the whole batch.
+        has_vars = include_vars and any("hv_seq" in b for b in batch)
         if has_vars:
             K = max(b["hv_seq"].size(1) for b in batch if "hv_seq" in b)
             hv_seq  = torch.zeros(B, Tmax, K, H)

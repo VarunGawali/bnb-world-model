@@ -361,23 +361,28 @@ class BnBSolver:
                     z_child, h_child, child_tokens = self.model.dynamics_step_full(
                         z, a_emb, h_vars, node.past_tokens, direction
                     )
+                    # P1.6/P1.1: both selection modes score the PREDICTED child
+                    # state (z_child/h_child), which differs per child via the
+                    # branch direction — not the shared parent state. The child's
+                    # fractional set is unknown (imagined), so frac_mask=None
+                    # rather than the stale parent mask.
                     if self.node_selection == "cost_to_go":
                         # Gap 5: learned best-first search. Order the frontier by
                         # this child's predicted cost-to-go. Node order never
                         # affects correctness, only efficiency, so exactness holds.
                         ctg = self.model.cost_to_go_pred(
-                            z_child, h_child, bvec, frac_t
+                            z_child, h_child, bvec, None
                         ).item()
                         # Node.__lt__ is a MAX-heap on priority (higher popped
                         # first), so negate: the SMALLEST predicted remaining
                         # work gets the highest priority and is explored first.
                         child_priority = -ctg
                     else:
-                        # Best-bound (default): explore the strongest LP bound
-                        # first. Both children inherit this node's LP bound, so
-                        # the priority is the same for both here by construction.
+                        # Best-bound (default): both children inherit this node's
+                        # LP bound, so the value head on the predicted child state
+                        # is what distinguishes the up vs down child here.
                         v_score = self.model.value_pred(
-                            z, h_vars, bvec, frac_t).item()
+                            z_child, h_child, bvec, None).item()
                         child_priority = -lp_obj + 0.01 * v_score
 
                 child = Node(
