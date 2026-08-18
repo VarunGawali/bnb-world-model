@@ -38,15 +38,15 @@ Note: widening `input_proj` changes the dynamics checkpoint shape — Phase-3 we
 | # | Verdict | Fix |
 |---|---|---|
 | P1.1 stale frac_mask in lookahead | **FIXED** | `rollout_candidate` no longer passes the real node's `valid_mask` to value/cost-to-go/subtree heads on imagined states (uses `frac_mask=None`, relying on predicted `h_vars`), and ranks imagined next-branching vars by the policy's scores over all vars instead of the stale mask. `valid_mask` kept for caller compatibility. |
-| P1.2 tier imbalance | **ENH** | Stratified train/val/test per tier; report tiers separately; inverse-frequency sampling. |
+| P1.2 tier imbalance | **PARTIAL** | `split_files` now **stratifies by tier** (parent dir) so SC-easy/medium/hard are proportional in train/val/test (was random-pooled, starving thin SC-hard). Tier-wise *reporting* is post-training (eval harness). |
 | P1.3 independent cut head | **ENH** | Budgeted slate policy (diversity/parallelism + marginal gain) instead of independent per-cut BCE. |
 | P1.4 single-cut labels | **ENH** | Record bound gain, LP time, stability, persistence, descendant effect, set-level gain. |
-| P1.5 checkpoint by Top-1 | **FIXED** | `evaluate/selection.py`: lexicographic gate exactness -> gap -> nodes -> time -> cuts -> memory (`select_best_checkpoint`/`rank_checkpoints`), replacing policy Top-1 as the selection criterion. Tested in `tests/test_selection.py`. |
-| P1.6 both children same score | **FIXED** | Was: one `child_priority` shared by both children. Now scored per child inside the branch loop, rolling the dynamics forward in each child's branch direction (+1 up / -1 down), reusing the P0.12 direction-conditioned step. |
+| P1.5 checkpoint by Top-1 | **PARTIAL** | `evaluate/selection.py` gate (exactness -> gap -> nodes -> time -> cuts -> memory) exists + tested, but **not yet wired into the trainer** — wiring needs solver-quality numbers, so it lands post-training when the eval harness runs. |
+| P1.6 both children same score | **FIXED** | Both node-selection modes now score the **predicted child state** (`z_child`/`h_child`, distinct per branch direction) with `frac_mask=None`. Previously only cost-to-go mode differed; default best-bound mode scored both children with the shared parent latent. |
 | P1.7 branch & cut separate | **REAL** | Unified controller: cut slate -> re-solve -> branch, shared search-cost objective (needs P0). |
 | P1.8 fragmented benchmarks | **ENH** | One per-instance record: obj, gap, proven-optimal, nodes, time, cuts, LP iters, peak RAM/GPU. |
 | P1.9 wrong eval split | **REAL** | Held-out Easy/Medium/Hard files, fixed seeds, identical limits for every baseline. |
-| P1.10 stale docs | **FIXED** | `bnb_solver.py` docstrings synced: valid Gomory cuts (not "pairwise CG intersection"), bidirectional GATv2 encoder, direction-conditioned DynamicsTransformer. |
+| P1.10 stale docs | **FIXED** | Synced `bnb_solver.py` docstrings, **README** (GATv2 + cross-attention [CLS] readout + DynamicsTransformer, not SAGEConv/GRU), and **CHANGES** (valid Gomory/GMI, not "pairwise CG intersection"). |
 
 ## P2 — reproducibility & quality
 
@@ -54,12 +54,12 @@ Note: widening `input_proj` changes the dynamics checkpoint shape — Phase-3 we
 |---|---|---|
 | P2.1 silent no-cuts if highspy missing | **FIXED** | Collector now fails loud at startup (`SystemExit`) if `highspy` is unimportable, instead of silently writing empty cut labels. Opt out with `--allow-missing-highspy` for a deliberate branching-only run. |
 | P2.2 warm-start disabled | **REAL** | Enable/validate HiGHS warm-start; report LP iters/time with vs without. |
-| P2.3 seeding/provenance | **DONE** | `training/repro.py`: `seed_everything` (Python/NumPy/torch/CUDA + DataLoader `worker_init_fn`, opt-in deterministic) and `write_provenance` (git commit+dirty, versions, argv, seed, config). Wired into `train.py` (`--seed`/`--deterministic`); provenance.json in the ckpt dir. |
-| P2.4 smoke tests only | **ENH** | Tests: cut validity, parent-child transitions, bidirectional edges, schema, Phase-5 load, SCIP-obj match. |
+| P2.3 seeding/provenance | **DONE** | `training/repro.py`: `seed_everything` (Python/NumPy/torch/CUDA + DataLoader `worker_init_fn`) and `write_provenance` (git commit+dirty, versions, argv, seed, config, **dataset fingerprint** [files/bytes/md5] + **config md5**). Wired into `train.py`; provenance.json in the ckpt dir. SCIP-seed capture still open. |
+| P2.4 smoke tests only | **PARTIAL** | Added: bidirectional edges, root->leaf path reconstruction, SB-index invariant, selection gate, subtree sizes, **cut validity** (cuts never remove a feasible integer point), **schema** (catches depth-as-node-id). Still open: Phase-5-load, SCIP-obj-match. |
 | P2.5 cut memory unmeasured | **ENH** | Track stored/active cuts, nnz, bytes, peak process/GPU memory. |
 | P2.6 masked-cosine bug | **FIXED** | `var_reconstruction_loss` cosine term now averages over valid (`var_mask`) positions only, instead of including zeroed padding rows. |
 | P2.7 config ignored | **DONE** | `benchmark.apply_config(cfg)` overrides the hardcoded lookahead/rollout constants from the YAML `benchmark:`/`solver:` sections; `run_macro_benchmark(config=...)` applies it. |
-| P2.8 build backend | **ENH** | `setuptools.build_meta`; clean ecole/pyscipopt/highspy extras. |
+| P2.8 build backend | **DONE** | `pyproject.toml` build-backend set to `setuptools.build_meta` (was `setuptools.backends.legacy:build`). Optional-deps extras hygiene still open. |
 
 ---
 
