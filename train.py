@@ -251,7 +251,9 @@ def main():
             sequence_loader(va_files, False),
             epochs=epochs_of("epochs_phase3"), lr=tcfg["lr_phase3"],
             overshoot_depth=tcfg.get("overshoot_depth", 0),
-            patience=patience,
+            # Phase 3 gets its own (larger) patience so the overshoot curriculum
+            # isn't misread as a plateau; falls back to the global patience.
+            patience=tcfg.get("patience_phase3", patience),
         )
         reload_best(model, ckpt_dir, 3, device)
 
