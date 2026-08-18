@@ -171,9 +171,13 @@ class BipartiteGNN(nn.Module):
         var_mask = node_type == 0
         con_mask = node_type == 1
 
-        # Standardise inputs per feature before projecting (prenorm).
-        xv = (x[var_mask] - self.var_mean) / self.var_std
-        xc = (x[con_mask][:, :self.con_dim] - self.con_mean) / self.con_std
+        # Standardise inputs per feature before projecting (prenorm). Clamp the
+        # standardised value to +/-10: a feature that is near-constant in the
+        # stats sample gets std floored to ~1e-6, so a rare out-of-sample
+        # deviation would otherwise blow up to ~1e6 and destabilise training.
+        xv = ((x[var_mask] - self.var_mean) / self.var_std).clamp(-10.0, 10.0)
+        xc = ((x[con_mask][:, :self.con_dim] - self.con_mean)
+              / self.con_std).clamp(-10.0, 10.0)
         h_v = F.relu(self.var_proj(xv))
         h_c = F.relu(self.con_proj(xc))
 
