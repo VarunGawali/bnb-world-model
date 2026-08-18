@@ -204,6 +204,10 @@ class Trainer:
                 total_acc  += acc
                 n += 1
 
+        # Guard empty loaders (e.g. a tiny stratified val split) — inf so an
+        # empty val never masquerades as the best checkpoint.
+        if n == 0:
+            return float("inf"), 0.0
         return total_loss / n, total_acc / n
 
     # ------------------------------------------------------------------
@@ -278,7 +282,7 @@ class Trainer:
             self.scaler.update()
             total_loss += loss.item()
             n += 1
-        return total_loss / n
+        return total_loss / n if n else float("inf")
 
     def _epoch_value_val(self, loader):
         self.model.eval()
@@ -628,7 +632,7 @@ class Trainer:
                     val_loss_sum += self._dynamics_batch_loss(batch).item()
                     val_n += 1
 
-            train_loss = total_loss / n
+            train_loss = total_loss / n if n else float("inf")
             val_loss   = val_loss_sum / val_n if val_n > 0 else float("inf")
             scheduler.step()
 
@@ -811,7 +815,7 @@ class Trainer:
                 n += 1
 
             scheduler.step()
-            train_loss = total_loss / n
+            train_loss = total_loss / n if n else float("inf")
             _, val_acc = self._epoch_policy(val_loader, None, training=False)
 
             self.history["p4_train_loss"].append(train_loss)
