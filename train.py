@@ -59,6 +59,7 @@ from bnb_wm.data import (
     SequenceDataset,
     make_sequence_collate,
 )
+from bnb_wm.data.datasets import ShardedBatchSampler
 
 
 def load_config(path):
@@ -104,7 +105,14 @@ def main():
                     help="cap number of trajectory files (fast experiments)")
     ap.add_argument("--num_workers", type=int, default=0,
                     help="DataLoader workers for the transition loaders "
-                         "(parallel data loading; Phase 3 always uses 0)")
+                         "(parallel data loading; Phase 3 always uses 0). "
+                         "Set to the CPU core count; more oversubscribes.")
+    ap.add_argument("--files_per_batch", type=int, default=4,
+                    help="ShardedBatchSampler: distinct trajectory files per "
+                         "transition batch. Lower = fewer np.load/decompress "
+                         "calls (faster loading) but less instance diversity "
+                         "per batch; 4 is a good balance. Set 0 to disable "
+                         "sharded sampling and use plain shuffle.")
     ap.add_argument("--max_epochs", type=int, default=None,
                     help="cap every phase's epochs at this value (fast checks / "
                          "budget control); overrides the config caps when lower")
@@ -180,10 +188,23 @@ def main():
 
     def transition_loader(file_list, shuffle):
         ds = TransitionDataset(file_list, with_cuts=args.with_cuts)
-        return DataLoader(ds, batch_size=bs, shuffle=shuffle,
-                          collate_fn=transition_collate,
-                          num_workers=args.num_workers,
-                          worker_init_fn=worker_init_fn)
+        nw = args.num_workers
+        common = dict(collate_fn=transition_collate, num_workers=nw,
+                      worker_init_fn=worker_init_fn)
+        # persistent_workers avoids re-spawning workers (and re-importing torch)
+        # every epoch; prefetch/pin_memory overlap loading with GPU compute.
+        if nw > 0:
+            common.update(persistent_workers=True, prefetch_factor=4)
+        if args.files_per_batch and args.files_per_batch > 0:
+            # Sharded batching: each batch drawn from a few files, so workers
+            # decompress far fewer trajectory files per batch (the loader was
+            # GPU-starving otherwise). Randomness preserved via per-epoch
+            # file/within-file shuffle in the sampler.
+            sampler = ShardedBatchSampler(
+                [fi for (fi, _t) in ds.index], batch_size=bs,
+                files_per_batch=args.files_per_batch, shuffle=shuffle)
+            return DataLoader(ds, batch_sampler=sampler, **common)
+        return DataLoader(ds, batch_size=bs, shuffle=shuffle, **common)
 
     # ---- class-imbalance correction (pos_weight) + early stopping ----
     patience = tcfg.get("patience")

@@ -98,4 +98,24 @@ with torch.no_grad():
     scores, z = model(batch)
 assert z.shape == (3, H), z.shape
 print(f"model forward  scores={tuple(scores.shape)} z={tuple(z.shape)}  OK")
+
+# ---- ShardedBatchSampler: covers every item exactly once, len is exact ----
+from bnb_wm.data.datasets import ShardedBatchSampler
+# 5 files with uneven node counts -> item_files like [0,0,0, 1,1, 2,...]
+counts = [17, 3, 40, 1, 25]
+item_files = [fi for fi, n in enumerate(counts) for _ in range(n)]
+for fpb in (1, 4, 8):
+    smp = ShardedBatchSampler(item_files, batch_size=32,
+                              files_per_batch=fpb, shuffle=True)
+    batches = list(iter(smp))
+    seen = [gi for b in batches for gi in b]
+    assert sorted(seen) == list(range(len(item_files))), \
+        f"coverage broken fpb={fpb}: {len(seen)} vs {len(item_files)}"
+    assert len(batches) == len(smp), \
+        f"len mismatch fpb={fpb}: {len(batches)} vs {len(smp)}"
+    files_touched = max(len({item_files[gi] for gi in b}) for b in batches)
+    assert files_touched <= fpb, f"too many files/batch fpb={fpb}: {files_touched}"
+    print(f"sampler fpb={fpb}  {len(batches)} batches, "
+          f"all {len(item_files)} items once, <= {fpb} files/batch  OK")
+
 print("\nALL CHECKS PASSED — vectorized ops match the old loops exactly.")

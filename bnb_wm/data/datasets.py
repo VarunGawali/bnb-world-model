@@ -298,7 +298,15 @@ class TransitionDataset(Dataset):
 
     def _load(self, fi):
         if fi != self._cache_fi:
-            self._cache_d = np.load(self.files[fi], allow_pickle=True)
+            # Materialise EVERY array once per file. np.load on a compressed .npz
+            # decompresses an array on *each* key access, so the old code paid a
+            # full decompress for var_features/con_features/edge_indices/
+            # edge_values on every __getitem__. Reading them all into a plain
+            # dict up front decompresses each array exactly once per file load;
+            # combined with the sharded batch sampler (few files per batch) this
+            # keeps the loader off the GPU's critical path.
+            with np.load(self.files[fi], allow_pickle=True) as z:
+                self._cache_d = {k: z[k] for k in z.files}
             self._cache_fi = fi
             self._cache_sizes = self._compute_subtree_sizes(self._cache_d)
         return self._cache_d
@@ -391,6 +399,75 @@ def transition_collate(batch):
     datas = [b[0] for b in batch]
     metas = [b[1] for b in batch]
     return Batch.from_data_list(datas), metas
+
+
+class ShardedBatchSampler(torch.utils.data.Sampler):
+    """Batch sampler that keeps each batch to a few source files ("shards").
+
+    TransitionDataset materialises one whole trajectory file per load, so the
+    per-item cost is dominated by how often the loader switches files. Global
+    shuffling makes almost every consecutive item hit a new file — a full
+    np.load/decompress each time — which starves the GPU (observed sm util
+    ~0-6%). This sampler instead builds every batch from `files_per_batch`
+    files, drawing ~batch_size/files_per_batch nodes from each, so a worker
+    loads only a handful of files per batch (an ~files_per_batch/batch_size
+    reduction in np.load calls) while each batch still mixes several instances
+    for gradient diversity.
+
+    Randomness is preserved at two levels each epoch: file order is shuffled and
+    each file's nodes are shuffled, so batches differ every epoch. (Training uses
+    a FIXED input prenorm, not BatchNorm, so grouping several nodes of one
+    instance in a batch leaks no statistics.)
+
+    Args:
+        item_files      : list mapping global item index -> source file index
+                          (i.e. [fi for (fi, t) in dataset.index]).
+        batch_size      : target items per batch.
+        files_per_batch : distinct files contributing to each batch.
+        shuffle         : reshuffle file order and within-file order per epoch.
+    """
+
+    def __init__(self, item_files, batch_size, files_per_batch=4, shuffle=True):
+        self.batch_size = int(batch_size)
+        self.files_per_batch = max(1, int(files_per_batch))
+        self.shuffle = shuffle
+        self.per_file = max(1, self.batch_size // self.files_per_batch)
+
+        by_file = {}
+        for gi, fi in enumerate(item_files):
+            by_file.setdefault(int(fi), []).append(gi)
+        self.by_file = by_file
+        self.files = list(by_file.keys())
+
+        # Deterministic batch count (independent of shuffle): each file yields
+        # ceil(n_items / per_file) chunks; each batch emits up to
+        # files_per_batch chunks.
+        import math
+        total_chunks = sum(math.ceil(len(v) / self.per_file)
+                           for v in by_file.values())
+        self._len = math.ceil(total_chunks / self.files_per_batch)
+
+    def __len__(self):
+        return self._len
+
+    def __iter__(self):
+        import random
+        # Cut each file's (shuffled) items into contiguous chunks of per_file,
+        # so every chunk comes from a single file (one np.load serves it).
+        chunks = []
+        for fi, items in self.by_file.items():
+            it = items[:]
+            if self.shuffle:
+                random.shuffle(it)
+            for c in range(0, len(it), self.per_file):
+                chunks.append(it[c:c + self.per_file])
+        # Shuffle chunk order, then pack files_per_batch chunks into each batch.
+        # Exactly ceil(n_chunks / files_per_batch) batches -> __len__ is exact.
+        if self.shuffle:
+            random.shuffle(chunks)
+        for i in range(0, len(chunks), self.files_per_batch):
+            group = chunks[i:i + self.files_per_batch]
+            yield [gi for ch in group for gi in ch]
 
 
 # ---------------------------------------------------------------------------
