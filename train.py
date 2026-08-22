@@ -59,7 +59,7 @@ from bnb_wm.data import (
     SequenceDataset,
     make_sequence_collate,
 )
-from bnb_wm.data.datasets import ShardedBatchSampler
+from bnb_wm.data.datasets import ShardedBatchSampler, probe_edge_cost_per_node
 
 
 def load_config(path):
@@ -113,6 +113,12 @@ def main():
                          "calls (faster loading) but less instance diversity "
                          "per batch; 4 is a good balance. Set 0 to disable "
                          "sharded sampling and use plain shuffle.")
+    ap.add_argument("--size_aware", type=int, default=1,
+                    help="1 = size-aware (dynamic) batching: --batch_size is the "
+                         "nominal count on a MEDIAN graph, and batches auto-grow "
+                         "on easy instances / shrink on hard ones to hold a fixed "
+                         "edge (memory) budget. Prevents OOM AND keeps throughput "
+                         "high. 0 = fixed item count. Ignored if files_per_batch=0.")
     ap.add_argument("--max_epochs", type=int, default=None,
                     help="cap every phase's epochs at this value (fast checks / "
                          "budget control); overrides the config caps when lower")
@@ -200,9 +206,16 @@ def main():
             # decompress far fewer trajectory files per batch (the loader was
             # GPU-starving otherwise). Randomness preserved via per-epoch
             # file/within-file shuffle in the sampler.
+            file_cost = None
+            if args.size_aware:
+                # Cheap ZIP-directory probe (no decompression) -> edges/node,
+                # so batches hold a fixed memory budget: big on easy instances,
+                # small on hard ones. Prevents OOM without capping throughput.
+                file_cost = probe_edge_cost_per_node(file_list)
             sampler = ShardedBatchSampler(
                 [fi for (fi, _t) in ds.index], batch_size=bs,
-                files_per_batch=args.files_per_batch, shuffle=shuffle)
+                files_per_batch=args.files_per_batch, shuffle=shuffle,
+                file_node_cost=file_cost)
             return DataLoader(ds, batch_sampler=sampler, **common)
         return DataLoader(ds, batch_size=bs, shuffle=shuffle, **common)
 

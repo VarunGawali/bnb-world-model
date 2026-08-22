@@ -419,19 +419,34 @@ class ShardedBatchSampler(torch.utils.data.Sampler):
     a FIXED input prenorm, not BatchNorm, so grouping several nodes of one
     instance in a batch leaks no statistics.)
 
+    Size-aware batching (optional, `file_node_cost`): graph sizes vary a lot
+    (SC-hard nodes have far more edges), so a fixed item count either OOMs on
+    hard batches or wastes the GPU on easy ones. When a per-file cost (edges per
+    node) is supplied, each batch is packed to a fixed *memory budget* instead:
+    `batch_size` becomes the nominal item count on a MEDIAN-sized graph, and the
+    per-file chunk size scales inversely with that file's cost (median/cost). So
+    easy instances yield big batches (fast) and hard instances small batches
+    (safe) while every batch carries roughly the same total edge count. This is
+    the token-budget trick from sequence modelling, applied to graph memory.
+
     Args:
         item_files      : list mapping global item index -> source file index
                           (i.e. [fi for (fi, t) in dataset.index]).
-        batch_size      : target items per batch.
+        batch_size      : nominal items per batch (on a median-sized graph when
+                          size-aware; exact when not).
         files_per_batch : distinct files contributing to each batch.
         shuffle         : reshuffle file order and within-file order per epoch.
+        file_node_cost  : optional {file_idx: cost_per_node}. Enables size-aware
+                          batching; None keeps the fixed-count behaviour.
     """
 
-    def __init__(self, item_files, batch_size, files_per_batch=4, shuffle=True):
+    def __init__(self, item_files, batch_size, files_per_batch=4, shuffle=True,
+                 file_node_cost=None):
+        import math
         self.batch_size = int(batch_size)
         self.files_per_batch = max(1, int(files_per_batch))
         self.shuffle = shuffle
-        self.per_file = max(1, self.batch_size // self.files_per_batch)
+        nominal_per_file = max(1, self.batch_size // self.files_per_batch)
 
         by_file = {}
         for gi, fi in enumerate(item_files):
@@ -439,12 +454,24 @@ class ShardedBatchSampler(torch.utils.data.Sampler):
         self.by_file = by_file
         self.files = list(by_file.keys())
 
+        # Per-file chunk size (items drawn from a file into one batch).
+        if file_node_cost:
+            costs = [c for c in file_node_cost.values() if c and c > 0]
+            costs.sort()
+            med = costs[len(costs) // 2] if costs else 1.0
+            self.per_file_of = {}
+            for fi in self.files:
+                c = file_node_cost.get(fi) or med
+                # Median graph -> nominal_per_file; scale inversely with cost.
+                self.per_file_of[fi] = max(1, int(round(nominal_per_file * med / c)))
+        else:
+            self.per_file_of = {fi: nominal_per_file for fi in self.files}
+
         # Deterministic batch count (independent of shuffle): each file yields
-        # ceil(n_items / per_file) chunks; each batch emits up to
+        # ceil(n_items / per_file_of[fi]) chunks; each batch emits up to
         # files_per_batch chunks.
-        import math
-        total_chunks = sum(math.ceil(len(v) / self.per_file)
-                           for v in by_file.values())
+        total_chunks = sum(math.ceil(len(v) / self.per_file_of[fi])
+                           for fi, v in by_file.items())
         self._len = math.ceil(total_chunks / self.files_per_batch)
 
     def __len__(self):
@@ -452,15 +479,17 @@ class ShardedBatchSampler(torch.utils.data.Sampler):
 
     def __iter__(self):
         import random
-        # Cut each file's (shuffled) items into contiguous chunks of per_file,
-        # so every chunk comes from a single file (one np.load serves it).
+        # Cut each file's (shuffled) items into contiguous chunks of its own
+        # per-file size, so every chunk comes from a single file (one np.load
+        # serves it) and each chunk's memory cost is roughly bounded.
         chunks = []
         for fi, items in self.by_file.items():
             it = items[:]
             if self.shuffle:
                 random.shuffle(it)
-            for c in range(0, len(it), self.per_file):
-                chunks.append(it[c:c + self.per_file])
+            pf = self.per_file_of[fi]
+            for c in range(0, len(it), pf):
+                chunks.append(it[c:c + pf])
         # Shuffle chunk order, then pack files_per_batch chunks into each batch.
         # Exactly ceil(n_chunks / files_per_batch) batches -> __len__ is exact.
         if self.shuffle:
@@ -468,6 +497,40 @@ class ShardedBatchSampler(torch.utils.data.Sampler):
         for i in range(0, len(chunks), self.files_per_batch):
             group = chunks[i:i + self.files_per_batch]
             yield [gi for ch in group for gi in ch]
+
+
+def probe_edge_cost_per_node(files):
+    """Cheap per-file memory proxy for size-aware batching.
+
+    Returns {file_idx: edges_per_node}, read from each .npz's ZIP central
+    directory WITHOUT decompressing any array: the stored (uncompressed) size of
+    the `edge_indices`/`edge_values` entry is proportional to the total edge
+    count across the trajectory's nodes, and dividing by the node count gives a
+    per-node cost. GAT memory scales with edges, so this is the right budget
+    variable. Milliseconds per file (directory read only). Files that can't be
+    probed are omitted (the sampler falls back to the median cost for them).
+    """
+    import zipfile
+    costs = {}
+    for fi, f in enumerate(files):
+        try:
+            with zipfile.ZipFile(f) as z:
+                sizes = {i.filename: i.file_size for i in z.infolist()}
+                n_steps = None
+                # n_steps.npy is tiny; read it to normalise per node.
+                if "n_steps.npy" in z.namelist():
+                    with z.open("n_steps.npy") as fh:
+                        n_steps = int(np.lib.format.read_array(fh))
+            edge_bytes = (sizes.get("edge_indices.npy")
+                          or sizes.get("edge_values.npy") or 0)
+            if not edge_bytes:
+                continue
+            if not n_steps or n_steps <= 0:
+                continue
+            costs[fi] = edge_bytes / float(n_steps)
+        except Exception:
+            continue
+    return costs
 
 
 # ---------------------------------------------------------------------------

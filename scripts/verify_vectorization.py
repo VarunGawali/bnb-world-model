@@ -118,4 +118,19 @@ for fpb in (1, 4, 8):
     print(f"sampler fpb={fpb}  {len(batches)} batches, "
           f"all {len(item_files)} items once, <= {fpb} files/batch  OK")
 
+# ---- size-aware batching: hard files -> smaller chunks, uniform edge budget --
+counts = [40] * 6
+item_files2 = [fi for fi, n in enumerate(counts) for _ in range(n)]
+cost = {0: 1.0, 1: 1.0, 2: 3.0, 3: 3.0, 4: 9.0, 5: 9.0}   # median 3.0
+smp = ShardedBatchSampler(item_files2, batch_size=32, files_per_batch=4,
+                          shuffle=True, file_node_cost=cost)
+sa_batches = list(iter(smp))
+seen = [gi for b in sa_batches for gi in b]
+assert sorted(seen) == list(range(len(item_files2))), "size-aware coverage"
+assert len(sa_batches) == len(smp), "size-aware len"
+assert smp.per_file_of[0] > smp.per_file_of[2] > smp.per_file_of[4], \
+    f"cost->chunk-size not monotone: {smp.per_file_of}"
+print(f"size-aware  per_file_of={smp.per_file_of} "
+      f"(easy>med>hard), coverage+len OK")
+
 print("\nALL CHECKS PASSED — vectorized ops match the old loops exactly.")

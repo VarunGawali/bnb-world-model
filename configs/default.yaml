@@ -32,10 +32,13 @@ training:
                         # (k ramps 1->3) transiently raises val loss when k steps
                         # up, which patience-6 would misread as a plateau and
                         # stop the dynamics phase mid-curriculum.
-  batch_size: 16    # peak GPU memory is driven by the largest graphs in a
-                    # batch; SC-hard nodes have many edges, so 32+ can OOM a
-                    # 16 GB card on an unlucky all-hard batch. 16 is safe here.
-                    # (Training loops also skip a rare OOM batch rather than die.)
+  batch_size: 32    # With size-aware batching (train.py --size_aware, default
+                    # on) this is the NOMINAL item count on a median-sized graph;
+                    # the sampler holds a fixed edge (memory) budget per batch, so
+                    # hard instances shrink the batch and easy ones grow it. Every
+                    # batch then costs ~= 32 * median-edges, which is LESS peak
+                    # memory than a fixed batch-16 all-hard batch used. The
+                    # per-batch OOM guard catches any residual tail.
   lr_phase1: 1.0e-3
   lr_phase2: 5.0e-4
   lr_phase3: 5.0e-4
