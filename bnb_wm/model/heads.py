@@ -11,6 +11,34 @@ Architecture (current):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.utils import scatter
+
+
+def _frac_mean(
+    z: torch.Tensor,
+    h_vars: torch.Tensor,
+    batch_vec: torch.Tensor,
+    frac_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Mean embedding of fractional variables, per graph, vectorised.
+
+    Segment-means h_vars over the fractional variables of each graph and falls
+    back to z for graphs with no fractional variable. Mathematically identical
+    to the old `for b in range(batch_size)` loop shared by the value/subtree/
+    cost-to-go heads, but runs as a couple of scatter kernels instead of
+    batch_size Python iterations (those loops were a CPU-bound bottleneck).
+    """
+    batch_size = z.size(0)
+    if frac_mask is None or not frac_mask.any():
+        return z
+    idx  = batch_vec[frac_mask]                      # [n_frac]
+    vals = h_vars[frac_mask]                         # [n_frac, H]
+    summ = scatter(vals, idx, dim=0, dim_size=batch_size, reduce="sum")
+    cnt  = scatter(torch.ones_like(idx, dtype=z.dtype), idx, dim=0,
+                   dim_size=batch_size, reduce="sum")            # [batch_size]
+    mean = summ / cnt.clamp_min(1.0).unsqueeze(-1)
+    has  = (cnt > 0).unsqueeze(-1)
+    return torch.where(has, mean, z)
 
 
 class PolicyHead(nn.Module):
@@ -66,16 +94,7 @@ class ValueHead(nn.Module):
         batch_vec: torch.Tensor,
         frac_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch_size = z.size(0)
-
-        if frac_mask is not None and frac_mask.any():
-            frac_mean = torch.zeros_like(z)
-            for b in range(batch_size):
-                sel = (batch_vec == b) & frac_mask
-                frac_mean[b] = h_vars[sel].mean(0) if sel.any() else z[b]
-        else:
-            frac_mean = z
-
+        frac_mean = _frac_mean(z, h_vars, batch_vec, frac_mask)
         return self.net(torch.cat([z, frac_mean], dim=-1)).squeeze(-1)
 
 
@@ -156,16 +175,7 @@ class SubtreeSizeHead(nn.Module):
         batch_vec: torch.Tensor,
         frac_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch_size = z.size(0)
-
-        if frac_mask is not None and frac_mask.any():
-            frac_mean = torch.zeros_like(z)
-            for b in range(batch_size):
-                sel = (batch_vec == b) & frac_mask
-                frac_mean[b] = h_vars[sel].mean(0) if sel.any() else z[b]
-        else:
-            frac_mean = z
-
+        frac_mean = _frac_mean(z, h_vars, batch_vec, frac_mask)
         # Softplus keeps the predicted log-size non-negative (size >= 1).
         out = self.net(torch.cat([z, frac_mean], dim=-1)).squeeze(-1)
         return F.softplus(out)
@@ -209,16 +219,7 @@ class CostToGoHead(nn.Module):
         batch_vec: torch.Tensor,
         frac_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch_size = z.size(0)
-
-        if frac_mask is not None and frac_mask.any():
-            frac_mean = torch.zeros_like(z)
-            for b in range(batch_size):
-                sel = (batch_vec == b) & frac_mask
-                frac_mean[b] = h_vars[sel].mean(0) if sel.any() else z[b]
-        else:
-            frac_mean = z
-
+        frac_mean = _frac_mean(z, h_vars, batch_vec, frac_mask)
         out = self.net(torch.cat([z, frac_mean], dim=-1)).squeeze(-1)
         return F.softplus(out)
 

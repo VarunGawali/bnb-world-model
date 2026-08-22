@@ -23,6 +23,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
+from torch_geometric.utils import softmax as segment_softmax
+from torch_geometric.utils import scatter
 
 
 class CrossAttentionPool(nn.Module):
@@ -46,20 +48,22 @@ class CrossAttentionPool(nn.Module):
         self.scale = hidden_dim ** -0.5
 
     def forward(self, h_vars: torch.Tensor, batch_vec: torch.Tensor) -> torch.Tensor:
+        # Vectorised segment attention (no Python per-graph loop): compute the
+        # scalar query-key logit for every variable, softmax it *within each
+        # graph* via segment_softmax, then scatter-sum the weighted values back
+        # to one row per graph. Mathematically identical to the old per-b loop
+        # but runs as a handful of GPU kernels instead of batch_size Python
+        # iterations — the pooling was a major CPU-bound bottleneck.
         batch_size = int(batch_vec.max().item()) + 1
         keys   = self.W_k(h_vars)   # [total_vars, H]
         values = self.W_v(h_vars)   # [total_vars, H]
 
-        out = []
-        for b in range(batch_size):
-            mask = batch_vec == b
-            k = keys[mask]           # [n_vars_b, H]
-            v = values[mask]         # [n_vars_b, H]
-            attn = (self.query @ k.T) * self.scale   # [1, n_vars_b]
-            attn = F.softmax(attn, dim=-1)
-            out.append((attn @ v).squeeze(0))        # [H]
-
-        return torch.stack(out, dim=0)               # [batch_size, H]
+        # Per-variable attention logit = <query, key_i> / sqrt(H)
+        logits = (keys * self.query).sum(dim=-1) * self.scale       # [total_vars]
+        attn   = segment_softmax(logits, batch_vec, num_nodes=batch_size)  # [total_vars]
+        weighted = values * attn.unsqueeze(-1)                      # [total_vars, H]
+        return scatter(weighted, batch_vec, dim=0,
+                       dim_size=batch_size, reduce="sum")           # [batch_size, H]
 
 
 class BipartiteGNN(nn.Module):
