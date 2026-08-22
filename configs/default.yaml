@@ -32,7 +32,10 @@ training:
                         # (k ramps 1->3) transiently raises val loss when k steps
                         # up, which patience-6 would misread as a plateau and
                         # stop the dynamics phase mid-curriculum.
-  batch_size: 64
+  batch_size: 16    # peak GPU memory is driven by the largest graphs in a
+                    # batch; SC-hard nodes have many edges, so 32+ can OOM a
+                    # 16 GB card on an unlucky all-hard batch. 16 is safe here.
+                    # (Training loops also skip a rare OOM batch rather than die.)
   lr_phase1: 1.0e-3
   lr_phase2: 5.0e-4
   lr_phase3: 5.0e-4

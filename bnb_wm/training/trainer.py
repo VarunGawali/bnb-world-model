@@ -34,6 +34,27 @@ from .checkpoint import save_checkpoint, load_weights_only
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _is_oom(exc: Exception) -> bool:
+    """True if an exception is a CUDA out-of-memory error.
+
+    Graph sizes vary a lot across instances (SC-hard nodes have far more edges),
+    so an unlucky batch can transiently exceed GPU memory. Rather than let one
+    such batch kill a multi-hour run, the training loops skip it (freeing its
+    memory) and continue — a handful of skipped batches per epoch is harmless.
+    """
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _recover_oom(optimizer=None):
+    """Free the failed batch's memory so the loop can continue."""
+    if optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _var_mask_and_batch(pyg_batch):
     """Return (var_mask, batch_vec_for_vars) from a PyG batch."""
     var_mask  = pyg_batch.node_type == 0
@@ -189,20 +210,25 @@ class Trainer:
             for batch in tqdm(loader, desc="Train" if training else "Val", leave=False):
                 if training:
                     optimizer.zero_grad(set_to_none=True)
+                try:
+                    with autocast("cuda", enabled=self.amp):
+                        loss, acc = _run_policy_batch(self.model, batch, self.device)
 
-                with autocast("cuda", enabled=self.amp):
-                    loss, acc = _run_policy_batch(self.model, batch, self.device)
+                    if training:
+                        self.scaler.scale(loss).backward()
+                        self.scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.scaler.step(optimizer)
+                        self.scaler.update()
 
-                if training:
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.scaler.step(optimizer)
-                    self.scaler.update()
-
-                total_loss += loss.item()
-                total_acc  += acc
-                n += 1
+                    total_loss += loss.item()
+                    total_acc  += acc
+                    n += 1
+                except RuntimeError as e:
+                    if _is_oom(e):
+                        _recover_oom(optimizer if training else None)
+                        continue
+                    raise
 
         # Guard empty loaders (e.g. a tiny stratified val split) — inf so an
         # empty val never masquerades as the best checkpoint.
@@ -271,17 +297,23 @@ class Trainer:
         total_loss = n = 0
         for batch in tqdm(loader, desc="Value Train", leave=False):
             optimizer.zero_grad(set_to_none=True)
-            with autocast("cuda", enabled=self.amp):
-                loss, _, _ = _run_value_batch(self.model, batch, self.device)
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad], 1.0
-            )
-            self.scaler.step(optimizer)
-            self.scaler.update()
-            total_loss += loss.item()
-            n += 1
+            try:
+                with autocast("cuda", enabled=self.amp):
+                    loss, _, _ = _run_value_batch(self.model, batch, self.device)
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad], 1.0
+                )
+                self.scaler.step(optimizer)
+                self.scaler.update()
+                total_loss += loss.item()
+                n += 1
+            except RuntimeError as e:
+                if _is_oom(e):
+                    _recover_oom(optimizer)
+                    continue
+                raise
         return total_loss / n if n else float("inf")
 
     def _epoch_value_val(self, loader):
@@ -289,7 +321,13 @@ class Trainer:
         preds_all, tgts_all = [], []
         with torch.no_grad():
             for batch in tqdm(loader, desc="Value Val", leave=False):
-                _, preds, tgts = _run_value_batch(self.model, batch, self.device)
+                try:
+                    _, preds, tgts = _run_value_batch(self.model, batch, self.device)
+                except RuntimeError as e:
+                    if _is_oom(e):
+                        _recover_oom()
+                        continue
+                    raise
                 preds_all.extend(preds.numpy().tolist())
                 tgts_all.extend(tgts.numpy().tolist())
         r, _ = spearmanr(preds_all, tgts_all)
@@ -890,32 +928,38 @@ class Trainer:
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with autocast("cuda", enabled=self.amp):
-                    _, z = self.model.encode(pyg_batch)
+                try:
+                    with autocast("cuda", enabled=self.amp):
+                        _, z = self.model.encode(pyg_batch)
 
-                    cut_losses = []
-                    for b_idx, meta in enumerate(metas):
-                        cut_feats  = meta["cut_features"].to(self.device)   # [n_cuts, 6]
-                        cut_labels = meta["cut_labels"].to(self.device)     # [n_cuts]
-                        if cut_feats.size(0) == 0:
+                        cut_losses = []
+                        for b_idx, meta in enumerate(metas):
+                            cut_feats  = meta["cut_features"].to(self.device)   # [n_cuts, 6]
+                            cut_labels = meta["cut_labels"].to(self.device)     # [n_cuts]
+                            if cut_feats.size(0) == 0:
+                                continue
+                            scores = self.model.cut_scores(cut_feats, z[b_idx])
+                            cut_losses.append(
+                                cutting_plane_loss(scores, cut_labels, pw)
+                            )
+
+                        if not cut_losses:
                             continue
-                        scores = self.model.cut_scores(cut_feats, z[b_idx])
-                        cut_losses.append(
-                            cutting_plane_loss(scores, cut_labels, pw)
-                        )
+                        loss = torch.stack(cut_losses).mean()
 
-                    if not cut_losses:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+
+                    total_loss += loss.item()
+                    n += 1
+                except RuntimeError as e:
+                    if _is_oom(e):
+                        _recover_oom(optimizer)
                         continue
-                    loss = torch.stack(cut_losses).mean()
-
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-                self.scaler.step(optimizer)
-                self.scaler.update()
-
-                total_loss += loss.item()
-                n += 1
+                    raise
 
             # Validation
             self.model.eval()
