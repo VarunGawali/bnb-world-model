@@ -111,6 +111,10 @@ def main():
     ap.add_argument("--batch_size", type=int, default=None,
                     help="override training.batch_size (lower it to fit GPU "
                          "memory on large instances / a shared GPU)")
+    ap.add_argument("--seq_batch_size", type=int, default=None,
+                    help="separate batch size for Phase 3 (dynamics sequences), "
+                         "the memory-heavy phase; defaults to --batch_size. Set "
+                         "this smaller so phases 1/2/4/5 can use a large batch.")
     ap.add_argument("--init_checkpoint", default=None,
                     help="warm-start: load these weights before the phase loop, "
                          "e.g. to re-run only --phases 3,4 on top of an existing "
@@ -239,11 +243,16 @@ def main():
         # checkpoint dir; epoch 1 encodes, later epochs load (no GNN forward).
         seq_cache = ckpt_dir / "seq_cache"
 
+        # Phase 3 (sequences) is the memory-heavy phase; it uses its own,
+        # typically smaller, batch size so the transition phases (1/2/4/5) can
+        # run a much larger batch for speed without OOMing here.
+        seq_bs = args.seq_batch_size or bs
+
         def sequence_loader(file_list, shuffle):
             ds = SequenceDataset(file_list, model, device, include_vars=True,
                                  cache_dir=seq_cache)
             # num_workers=0: the dataset holds the (unpicklable) model.
-            return DataLoader(ds, batch_size=bs, shuffle=shuffle,
+            return DataLoader(ds, batch_size=seq_bs, shuffle=shuffle,
                               collate_fn=seq_collate, num_workers=0)
 
         trainer.train_dynamics(
