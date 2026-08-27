@@ -24,6 +24,7 @@ from bnb_wm.model import BnBWorldModel
 from bnb_wm.data import (
     TransitionDataset, pyg_collate, list_trajectory_files, split_files,
 )
+from bnb_wm.data.datasets import ShardedBatchSampler, probe_edge_cost_per_node
 from bnb_wm.training.checkpoint import load_weights_only
 from bnb_wm.evaluate.metrics import topk_accuracy, rank_cdf, compute_spearman
 from bnb_wm.evaluate.benchmark import run_macro_benchmark
@@ -58,12 +59,20 @@ def main():
         raise SystemExit(f"No traj_*.npz found under {args.data}")
     _, val_paths, _ = split_files(all_paths, 0.8, 0.1, 0.1)
 
+    # Size-aware batching (same as training): graphs vary a lot in edge count,
+    # so a fixed batch of 64 OOMs on hard instances. Cap each batch to a memory
+    # budget instead — nominal 16 items on a median graph, shrinking on hard
+    # ones. No shuffle needed for metrics.
+    val_ds = TransitionDataset(val_paths)
+    val_sampler = ShardedBatchSampler(
+        [fi for (fi, _t) in val_ds.index], batch_size=16, files_per_batch=4,
+        shuffle=False, file_node_cost=probe_edge_cost_per_node(val_paths),
+    )
     val_loader = DataLoader(
-        TransitionDataset(val_paths),
-        batch_size=64, shuffle=False,
+        val_ds, batch_sampler=val_sampler,
         collate_fn=pyg_collate, num_workers=0,
     )
-    print(f"Val samples: {len(TransitionDataset(val_paths)):,}\n")
+    print(f"Val samples: {len(val_ds):,}\n")
 
     # 1. Top-k accuracy
     print("--- Policy Top-k Accuracy ---")
