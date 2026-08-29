@@ -433,6 +433,7 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
 
     keys = ("var_features", "con_features", "edge_indices", "edge_values",
             "action_sets", "branching_vars", "local_branching_label",
+            "sb_scores",
             "dual_bounds", "depths", "node_ids", "parent_ids", "branch_dirs")
     buf: dict[str, list[Any]] = {k: [] for k in keys}
     # P0.11: the true optimal objective, for a fixed cross-instance value anchor.
@@ -473,6 +474,11 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
         buf["action_sets"].append(aset.astype(np.int32))
         buf["branching_vars"].append(chosen)
         buf["local_branching_label"].append(best_local)
+        # Full SB scores over the candidate set (not just the argmax): enables
+        # soft/ranking imitation, which recovers the SB *preference order* rather
+        # than only its top-1 (SB has many near-ties, so top-1 CE is a lossy
+        # target). Stored per node as a ragged float32 array aligned with aset.
+        buf["sb_scores"].append(scores[aset].astype(np.float32))
         buf["dual_bounds"].append(float(local_lb))    # P0.11: node-local LP bound
         buf["depths"].append(int(depth))              # P0.11: true tree depth
         buf["node_ids"].append(int(nid))
@@ -544,6 +550,7 @@ def _record(env: Any, lp_path: Path, args: argparse.Namespace) -> dict[str, Any]
         "action_sets": np.asarray(buf["action_sets"], dtype=object),
         "branching_vars": np.asarray(buf["branching_vars"], dtype=np.int32),
         "local_branching_label": np.asarray(buf["local_branching_label"], dtype=np.int32),
+        "sb_scores": np.asarray(buf["sb_scores"], dtype=object),   # ragged, per node
         "dual_bounds": db.astype(np.float32),
         # P0.11: per-trajectory min-max kept only as a legacy fallback; the
         # dataset normalises with the true anchors below (gap_to_primal_norm).

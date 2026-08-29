@@ -366,6 +366,14 @@ class TransitionDataset(Dataset):
             "n_frac":      n_frac,
         }
 
+        # Full SB scores over the candidate set (soft/ranking imitation). Only
+        # present in data collected with the score-capturing collector; the
+        # trainer falls back to hard cross-entropy when absent.
+        if "sb_scores" in d:
+            meta["sb_scores"] = torch.as_tensor(
+                np.asarray(d["sb_scores"][t], dtype=np.float32),
+                dtype=torch.float32)
+
         # Cost-to-go and subtree-size targets from the TRUE tree when available
         # (recorded-subtree node count), falling back to the visitation-order
         # `n_steps - t` proxy only for id-less legacy files. Using the tree

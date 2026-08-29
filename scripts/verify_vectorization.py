@@ -133,4 +133,28 @@ assert smp.per_file_of[0] > smp.per_file_of[2] > smp.per_file_of[4], \
 print(f"size-aware  per_file_of={smp.per_file_of} "
       f"(easy>med>hard), coverage+len OK")
 
+# ---- soft/ranking policy loss ------------------------------------------------
+from bnb_wm.training.losses import policy_loss_soft, policy_loss_masked
+sc = torch.randn(20, requires_grad=True)
+aset = torch.tensor([2, 5, 7, 11, 14])
+sb = torch.tensor([0.1, 0.9, 0.3, 0.2, 0.05])   # candidate 5 (local idx 1) best
+ls, acc, _ = policy_loss_soft(sc, aset, sb, 1)
+ls.backward()
+assert torch.isfinite(sc.grad).all(), "soft-loss grad not finite"
+# aligned policy -> lower loss than a random one
+al = torch.full((20,), -5.0); al[aset] = torch.tensor([0., 3., 0., 0., 0.])
+al.requires_grad_(True)
+la, aa, _ = policy_loss_soft(al, aset, sb, 1)
+assert la.item() < ls.item() and aa == 1.0, "aligned policy not rewarded"
+# single-candidate degenerate -> falls back to hard, finite
+sd = torch.randn(20, requires_grad=True)
+ld, _, _ = policy_loss_soft(sd, torch.tensor([3]), torch.tensor([0.5]), 0)
+assert torch.isfinite(ld), "degenerate soft-loss not finite"
+# alpha extremes differ
+lp, _, _ = policy_loss_soft(sc, aset, sb, 1, alpha=0.0)
+lh, _, _ = policy_loss_soft(sc, aset, sb, 1, alpha=1.0)
+assert abs(lp.item() - lh.item()) > 1e-3, "alpha has no effect"
+print(f"soft-loss  grad OK, aligned<random ({la.item():.3f}<{ls.item():.3f}), "
+      f"pure_soft={lp.item():.3f} pure_hard={lh.item():.3f}  OK")
+
 print("\nALL CHECKS PASSED — vectorized ops match the old loops exactly.")

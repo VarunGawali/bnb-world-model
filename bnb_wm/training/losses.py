@@ -40,6 +40,55 @@ def policy_loss_masked(scores, action_set, local_label):
     return loss, acc, rand
 
 
+def policy_loss_soft(scores, action_set, sb_scores, local_label,
+                     alpha=0.5, temp=1.0):
+    """Soft/ranking imitation for one graph: match SB's *preference order*.
+
+    Strong branching produces a score for every candidate, and those scores have
+    many near-ties, so training the policy only on the argmax (hard CE) throws
+    away most of the signal and caps top-1 accuracy artificially. Here we build a
+    soft target distribution from the full SB scores and minimise KL to the
+    policy's candidate distribution, blended with the hard CE for a stable anchor:
+
+        loss = alpha * CE(policy, argmax) + (1 - alpha) * KL(target || policy)
+
+    The SB scores are standardised per node before the softmax so the target is
+    scale-invariant (SB magnitudes vary wildly across nodes); `temp` sharpens
+    (<1) or softens (>1) the target.
+
+    Args:
+        scores      : [n_vars] raw policy logits
+        action_set  : [k]      candidate indices
+        sb_scores   : [k]      SB scores aligned with action_set
+        local_label : int      index into action_set of the SB argmax
+        alpha       : weight on the hard-CE term (0=pure soft, 1=pure hard)
+        temp        : softmax temperature for the soft target
+    Returns:
+        loss, acc (top-1 vs SB argmax), rand (1/k)
+    """
+    neg_inf = torch.finfo(scores.dtype).min
+    masked = torch.full_like(scores, neg_inf)
+    masked[action_set] = scores[action_set]
+    target_idx = action_set[local_label]
+
+    hard = F.cross_entropy(masked.unsqueeze(0).float(), target_idx.unsqueeze(0))
+
+    # Soft target over candidates: standardise SB scores, then temp-softmax.
+    sb = sb_scores.float()
+    if sb.numel() > 1 and torch.isfinite(sb).all():
+        sb = (sb - sb.mean()) / (sb.std() + 1e-6)
+        tgt = F.softmax(sb / max(temp, 1e-3), dim=0)              # [k]
+        logp = F.log_softmax(scores[action_set].float(), dim=0)  # [k]
+        soft = F.kl_div(logp, tgt, reduction="sum")
+        loss = alpha * hard + (1.0 - alpha) * soft
+    else:
+        loss = hard  # degenerate (single candidate / bad scores): hard only
+
+    acc  = float(masked.argmax() == target_idx)
+    rand = 1.0 / len(action_set)
+    return loss, acc, rand
+
+
 def value_loss(v_pred, target):
     """
     Huber loss for dual-bound regression.

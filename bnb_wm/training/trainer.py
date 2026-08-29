@@ -18,6 +18,7 @@ from tqdm.auto import tqdm
 
 from .losses import (
     policy_loss_masked,
+    policy_loss_soft,
     value_loss as _value_loss,
     integrality_loss,
     dynamics_loss as _dynamics_loss,
@@ -81,8 +82,13 @@ def _frac_mask_from_features(x_var: torch.Tensor) -> torch.Tensor | None:
     return None
 
 
-def _run_policy_batch(model, batch, device):
-    """Forward pass + policy loss for one transition batch."""
+def _run_policy_batch(model, batch, device, soft_alpha=0.5, soft_temp=1.0):
+    """Forward pass + policy loss for one transition batch.
+
+    Uses soft/ranking imitation (KL to the full SB score distribution, blended
+    with hard CE) when the batch carries `sb_scores`; otherwise falls back to
+    plain masked cross-entropy. `soft_alpha`/`soft_temp` tune the blend/target.
+    """
     pyg_batch, metas = batch
     pyg_batch = pyg_batch.to(device)
 
@@ -95,7 +101,12 @@ def _run_policy_batch(model, batch, device):
         logits = scores[offset : offset + n_v]
         aset   = meta["action_set"].to(device)
         lbl    = meta["local_label"]
-        loss, acc, _ = policy_loss_masked(logits, aset, lbl)
+        if "sb_scores" in meta:
+            loss, acc, _ = policy_loss_soft(
+                logits, aset, meta["sb_scores"].to(device), lbl,
+                alpha=soft_alpha, temp=soft_temp)
+        else:
+            loss, acc, _ = policy_loss_masked(logits, aset, lbl)
         losses.append(loss)
         top1  += acc
         offset += n_v
@@ -763,9 +774,16 @@ class Trainer:
                         n_v    = meta["n_vars"]
                         logits = scores[offset : offset + n_v]
                         aset   = meta["action_set"].to(self.device)
-                        ploss, acc, _ = policy_loss_masked(
-                            logits, aset, meta["local_label"]
-                        )
+                        if "sb_scores" in meta:
+                            ploss, acc, _ = policy_loss_soft(
+                                logits, aset,
+                                meta["sb_scores"].to(self.device),
+                                meta["local_label"],
+                            )
+                        else:
+                            ploss, acc, _ = policy_loss_masked(
+                                logits, aset, meta["local_label"]
+                            )
                         p_losses.append(ploss)
                         top1  += acc
                         chosen_idx.append(offset + int(aset[meta["local_label"]]))
