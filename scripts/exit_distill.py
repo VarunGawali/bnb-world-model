@@ -37,6 +37,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -79,7 +80,7 @@ def relabel(model, loader, device, topk, depth, gamma, temp, ctg_weight,
     """
     model.eval()
     targets = {}
-    for pyg_batch, metas in loader:
+    for pyg_batch, metas in tqdm(loader, desc="relabel", leave=False):
         pyg_batch = pyg_batch.to(device)
         h_vars, z = model.encode(pyg_batch)
         var_mask = pyg_batch.node_type == 0
@@ -121,7 +122,8 @@ def distill_epoch(model, loader, targets, optimizer, device, alpha, temp,
     tot_loss = tot_acc = n = 0
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
-        for pyg_batch, metas in loader:
+        for pyg_batch, metas in tqdm(
+                loader, desc="distill" if training else "val", leave=False):
             pyg_batch = pyg_batch.to(device)
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -191,10 +193,24 @@ def main():
     ap.add_argument("--unfreeze_encoder", action="store_true")
     ap.add_argument("--oversample_hard", type=float, default=1.0,
                     help=">1 duplicates hard-tier nodes in the distill loader")
+    ap.add_argument("--max_train_files", type=int, default=400,
+                    help="cap the number of TRAIN trajectory files used for ExIt "
+                         "(all SC-hard files are kept; easy/medium are sampled to "
+                         "fill). The relabel rollout is per-node and expensive, so "
+                         "a few hundred files is plenty to distill from. 0 = all.")
+    ap.add_argument("--max_val_files", type=int, default=60,
+                    help="cap validation files (0 = all)")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--files_per_batch", type=int, default=4)
     ap.add_argument("--out_dir", default="checkpoints")
     args = ap.parse_args()
+
+    # Line-buffer stdout so progress is visible under nohup/redirection (Python
+    # block-buffers a redirected stdout, which hides all prints until exit).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = yaml.safe_load(open(args.config))["model"]
@@ -210,6 +226,22 @@ def main():
 
     all_paths = list_trajectory_files(args.data_root)
     tr_files, val_files, _ = split_files(all_paths, 0.8, 0.1, 0.1, stratify=True)
+
+    def cap_files(files, cap):
+        """Cap file count but KEEP every SC-hard file (the starved tier), then
+        fill the remainder with a deterministic sample of easy/medium."""
+        if not cap or cap <= 0 or len(files) <= cap:
+            return list(files)
+        rng = np.random.default_rng(0)
+        hard = [f for f in files if _tier_of(Path(f)) == "hard"]
+        rest = [f for f in files if _tier_of(Path(f)) != "hard"]
+        rng.shuffle(rest)
+        keep = hard + rest[:max(0, cap - len(hard))]
+        rng.shuffle(keep)
+        return keep
+
+    tr_files = cap_files(tr_files, args.max_train_files)
+    val_files = cap_files(val_files, args.max_val_files)
 
     # Hard-tier oversampling: repeat SC-hard trajectory files so their nodes are
     # relabeled and trained more often (that tier is data-starved and drives the
