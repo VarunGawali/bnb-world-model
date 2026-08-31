@@ -148,7 +148,9 @@ def compute_label_stats(files, with_cuts=False):
         nil = np.asarray(d["next_is_leaf"], dtype=np.float32)
         leaf_pos += int((nil > 0.5).sum())
         leaf_tot += int(nil.size)
-        if with_cuts:
+        # Cut fields are absent in lean/DAgger files; treat those as zero-cut so
+        # a mixed dataset (original + DAgger) can still be read with_cuts.
+        if with_cuts and "n_cuts" in d:
             for t in range(int(d["n_steps"])):
                 if int(d["n_cuts"][t]) > 0:
                     cl = np.asarray(d["cut_labels"][t], dtype=np.float32)
@@ -390,7 +392,8 @@ class TransitionDataset(Dataset):
             # Always present (possibly empty) so the Phase-5 loop, which reads
             # cut_features unconditionally and skips size-0 entries, never
             # KeyErrors on a node that generated no cuts.
-            if int(d["n_cuts"][t]) > 0:
+            # Lean/DAgger files carry no cut fields -> treat as a no-cut node.
+            if "n_cuts" in d and int(d["n_cuts"][t]) > 0:
                 cf_t = np.asarray(d["cut_features"][t], dtype=np.float32)
                 cl_t = np.asarray(d["cut_labels"][t],   dtype=np.float32)
             else:
