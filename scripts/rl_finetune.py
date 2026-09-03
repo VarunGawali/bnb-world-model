@@ -238,12 +238,14 @@ def main():
                     ents.append(dist.entropy())
                 if not losses:
                     continue
-                loss = torch.stack(losses).mean() - args.entropy_coef * torch.stack(ents).mean()
+                pg = torch.stack(losses).mean()
+                ent = torch.stack(ents).mean()
+                loss = pg - args.entropy_coef * ent
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 opt.step()
-                pg_loss_sum += float(torch.stack(losses).mean())
-                ent_sum += float(torch.stack(ents).mean())
+                pg_loss_sum += float(pg.detach())
+                ent_sum += float(ent.detach())
                 m += 1
             except RuntimeError as ex:
                 if "out of memory" in str(ex).lower():
