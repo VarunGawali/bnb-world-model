@@ -63,9 +63,13 @@ TIERS = {
 def _obs_to_data(obs):
     """Ecole NodeBipartite obs -> a single PyG Data (CPU), matching _format_obs /
     build_pyg_data (bidirectional edges, 3-dim edge_attr, clipped features)."""
-    vf = np.clip(np.nan_to_num(np.asarray(obs.variable_features, np.float32),
+    vf_raw = (obs.variable_features if hasattr(obs, "variable_features")
+              else obs.column_features)
+    cf_raw = (obs.constraint_features if hasattr(obs, "constraint_features")
+              else obs.row_features)
+    vf = np.clip(np.nan_to_num(np.asarray(vf_raw, np.float32),
                                nan=0.0, posinf=_FC, neginf=-_FC), -_FC, _FC)
-    cf = np.clip(np.nan_to_num(np.asarray(obs.constraint_features, np.float32),
+    cf = np.clip(np.nan_to_num(np.asarray(cf_raw, np.float32),
                                nan=0.0, posinf=_FC, neginf=-_FC), -_FC, _FC)
     ei = np.asarray(obs.edge_features.indices, np.int64)
     ev = np.asarray(obs.edge_features.values, np.float32)
