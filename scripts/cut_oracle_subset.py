@@ -79,6 +79,9 @@ def main():
     ap.add_argument("--max_pool", type=int, default=40, help="max Gomory cuts generated")
     ap.add_argument("--pool_cap", type=int, default=12,
                     help="cap candidates entering the subset search (top by violation)")
+    ap.add_argument("--div_thresh", type=float, default=0.7,
+                    help="max |cosine| between any two accepted pool cuts (diversity filter); "
+                         "1.0 = disabled")
     ap.add_argument("--k_max", type=int, default=6, help="max subset cardinality")
     ap.add_argument("--beam", type=int, default=2, help="beam width for greedy forward search")
     ap.add_argument("--node_limit", type=int, default=5000)
@@ -159,7 +162,22 @@ def main():
             x_lp = np.zeros(n)
         viol = np.array([_cut_features(np.asarray(l), float(r), x_lp, c, n)[0]
                          for (l, r) in pool])
-        keep = list(np.argsort(-viol)[:args.pool_cap])
+        # Greedy max-coverage diversity filter: walk violation-sorted cuts and
+        # accept each one only if its cosine similarity to every already-accepted
+        # cut is below div_thresh.  div_thresh=1.0 disables the filter.
+        normals = np.array([np.asarray(l, np.float64) for l, _ in pool])
+        norms   = np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12
+        normals = normals / norms
+        ranked  = list(np.argsort(-viol))
+        keep    = []
+        for j in ranked:
+            if len(keep) >= args.pool_cap:
+                break
+            if args.div_thresh < 1.0 and keep:
+                cos_max = float(np.abs(normals[keep] @ normals[j]).max())
+                if cos_max >= args.div_thresh:
+                    continue
+            keep.append(j)
         cand = [pool[j] for j in keep]
 
         # individual best (best-1)
@@ -198,6 +216,7 @@ def main():
                        "best_by_k": best_by_k, "pool": len(pool),
                        "redundancy": rec["redundancy"]})
         print(f"[{i+1}] N0={N0} pool={len(pool)} cap={len(cand)} "
+              f"(div_kept={len(keep)}) "
               f"best1={best1} best_subset={best_subset} "
               f"(Δ={N0-best_subset:+d}) redund={rec['redundancy']:.2f}", flush=True)
 
