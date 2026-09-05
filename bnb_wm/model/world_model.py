@@ -708,8 +708,14 @@ class BnBWorldModel(nn.Module):
             child_masks_root = None
 
         d_root = torch.tensor(directions, dtype=z.dtype, device=device).repeat(K)
+        # Expand past_tokens from [1,T,H] to [K*n_dirs,T,H] so the dynamics
+        # cat([past_tokens, token]) doesn't hit a batch-dim mismatch.
+        past_root = (
+            past_tokens.expand(K * n_dirs, -1, -1)
+            if past_tokens is not None else None
+        )
         z_front, h_front, tok_front = self.dynamics_step_full_batched(
-            z_root, a_root, h_root, past_tokens, d_root
+            z_root, a_root, h_root, past_root, d_root
         )
 
         # F = K*n_dirs frontier elements after the root step.

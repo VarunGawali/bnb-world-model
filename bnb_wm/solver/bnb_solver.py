@@ -835,26 +835,25 @@ class BnBSolver:
             masked[frac_t] = scores[frac_t]
 
             k     = min(self.lookahead_k, len(frac_indices))
-            top_k = masked.topk(k).indices
+            top_k = masked.topk(k).indices   # [k] LongTensor
 
-            best_var   = int(top_k[0])
-            best_score = -float("inf")
+            # Evaluate all k candidates in one batched rollout pass.
+            # rollout_top_k_batched amortises the shared dynamics prefix
+            # across all candidates — k× cheaper than a sequential loop
+            # for branch_factor > 1 or depth > 1.
+            cand_scores = self.model.rollout_top_k_batched(
+                z, h_vars, top_k,
+                depth=self.lookahead_depth,
+                gamma=self.lookahead_gamma,
+                valid_mask=valid_mask,
+                past_tokens=node.past_tokens,
+                size_weight=self.size_weight,
+                ctg_weight=self.ctg_weight,
+                branch_factor=self.branch_factor,
+                use_reward_return=self.use_reward_return,
+            )   # [k] FloatTensor
 
-            for cand in top_k:
-                discounted_return = self.model.rollout_candidate(
-                    z, h_vars, int(cand),
-                    depth=self.lookahead_depth,
-                    gamma=self.lookahead_gamma,
-                    valid_mask=valid_mask,
-                    past_tokens=node.past_tokens,
-                    size_weight=self.size_weight,
-                    ctg_weight=self.ctg_weight,
-                    branch_factor=self.branch_factor,
-                    use_reward_return=self.use_reward_return,
-                )
-                if discounted_return > best_score:
-                    best_score = discounted_return
-                    best_var   = int(cand)
+            best_var = int(top_k[cand_scores.argmax()].item())
 
         return best_var
 
