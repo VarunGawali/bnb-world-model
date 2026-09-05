@@ -220,9 +220,11 @@ class BnBSolver:
                                time.perf_counter() - t_start, np.inf)
 
         # Encode root node
-        h_vars, z = self._encode_node(A, b, c, x_lp, dual, root_lb_arr, root_ub_arr, [])
+        h_vars, z, h_cons = self._encode_node(
+            A, b, c, x_lp, dual, root_lb_arr, root_ub_arr, []
+        )
 
-        # Generate and apply cuts at root
+        # Generate and apply cuts at root (legacy path — uses _select_cuts_neural)
         root_cuts = self._select_cuts_neural(A, b, x_lp, c, z, [])
         if root_cuts:
             lp_obj2, x_lp2, dual2, feas2, root_basis2 = self._solve_lp(
@@ -230,7 +232,7 @@ class BnBSolver:
             )
             if feas2 and lp_obj2 > lp_obj + 1e-8:
                 lp_obj, x_lp, dual, root_basis = lp_obj2, x_lp2, dual2, root_basis2
-                h_vars, z = self._encode_node(
+                h_vars, z, h_cons = self._encode_node(
                     A, b, c, x_lp, dual, root_lb_arr, root_ub_arr, root_cuts
                 )
 
@@ -285,7 +287,7 @@ class BnBSolver:
                 continue
 
             # Encode node
-            h_vars, z = self._encode_node(
+            h_vars, z, h_cons = self._encode_node(
                 A, b, c, x_lp, dual, node.var_lb, node.var_ub,
                 node.inherited_cuts,
             )
@@ -314,7 +316,9 @@ class BnBSolver:
                         A, b, c, x_lp, node.inherited_cuts
                     )
                     if candidates:
-                        cut_scores = self._score_cuts_gnn(candidates, h_vars, z, x_lp)
+                        cut_scores = self._score_cuts_gnn(
+                            candidates, h_vars, h_cons, x_lp, A, b
+                        )
                         order = np.argsort(-cut_scores)
                         new_cuts = [candidates[i]
                                     for i in order[:self.max_cuts_per_node]]
@@ -758,9 +762,9 @@ class BnBSolver:
         pyg_batch = Batch.from_data_list([data]).to(self.device)
 
         with torch.no_grad():
-            h_vars, z = self.model.encode(pyg_batch)
+            h_vars, z, h_cons = self.model.encode_with_cons(pyg_batch)
 
-        return h_vars, z
+        return h_vars, z, h_cons
 
     # ------------------------------------------------------------------
     # Branching variable selection
@@ -1013,35 +1017,42 @@ class BnBSolver:
         self,
         candidates: list,
         h_vars: torch.Tensor,
-        z: torch.Tensor,
+        h_cons: torch.Tensor,
         x_lp: np.ndarray,
+        A: np.ndarray,
+        b: np.ndarray,
     ) -> np.ndarray:
         """
         Zero-shot GNN cut scoring — no new parameters, no retraining.
 
         For each candidate cut with coefficient vector lhs:
-          h_cut = normalize( lhs @ h_vars )   # coeff-weighted variable embedding
-          align = h_cut · z / √H              # geometric alignment with latent state
-          score = align + violation            # combine geometry + LP bite
+          h_cut  = normalize( lhs @ h_vars )          # coeff-weighted var embedding [H]
+          attn   = softmax( h_cut @ h_cons.T / √H )   # cross-attention over constraints
+          loose  = max(0, b - A @ x_lp)               # constraint looseness [m]
+          score  = attn · loose + violation            # geometry + LP bite
 
-        The alignment term encodes how well the cut's variable geometry matches
-        the current search context; violation ensures cuts that actually bite
-        x_lp are preferred.
+        Cross-attention over h_cons is the proper bipartite analog — h_cut queries
+        which constraints are most geometrically related to the cut, weighted by how
+        loose those constraints currently are. Combined with LP violation this scores
+        cuts by both structural relevance and immediate LP improvement.
         """
         if not candidates:
             return np.array([], dtype=np.float32)
 
-        H     = h_vars.size(1)
-        z_vec = z.squeeze(0)   # [H]
+        H   = h_vars.size(1)
+        loose = np.maximum(0.0, b - A @ x_lp).astype(np.float32)  # [m]
+        loose_t = torch.tensor(loose, dtype=torch.float32, device=self.device)
 
         scores = []
         with torch.no_grad():
             for cut in candidates:
-                lhs_t  = torch.tensor(cut.lhs, dtype=torch.float32, device=self.device)
-                h_cut  = F.normalize((lhs_t @ h_vars).unsqueeze(0), dim=1).squeeze(0)
-                align  = float((h_cut @ z_vec) / (H ** 0.5))
-                viol   = float(max(0.0, cut.rhs - float(cut.lhs @ x_lp)))
-                scores.append(align + viol)
+                lhs_t = torch.tensor(cut.lhs, dtype=torch.float32, device=self.device)
+                h_cut = F.normalize((lhs_t @ h_vars).unsqueeze(0), dim=1).squeeze(0)
+                # Cross-attention: h_cut queries h_cons [m, H]
+                attn  = torch.softmax(h_cons @ h_cut / (H ** 0.5), dim=0)  # [m]
+                geom  = float((attn * loose_t).sum())
+                viol  = float(max(0.0, cut.rhs - float(cut.lhs @ x_lp)))
+                scores.append(geom + viol)
 
         return np.array(scores, dtype=np.float32)
 

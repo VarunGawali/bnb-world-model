@@ -98,6 +98,15 @@ class BnBWorldModel(nn.Module):
     def encode(self, batch):
         """Returns (h_vars [total_vars, H], z [batch_size, H])."""
         edge_attr = getattr(batch, "edge_attr", None)
+        h_vars, z, _h_cons = self.encoder(
+            batch.x, batch.edge_index, batch.node_type, batch.batch,
+            edge_attr=edge_attr,
+        )
+        return h_vars, z
+
+    def encode_with_cons(self, batch):
+        """Returns (h_vars, z, h_cons) — h_cons exposed for cut scoring."""
+        edge_attr = getattr(batch, "edge_attr", None)
         return self.encoder(
             batch.x, batch.edge_index, batch.node_type, batch.batch,
             edge_attr=edge_attr,

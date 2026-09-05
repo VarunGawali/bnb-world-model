@@ -203,6 +203,7 @@ class BipartiteGNN(nn.Module):
         attr_c2v = edge_attr[c2v_mask]
         attr_v2c = edge_attr[v2c_mask]
 
+        h_cons_out = h[con_mask]   # fallback: layer-0 constraint embeddings
         for i in range(self.n_layers):
             last = i == self.n_layers - 1
             # Constraints -> variables
@@ -214,6 +215,9 @@ class BipartiteGNN(nn.Module):
             # are never read. Skip it (both upd_v and upd_c are computed from the
             # SAME pre-update h, so skipping only the last con update leaves h_vars
             # bit-identical while saving one GATv2 pass).
+            # We capture h_cons_out BEFORE the last layer (i.e. at layer L-1),
+            # which is the fully-updated constraint embedding that h_vars[L] was
+            # built from. This exposes h_cons without running an extra GATv2 pass.
             if not last:
                 upd_c = self.conv_v2c[i](h, edge_v2c, edge_attr=attr_v2c)[con_mask]
                 upd_c = self.norm_con[i](F.relu(upd_c)).to(h.dtype)
@@ -224,8 +228,9 @@ class BipartiteGNN(nn.Module):
             if not last:
                 h = h.index_put((con_mask.nonzero(as_tuple=True)[0],),
                                 h[con_mask] + upd_c)
+                h_cons_out = h[con_mask]   # updated after each non-last layer
 
         h_vars = h[var_mask]
         z = self.pool(h_vars, batch_vec[var_mask])
 
-        return h_vars, z
+        return h_vars, z, h_cons_out
