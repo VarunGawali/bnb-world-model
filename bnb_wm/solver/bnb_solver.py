@@ -1004,11 +1004,16 @@ class BnBSolver:
         if not frac_mask_np.any():
             return False, None
 
-        # Root node: always attempt cuts (highest ROI; skip entropy/CTG gate).
+        # Root node: skip entropy gate (noisy at root) but keep CTG guard so we
+        # don't waste an LP re-solve on instances the model predicts as trivial
+        # (e.g. already-integral or single-node solves).
         if node.depth == 0 and self.force_root_cuts:
             with torch.no_grad():
                 bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
                 scores = self.model.policy_scores(h_vars, z, bvec)
+                ctg    = self.model.cost_to_go_pred(z, h_vars, bvec, frac_mask=None).item()
+            if ctg < self.cut_ctg_thresh_root:
+                return False, scores
             return True, scores
 
         with torch.no_grad():
