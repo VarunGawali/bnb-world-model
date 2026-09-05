@@ -204,19 +204,26 @@ class BipartiteGNN(nn.Module):
         attr_v2c = edge_attr[v2c_mask]
 
         for i in range(self.n_layers):
+            last = i == self.n_layers - 1
             # Constraints -> variables
             upd_v = self.conv_c2v[i](h, edge_c2v, edge_attr=attr_c2v)[var_mask]
             upd_v = self.norm_var[i](F.relu(upd_v)).to(h.dtype)
 
-            # Variables -> constraints
-            upd_c = self.conv_v2c[i](h, edge_v2c, edge_attr=attr_v2c)[con_mask]
-            upd_c = self.norm_con[i](F.relu(upd_c)).to(h.dtype)
+            # Variables -> constraints. The LAST layer's constraint update is
+            # dead — only h_vars is pooled afterwards, so updated constraint rows
+            # are never read. Skip it (both upd_v and upd_c are computed from the
+            # SAME pre-update h, so skipping only the last con update leaves h_vars
+            # bit-identical while saving one GATv2 pass).
+            if not last:
+                upd_c = self.conv_v2c[i](h, edge_v2c, edge_attr=attr_v2c)[con_mask]
+                upd_c = self.norm_con[i](F.relu(upd_c)).to(h.dtype)
 
             # Residual update — in-place scatter to avoid h.clone()
             h = h.index_put((var_mask.nonzero(as_tuple=True)[0],),
                             h[var_mask] + upd_v)
-            h = h.index_put((con_mask.nonzero(as_tuple=True)[0],),
-                            h[con_mask] + upd_c)
+            if not last:
+                h = h.index_put((con_mask.nonzero(as_tuple=True)[0],),
+                                h[con_mask] + upd_c)
 
         h_vars = h[var_mask]
         z = self.pool(h_vars, batch_vec[var_mask])

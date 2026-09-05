@@ -157,4 +157,21 @@ assert abs(lp.item() - lh.item()) > 1e-3, "alpha has no effect"
 print(f"soft-loss  grad OK, aligned<random ({la.item():.3f}<{ls.item():.3f}), "
       f"pure_soft={lp.item():.3f} pure_hard={lh.item():.3f}  OK")
 
+# ---- rollout_candidate with candidate mask (Fix B) --------------------------
+import math
+single = Batch.from_data_list([rand_graph(12, 7)])
+with torch.no_grad():
+    hv, zz = model.encode(single)
+    V = hv.size(0)
+    vm = torch.zeros(V, dtype=torch.bool); vm[[0, 3, 5, 7]] = True
+    s_mask = model.rollout_candidate(zz, hv, 0, depth=2, gamma=0.95,
+                                     valid_mask=vm, ctg_weight=1.0,
+                                     branch_factor=2, use_reward_return=True)
+    s_none = model.rollout_candidate(zz, hv, 0, depth=2, gamma=0.95,
+                                     valid_mask=None, ctg_weight=1.0,
+                                     branch_factor=2, use_reward_return=True)
+assert isinstance(s_mask, float) and math.isfinite(s_mask), s_mask
+assert isinstance(s_none, float) and math.isfinite(s_none), s_none
+print(f"rollout_candidate  masked={s_mask:.3f} none={s_none:.3f}  finite, OK")
+
 print("\nALL CHECKS PASSED — vectorized ops match the old loops exactly.")

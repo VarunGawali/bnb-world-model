@@ -326,10 +326,13 @@ class BnBWorldModel(nn.Module):
             depth       : int      rollout horizon
             gamma       : float    per-step discount
             valid_mask  : [V] bool valid branching candidates at the REAL node.
-                          P1.1: intentionally NOT applied to imagined rollout
-                          states (their fractional set differs); kept only for
-                          caller/API compatibility. Candidate pre-selection at the
-                          real node happens in the caller.
+                          Threaded through the rollout as a shrinking candidate
+                          mask (the branched variable is removed at each step) and
+                          used for BOTH the heads' fractional context and to
+                          restrict imagined branching to real candidates — a proxy
+                          for the (unknown) imagined fractional set that is far
+                          closer than None. When None, reverts to the old
+                          all-variable behaviour (frac_mask=None, unmasked topk).
             past_tokens : token buffer for the dynamics Transformer
             size_weight : float    weight on the predicted-subtree-size penalty
                                    (0 recovers the pure value-based rollout)
@@ -376,13 +379,32 @@ class BnBWorldModel(nn.Module):
         directions = (1.0, -1.0) if expand_both_children else (0.0,)
         size_estimate = [0.0]   # subtree size summed over the root's children
 
-        def branch(z_cur, h_cur, tokens_cur, a_idx, depth_left, g, is_root):
+        neg_inf = float("-inf")
+
+        def branch(z_cur, h_cur, tokens_cur, a_idx, depth_left, g, is_root, mask):
             """Value of branching on variable a_idx from the current node.
 
             Explores every child in `directions`, summing their continuations —
             both branches are part of the subtree that this decision creates.
+
+            `mask` is the candidate set valid at the CURRENT node (a [V] bool, or
+            None). Branching on a_idx fixes it, so the child's candidate mask is
+            `mask` with a_idx removed. This shrinking mask is threaded through the
+            rollout and used for BOTH (a) the heads' fractional context and (b)
+            restricting the next imagined branching to real candidates. It is a
+            deliberate proxy: the imagined child's exact fractional set is unknown
+            without decoding it, but the real candidate set minus the branched
+            variables is far closer than the previous behaviour (frac_mask=None ->
+            value=MLP(z||z), and topk over ALL variables). Falls back to the old
+            all-variable behaviour when `mask` is None.
             """
             a_emb = h_cur[a_idx].unsqueeze(0)                    # [1, H]
+            if mask is not None:
+                child_mask = mask.clone()
+                child_mask[a_idx] = False                        # a_idx now fixed
+                fm = child_mask if bool(child_mask.any()) else None
+            else:
+                child_mask, fm = None, None
             subtree = 0.0
             for direction in directions:
                 z_n, h_n, tok = self.dynamics.step_full(
@@ -395,44 +417,47 @@ class BnBWorldModel(nn.Module):
                 else:
                     # Legacy: sum the value at every step.
                     child_score = g * self.value(
-                        z_n, h_n, bvec, frac_mask=None
+                        z_n, h_n, bvec, frac_mask=fm
                     ).item()
                 if ctg_weight != 0.0:
                     ctg = self.cost_to_go(
-                        z_n, h_n, bvec, frac_mask=None).item()
+                        z_n, h_n, bvec, frac_mask=fm).item()
                     child_score -= ctg_weight * g * ctg
                 if is_root and size_weight != 0.0:
                     size_estimate[0] += self.subtree_size(
-                        z_n, h_n, bvec, frac_mask=None
+                        z_n, h_n, bvec, frac_mask=fm
                     ).item()
 
-                if depth_left <= 1:
+                # A node with no remaining candidates is a leaf regardless of depth.
+                can_expand = depth_left > 1 and (child_mask is None
+                                                 or bool(child_mask.any()))
+                if not can_expand:
                     if use_reward_return:
                         # Bootstrap the leaf with the value estimate.
                         child_score += g * self.value(
-                            z_n, h_n, bvec, frac_mask=None
+                            z_n, h_n, bvec, frac_mask=fm
                         ).item()
                 else:
-                    # Expand the top-b next *variables* on the PREDICTED child
-                    # state and average their continuations (b=1 recovers the
-                    # single greedy path). Averaging over candidate variables is
-                    # an expectation over the policy's choice; the sum over
-                    # directions above is because both children are always solved.
-                    # P1.1: the imagined child's fractional set differs from the
-                    # real node's, so the live `valid_mask` is stale here and must
-                    # not be applied. Rank next branching variables by the policy's
-                    # own scores on the PREDICTED embeddings (h_n) over all vars.
+                    # Expand the top-b next *branching candidates* on the PREDICTED
+                    # child state and average their continuations (b=1 = single
+                    # greedy path). Restrict to the child's candidate mask so the
+                    # imagined rollout branches only on plausible variables.
                     scores = self.policy(h_n, z_n.expand(h_n.size(0), -1))
-                    k = min(b, scores.size(0))
+                    if child_mask is not None:
+                        scores = scores.masked_fill(~child_mask, neg_inf)
+                        k = min(b, int(child_mask.sum().item()))
+                    else:
+                        k = min(b, scores.size(0))
                     next_actions = scores.topk(k).indices
                     cont = [
                         branch(z_n, h_n, tok, int(na),
-                               depth_left - 1, g * gamma, False)
+                               depth_left - 1, g * gamma, False, child_mask)
                         for na in next_actions
                     ]
                     child_score += sum(cont) / len(cont)
                 subtree += child_score
             return subtree
 
-        total = branch(z, h_vars, past_tokens, cand_idx, depth, 1.0, True)
+        init_mask = valid_mask.clone() if valid_mask is not None else None
+        total = branch(z, h_vars, past_tokens, cand_idx, depth, 1.0, True, init_mask)
         return total - size_weight * size_estimate[0]
