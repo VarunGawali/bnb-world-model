@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
+from torch.utils.data import Dataset as TorchDataset
 
 from bnb_wm.model.world_model import BnBWorldModel
 from bnb_wm.data.datasets import (
