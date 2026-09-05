@@ -135,17 +135,28 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
     if leaf_prob > _LEAF_SKIP:
         return int(masked.argmax()), past_tokens
 
-    # Confidence gate: skip the (expensive) rollout when the policy is already
-    # confident. If the softmax mass on the top candidate exceeds the threshold,
-    # the lookahead almost always agrees, so take the policy pick directly. This
-    # removes the rollout on the majority of nodes -> large per-node speedup.
-    conf = cfg.get("skip_confident")
-    if conf is not None:
-        p_top = float(torch.softmax(scores_all[aset_t], dim=0).max())
-        if p_top >= conf:
-            return int(masked.argmax()), past_tokens
+    # Confidence gate + adaptive compute (items 10+11).
+    # Always compute p_top once; reuse for the skip gate and adaptive scaling.
+    p_top = float(torch.softmax(scores_all[aset_t], dim=0).max())
 
-    k = min(cfg["k"], len(action_set))
+    conf = cfg.get("skip_confident")
+    if conf is not None and p_top >= conf:
+        return int(masked.argmax()), past_tokens
+
+    # Adaptive k and depth: high-confidence decisions get a cheap (k=1, depth=1)
+    # rollout; medium-confidence get (k=2, depth=2); low-confidence use full budget.
+    # Thresholds default to None = disabled (full budget always).
+    conf_high = cfg.get("adaptive_conf_high")
+    conf_mid  = cfg.get("adaptive_conf_mid")
+    eff_k     = cfg["k"]
+    eff_depth = cfg["depth"]
+    if conf_high is not None and p_top >= conf_high:
+        eff_k, eff_depth = 1, 1
+    elif conf_mid is not None and p_top >= conf_mid:
+        eff_k     = min(cfg["k"], 2)
+        eff_depth = min(cfg["depth"], 2)
+
+    k = min(eff_k, len(action_set))
     top_k = masked.topk(k).indices
     valid_mask = torch.zeros(scores_all.size(0), dtype=torch.bool, device=device)
     valid_mask[aset_t] = True
@@ -153,7 +164,7 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
     # Evaluate all k candidates in a single batched forward pass.
     rets_t = model.rollout_top_k_batched(
         z, h_vars, top_k,
-        depth=cfg["depth"], gamma=cfg["gamma"],
+        depth=eff_depth, gamma=cfg["gamma"],
         valid_mask=valid_mask, past_tokens=past_tokens,
         size_weight=0.0, ctg_weight=cfg["ctg_weight"],
         branch_factor=cfg["branch_factor"],

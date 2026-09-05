@@ -55,6 +55,12 @@ _LEAF_PROB_SKIP = 0.8
 # trust the policy and skip the expensive rollout entirely. None = disabled.
 # Mirrors the skip_confident parameter in ablation.py.
 _SKIP_CONFIDENT: float | None = None
+# Adaptive rollout depth + candidate count (items 10+11).
+# High-confidence decisions (p_top >= conf_high) use k=1, depth=1.
+# Medium-confidence (p_top >= conf_mid) use k=min(K,2), depth=min(D,2).
+# None = disabled (full budget always).
+_ADAPTIVE_CONF_HIGH: float | None = None
+_ADAPTIVE_CONF_MID:  float | None = None
 
 
 def apply_config(cfg: dict | None):
@@ -69,6 +75,7 @@ def apply_config(cfg: dict | None):
         return
     global _LOOKAHEAD_K, _LOOKAHEAD_DEPTH, _LOOKAHEAD_GAMMA, _SIZE_WEIGHT
     global _CTG_WEIGHT, _BRANCH_FACTOR, _USE_REWARD_RETURN, _SKIP_CONFIDENT
+    global _ADAPTIVE_CONF_HIGH, _ADAPTIVE_CONF_MID
     b = {**cfg.get("solver", {}), **cfg.get("benchmark", {})}   # benchmark wins
     _LOOKAHEAD_K       = int(b.get("lookahead_k", _LOOKAHEAD_K))
     _LOOKAHEAD_DEPTH   = int(b.get("lookahead_depth", _LOOKAHEAD_DEPTH))
@@ -79,6 +86,10 @@ def apply_config(cfg: dict | None):
     _USE_REWARD_RETURN = bool(b.get("use_reward_return", _USE_REWARD_RETURN))
     if "skip_confident" in b:
         _SKIP_CONFIDENT = float(b["skip_confident"])
+    if "adaptive_conf_high" in b:
+        _ADAPTIVE_CONF_HIGH = float(b["adaptive_conf_high"])
+    if "adaptive_conf_mid" in b:
+        _ADAPTIVE_CONF_MID = float(b["adaptive_conf_mid"])
 
 
 def _format_obs(obs, device):
@@ -189,19 +200,24 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None, depth=0
         best_action = int(masked.argmax())
         return best_action, past_tokens
 
-    # Confidence gate: if the policy already assigns high softmax mass to its
-    # top candidate within the action set, the rollout almost always agrees —
-    # skip the expensive lookahead and return the policy pick directly.
-    if _SKIP_CONFIDENT is not None:
-        p_top = float(torch.softmax(scores_all[aset_t], dim=0).max())
-        if p_top >= _SKIP_CONFIDENT:
-            return int(masked.argmax()), past_tokens
+    # Confidence gate + adaptive compute (items 10+11).
+    # Compute p_top once; reuse for both the skip gate and adaptive scaling.
+    p_top = float(torch.softmax(scores_all[aset_t], dim=0).max())
+    if _SKIP_CONFIDENT is not None and p_top >= _SKIP_CONFIDENT:
+        return int(masked.argmax()), past_tokens
+
+    # Adaptive k and depth: shrink the rollout budget on high/medium-confidence
+    # decisions so the expensive lookahead is reserved for genuinely hard choices.
+    eff_k     = _LOOKAHEAD_K
+    eff_depth = _LOOKAHEAD_DEPTH
+    if _ADAPTIVE_CONF_HIGH is not None and p_top >= _ADAPTIVE_CONF_HIGH:
+        eff_k, eff_depth = 1, 1
+    elif _ADAPTIVE_CONF_MID is not None and p_top >= _ADAPTIVE_CONF_MID:
+        eff_k     = min(_LOOKAHEAD_K, 2)
+        eff_depth = min(_LOOKAHEAD_DEPTH, 2)
 
     # --- real multi-step latent rollout over top-k candidates ---
-    # All K candidates are evaluated in a single batched forward pass via
-    # rollout_top_k_batched, replacing K sequential rollout_candidate calls.
-    # GNN embeddings (z, h_vars) are already computed once above and reused.
-    k            = min(_LOOKAHEAD_K, len(action_set))
+    k            = min(eff_k, len(action_set))
     top_k_global = masked.topk(k).indices
 
     valid_mask = torch.zeros(scores_all.size(0), dtype=torch.bool, device=device)
@@ -209,7 +225,7 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None, depth=0
 
     scores = model.rollout_top_k_batched(
         z, h_vars, top_k_global,
-        depth=_LOOKAHEAD_DEPTH,
+        depth=eff_depth,
         gamma=_LOOKAHEAD_GAMMA,
         valid_mask=valid_mask,
         past_tokens=past_tokens,
