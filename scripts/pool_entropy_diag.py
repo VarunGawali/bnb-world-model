@@ -33,9 +33,24 @@ def main():
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt   = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 
-    cfg = ckpt.get("config", {})
+    # Checkpoints may use different key names depending on the saving code.
+    state_dict_key = next(
+        (k for k in ("model_state_dict", "state_dict", "model") if k in ckpt),
+        None,
+    )
+    if state_dict_key is None:
+        # The checkpoint IS the state dict (plain torch.save(model.state_dict()))
+        state_dict = ckpt
+        cfg = {}
+    else:
+        state_dict = ckpt[state_dict_key]
+        cfg = ckpt.get("config", ckpt.get("cfg", {}))
+
+    print(f"Checkpoint keys: {list(ckpt.keys()) if isinstance(ckpt, dict) else type(ckpt)}")
+    print(f"Using state_dict key: {state_dict_key!r}")
+
     mcfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
     model = BnBWorldModel(
         hidden_dim   = mcfg.get("hidden_dim",   128),
@@ -45,7 +60,7 @@ def main():
         n_dyn_heads  = mcfg.get("n_dyn_heads",  4),
         max_seq      = mcfg.get("max_seq",      512),
     )
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.load_state_dict(state_dict, strict=False)
     model.to(device).eval()
 
     all_files = list_trajectory_files(args.data_root)
