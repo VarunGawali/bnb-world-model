@@ -24,6 +24,17 @@ from bnb_wm.data.datasets import (
 )
 
 
+class _GraphOnlyDataset(TorchDataset):
+    """Wraps TransitionDataset and returns only the PyG Data (drops meta)."""
+    def __init__(self, inner):
+        self._inner = inner
+    def __len__(self):
+        return len(self._inner)
+    def __getitem__(self, i):
+        data, _ = self._inner[i]
+        return data
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint",   required=True)
@@ -66,7 +77,7 @@ def main():
     all_files = list_trajectory_files(args.data_root)
     _, _, test_files = split_files(all_files)
     test_files = test_files[:args.n_instances]
-    dataset = TransitionDataset(test_files)
+    dataset = _GraphOnlyDataset(TransitionDataset(test_files))
     loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
     all_veff, all_V = [], []
