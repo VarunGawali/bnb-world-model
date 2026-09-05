@@ -144,8 +144,11 @@ def generate_root_gomory_cuts(A, b, c, highspy, max_cuts=50, tol=1e-6):
                 alpha[j] -= w
                 beta -= w                          # move +w constant to rhs
 
-        if not any_coeff or beta < tol:
+        if not any_coeff:
             continue
+        # beta can legitimately be negative after back-substituting t_j = 1 - x_j
+        # terms; the cut alpha @ x >= beta is valid for any beta. Only skip if
+        # the LHS is entirely zero (caught above via any_coeff).
         # clean tiny coefficients
         alpha[np.abs(alpha) < tol] = 0.0
         if not np.any(np.abs(alpha) > tol):
