@@ -118,8 +118,10 @@ class BnBSolver:
         use_reward_return: bool = False,
         cut_mode: str = "learned",
         cut_depth_max: int = 3,
-        cut_entropy_thresh: float = 0.5,
-        cut_ctg_thresh: float = 30.0,
+        cut_entropy_thresh_root: float = 0.2,   # depth=0: fire unless very confident
+        cut_ctg_thresh_root: float = 10.0,      # depth=0: fire unless nearly solved
+        cut_entropy_thresh: float = 0.5,        # depth 1+: require more uncertainty
+        cut_ctg_thresh: float = 30.0,           # depth 1+: require larger subtree
         cut_budget_cap: int = 10,
     ):
         self.model               = model
@@ -151,11 +153,13 @@ class BnBSolver:
                 "Load a Phase-5 checkpoint to use learned cut selection.",
                 RuntimeWarning, stacklevel=2)
             cut_mode = "heuristic"
-        self.cut_mode            = cut_mode
-        self.cut_depth_max       = cut_depth_max       # max node depth to attempt cuts
-        self.cut_entropy_thresh  = cut_entropy_thresh  # min H(π) nats to fire gate
-        self.cut_ctg_thresh      = cut_ctg_thresh      # min predicted remaining nodes
-        self.cut_budget_cap      = cut_budget_cap      # max total cuts per solve()
+        self.cut_mode                = cut_mode
+        self.cut_depth_max           = cut_depth_max
+        self.cut_entropy_thresh_root = cut_entropy_thresh_root
+        self.cut_ctg_thresh_root     = cut_ctg_thresh_root
+        self.cut_entropy_thresh      = cut_entropy_thresh
+        self.cut_ctg_thresh          = cut_ctg_thresh
+        self.cut_budget_cap          = cut_budget_cap
         self._cuts_added         = 0                   # per-solve cut counter
         # Branching mode for the ablation: "rollout" (latent world-model
         # lookahead), "policy" (argmax policy, no rollout), "most_fractional".
@@ -1004,11 +1008,13 @@ class BnBSolver:
             probs   = torch.softmax(scores[frac_t], dim=0)
             entropy = float(-(probs * torch.log(probs + 1e-12)).sum())
 
-            if entropy < self.cut_entropy_thresh:
+            eth = self.cut_entropy_thresh_root if node.depth == 0 else self.cut_entropy_thresh
+            if entropy < eth:
                 return False, scores
 
+            cth = self.cut_ctg_thresh_root if node.depth == 0 else self.cut_ctg_thresh
             ctg = self.model.cost_to_go_pred(z, h_vars, bvec, frac_mask=None).item()
-            if ctg < self.cut_ctg_thresh:
+            if ctg < cth:
                 return False, scores
 
         return True, scores

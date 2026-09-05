@@ -76,8 +76,10 @@ solver:
   # cut_ctg_thresh: minimum predicted remaining nodes — skip cheap-to-finish nodes.
   # cut_budget_cap: hard cap on total cuts injected per solve() call.
   cut_depth_max: 3
-  cut_entropy_thresh: 0.5
-  cut_ctg_thresh: 30.0
+  cut_entropy_thresh_root: 0.2   # root node (depth=0): fire aggressively, highest ROI
+  cut_ctg_thresh_root: 10.0      # root node: lower remaining-nodes bar
+  cut_entropy_thresh: 0.5        # internal nodes (depth 1-cut_depth_max)
+  cut_ctg_thresh: 30.0           # internal nodes: require larger remaining subtree
   cut_budget_cap: 10
   lookahead_k: 3             # candidates evaluated with dynamics lookahead
   lookahead_depth: 3         # latent rollout steps per candidate
