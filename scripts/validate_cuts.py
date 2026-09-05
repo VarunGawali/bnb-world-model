@@ -40,7 +40,12 @@ def _extract_Abc(pyscip_model):
     """Set-cover (A x >= b, min c^T x) matrices from a pyscipopt Model."""
     vars_ = pyscip_model.getVars()
     n = len(vars_)
-    name2col = {v.getName(): j for j, v in enumerate(vars_)}
+
+    def _vname(v):
+        # pyscipopt Variable exposes .name (attr); .getName() only on some builds
+        return v.name if hasattr(v, "name") else v.getName()
+
+    name2col = {_vname(v): j for j, v in enumerate(vars_)}
     c = np.array([v.getObj() for v in vars_], dtype=np.float64)
     conss = pyscip_model.getConss()
     rows = []
@@ -51,9 +56,11 @@ def _extract_Abc(pyscip_model):
         except Exception:
             continue
         row = np.zeros(n, dtype=np.float64)
-        for vname, coeff in vals.items():
-            if vname in name2col:
-                row[name2col[vname]] = coeff
+        for key, coeff in vals.items():
+            # getValsLinear may key by variable NAME (str) or Variable object
+            kname = key if isinstance(key, str) else _vname(key)
+            if kname in name2col:
+                row[name2col[kname]] = coeff
         lhs = pyscip_model.getLhs(cons)
         rows.append(row)
         b.append(lhs if np.isfinite(lhs) else 1.0)
