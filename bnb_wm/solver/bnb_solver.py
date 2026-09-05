@@ -117,7 +117,7 @@ class BnBSolver:
         node_selection: str = "bound",
         use_reward_return: bool = False,
         cut_mode: str = "learned",
-        cut_depth_max: int = 0,   # root only — oracle evidence exists only at depth 0
+        cut_depth_max: int = 3,
         cut_entropy_thresh: float = 0.5,
         cut_ctg_thresh: float = 30.0,
         cut_budget_cap: int = 10,
