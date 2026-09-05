@@ -61,7 +61,7 @@ def load_checkpoint(model, optimizer, path, device=None):
     return ckpt.get("epoch", 0), ckpt.get("metrics", {})
 
 
-def load_weights_only(model, path, device=None):
+def load_weights_only(model, path, device=None, strict=False):
     """
     Load only model weights (no optimizer state).
     Useful for evaluation and fine-tuning.
@@ -70,6 +70,8 @@ def load_weights_only(model, path, device=None):
         model  : nn.Module
         path   : str or Path
         device : torch.device
+        strict : passed to load_state_dict; False allows checkpoints with
+                 extra or missing keys (e.g. after removing dead layers).
 
     Returns:
         model (in-place modified)
@@ -77,5 +79,9 @@ def load_weights_only(model, path, device=None):
     ckpt = torch.load(path, map_location=device or "cpu", weights_only=False)
     state = ckpt["model"] if "model" in ckpt else ckpt
     state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
-    model.load_state_dict(state)
+    missing, unexpected = model.load_state_dict(state, strict=strict)
+    if unexpected:
+        print(f"[load_weights_only] ignored unexpected keys: {unexpected}")
+    if missing:
+        print(f"[load_weights_only] missing keys (random init kept): {missing}")
     return model
