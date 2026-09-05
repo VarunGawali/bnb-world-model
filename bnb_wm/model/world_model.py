@@ -359,8 +359,13 @@ class BnBWorldModel(nn.Module):
             fm_root = child_mask if bool(child_mask.any()) else None
 
         d_root = torch.tensor(directions, dtype=z.dtype, device=device)
+        # Expand past_tokens to match the frontier batch size (n_dirs copies).
+        past_root = (
+            past_tokens.expand(n_dirs, -1, -1)
+            if past_tokens is not None else None
+        )
         z_front, h_front, tok_front = self.dynamics_step_full_batched(
-            z_root, a_root, h_root, past_tokens, d_root
+            z_root, a_root, h_root, past_root, d_root
         )
 
         # Flatten [F,V,H] -> [F*V,H] and build proper per-graph batch index.
