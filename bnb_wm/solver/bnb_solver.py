@@ -117,6 +117,10 @@ class BnBSolver:
         node_selection: str = "bound",
         use_reward_return: bool = False,
         cut_mode: str = "learned",
+        cut_depth_max: int = 3,
+        cut_entropy_thresh: float = 0.5,
+        cut_ctg_thresh: float = 30.0,
+        cut_budget_cap: int = 10,
     ):
         self.model               = model
         self.device              = device
@@ -148,7 +152,11 @@ class BnBSolver:
                 RuntimeWarning, stacklevel=2)
             cut_mode = "heuristic"
         self.cut_mode            = cut_mode
-        self._cuts_added         = 0                    # per-solve cut counter
+        self.cut_depth_max       = cut_depth_max       # max node depth to attempt cuts
+        self.cut_entropy_thresh  = cut_entropy_thresh  # min H(π) nats to fire gate
+        self.cut_ctg_thresh      = cut_ctg_thresh      # min predicted remaining nodes
+        self.cut_budget_cap      = cut_budget_cap      # max total cuts per solve()
+        self._cuts_added         = 0                   # per-solve cut counter
         # Branching mode for the ablation: "rollout" (latent world-model
         # lookahead), "policy" (argmax policy, no rollout), "most_fractional".
         self.branch_mode         = "rollout"
@@ -292,37 +300,76 @@ class BnBSolver:
                     self.model.integrality_logit(z, depth_t, nfrac_t)
                 ).item()
 
-            # Generate and select cuts (skip for near-leaf nodes)
+            # Neural cut gate: H(π) + CTG + depth (replaces leaf_prob heuristic).
+            # On gate fire: generate GMI candidates, score with zero-shot GNN
+            # cross-attention, apply best subset, warmstart LP re-solve, then
+            # patch policy scores with Δ-fractionality / Δ-reduced-cost adjustment
+            # (no full GNN re-encode — h_vars structural info stays valid).
             new_cuts = []
-            if leaf_prob < 0.7 and node.depth < 20:
-                new_cuts = self._select_cuts_neural(
-                    A, b, x_lp, c, z, node.inherited_cuts
-                )
-                if new_cuts:
-                    lp_obj2, x_lp2, dual2, feas2, node_basis2 = self._solve_lp(
-                        A, b, c, node.var_lb, node.var_ub,
-                        node.inherited_cuts + new_cuts,
-                        warm_basis=node_basis,
+            scores_adj = None
+            if self.cut_mode != "none" and leaf_prob < 0.7:
+                fire, scores_precut = self._cut_gate(h_vars, z, x_lp, node)
+                if fire:
+                    candidates = self._generate_cg_cuts(
+                        A, b, c, x_lp, node.inherited_cuts
                     )
-                    if feas2 and lp_obj2 > lp_obj + 1e-8:
-                        lp_obj, x_lp, dual, node_basis = lp_obj2, x_lp2, dual2, node_basis2
-                        h_vars, z = self._encode_node(
-                            A, b, c, x_lp, dual, node.var_lb, node.var_ub,
+                    if candidates:
+                        cut_scores = self._score_cuts_gnn(candidates, h_vars, z, x_lp)
+                        order = np.argsort(-cut_scores)
+                        new_cuts = [candidates[i]
+                                    for i in order[:self.max_cuts_per_node]]
+
+                    if new_cuts:
+                        lp_obj2, x_lp2, dual2, feas2, node_basis2 = self._solve_lp(
+                            A, b, c, node.var_lb, node.var_ub,
                             node.inherited_cuts + new_cuts,
+                            warm_basis=node_basis,
                         )
-                        if self._is_integral(x_lp):
-                            if lp_obj < global_ub:
-                                global_ub = lp_obj
-                                best_sol  = np.round(x_lp)
-                                status    = "feasible"
-                            continue
+                        if feas2 and lp_obj2 > lp_obj + 1e-8:
+                            # Δ-score adjustment — patch policy scores for the
+                            # changed LP state without a full GNN re-encode.
+                            frac_old   = np.abs(x_lp  - np.round(x_lp))
+                            frac_new   = np.abs(x_lp2 - np.round(x_lp2))
+                            delta_frac = torch.tensor(
+                                frac_new - frac_old, dtype=torch.float32,
+                                device=self.device
+                            )
+                            d_old = dual  if dual  is not None else np.zeros(len(b))
+                            d_new = dual2 if dual2 is not None else np.zeros(len(b))
+                            rc_old = c - A.T @ d_old
+                            rc_new = c - A.T @ d_new
+                            rc_scale = float(np.abs(rc_new).max()) + 1e-8
+                            delta_rc = torch.tensor(
+                                (rc_new - rc_old) / rc_scale, dtype=torch.float32,
+                                device=self.device
+                            )
+                            # More fractional → raise branching priority;
+                            # higher reduced cost → lower priority.
+                            scores_adj = scores_precut + 1.0 * delta_frac \
+                                         - 0.5 * delta_rc
+
+                            lp_obj, x_lp, dual, node_basis = (
+                                lp_obj2, x_lp2, dual2, node_basis2
+                            )
+                            self._cuts_added += len(new_cuts)
+
+                            if self._is_integral(x_lp):
+                                if lp_obj < global_ub:
+                                    global_ub = lp_obj
+                                    best_sol  = np.round(x_lp)
+                                    status    = "feasible"
+                                continue
+                        else:
+                            new_cuts = []  # LP did not improve; discard cuts
 
             # Cuts to propagate to children (branch-and-cut: inherited + new)
             child_cuts = node.inherited_cuts + new_cuts
 
-            # Select branching variable (multi-step lookahead)
+            # Select branching variable (multi-step lookahead).
+            # Pass Δ-adjusted scores when cuts were applied, so branching sees
+            # the updated LP state without a full GNN re-encode.
             branch_var = self._select_branch_var(
-                h_vars, z, x_lp, node
+                h_vars, z, x_lp, node, policy_scores_override=scores_adj
             )
 
             # Shared context for child scoring (same for both children).
@@ -725,6 +772,7 @@ class BnBSolver:
         z: torch.Tensor,
         x_lp: np.ndarray,
         node: Node,
+        policy_scores_override: "torch.Tensor | None" = None,
     ) -> int:
         """
         Select branching variable using PolicyHead + a real multi-step
@@ -752,8 +800,13 @@ class BnBSolver:
             return int(frac_indices[np.argmax(fr[frac_indices])])
 
         with torch.no_grad():
-            bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
-            scores = self.model.policy_scores(h_vars, z, bvec)
+            bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
+            # Use Δ-adjusted scores when provided (post-cut state without re-encode),
+            # otherwise compute fresh from the policy head.
+            if policy_scores_override is not None:
+                scores = policy_scores_override
+            else:
+                scores = self.model.policy_scores(h_vars, z, bvec)
 
             # Policy-only: take the top policy score, skip the latent rollout.
             if self.branch_mode == "policy":
@@ -909,7 +962,91 @@ class BnBSolver:
         return np.array(feats, dtype=np.float32)   # [n_cuts, 6]
 
     # ------------------------------------------------------------------
-    # Neural cut selection
+    # Neural cut gate and zero-shot GNN scoring
+    # ------------------------------------------------------------------
+
+    def _cut_gate(
+        self,
+        h_vars: torch.Tensor,
+        z: torch.Tensor,
+        x_lp: np.ndarray,
+        node: Node,
+    ) -> "tuple[bool, torch.Tensor | None]":
+        """
+        Three-part cut gate: depth cap, policy entropy, and CTG.
+
+        Returns (fire, policy_scores):
+          fire         : bool — whether to attempt cut generation
+          policy_scores: the pre-cut policy logits (reused for Δ-adjustment)
+
+        Entropy measures genuine branching uncertainty over the fractional
+        variables; CTG ensures the remaining tree is large enough that saving
+        nodes is worth the LP re-solve overhead.
+        """
+        if node.depth > self.cut_depth_max:
+            return False, None
+        if self._cuts_added >= self.cut_budget_cap:
+            return False, None
+
+        frac_mask_np = (x_lp > 1e-4) & (x_lp < 1 - 1e-4)
+        if not frac_mask_np.any():
+            return False, None
+
+        with torch.no_grad():
+            bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
+            scores = self.model.policy_scores(h_vars, z, bvec)
+
+            frac_t  = torch.tensor(frac_mask_np, dtype=torch.bool, device=self.device)
+            probs   = torch.softmax(scores[frac_t], dim=0)
+            entropy = float(-(probs * torch.log(probs + 1e-12)).sum())
+
+            if entropy < self.cut_entropy_thresh:
+                return False, scores
+
+            ctg = self.model.cost_to_go_pred(z, h_vars, bvec, frac_mask=None).item()
+            if ctg < self.cut_ctg_thresh:
+                return False, scores
+
+        return True, scores
+
+    def _score_cuts_gnn(
+        self,
+        candidates: list,
+        h_vars: torch.Tensor,
+        z: torch.Tensor,
+        x_lp: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Zero-shot GNN cut scoring — no new parameters, no retraining.
+
+        For each candidate cut with coefficient vector lhs:
+          h_cut = normalize( lhs @ h_vars )   # coeff-weighted variable embedding
+          align = h_cut · z / √H              # geometric alignment with latent state
+          score = align + violation            # combine geometry + LP bite
+
+        The alignment term encodes how well the cut's variable geometry matches
+        the current search context; violation ensures cuts that actually bite
+        x_lp are preferred.
+        """
+        if not candidates:
+            return np.array([], dtype=np.float32)
+
+        H     = h_vars.size(1)
+        z_vec = z.squeeze(0)   # [H]
+
+        scores = []
+        with torch.no_grad():
+            for cut in candidates:
+                lhs_t  = torch.tensor(cut.lhs, dtype=torch.float32, device=self.device)
+                h_cut  = F.normalize((lhs_t @ h_vars).unsqueeze(0), dim=1).squeeze(0)
+                align  = float((h_cut @ z_vec) / (H ** 0.5))
+                viol   = float(max(0.0, cut.rhs - float(cut.lhs @ x_lp)))
+                scores.append(align + viol)
+
+        return np.array(scores, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Neural cut selection (legacy CuttingPlaneHead path — kept for ablation)
     # ------------------------------------------------------------------
 
     def _select_cuts_neural(

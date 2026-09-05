@@ -69,7 +69,16 @@ solver:
   node_limit: 100000
   gap_tolerance: 1.0e-4
   max_cuts_per_node: 10
-  cut_score_threshold: 0.3   # sigmoid threshold for cut acceptance
+  cut_score_threshold: 0.3   # sigmoid threshold for cut acceptance (legacy learned head)
+  # Neural cut gate (H(π) × CTG × depth).
+  # cut_depth_max:  only attempt cuts at nodes shallower than this depth (0=root only).
+  # cut_entropy_thresh: minimum policy entropy (nats) over fractional vars to fire.
+  # cut_ctg_thresh: minimum predicted remaining nodes — skip cheap-to-finish nodes.
+  # cut_budget_cap: hard cap on total cuts injected per solve() call.
+  cut_depth_max: 3
+  cut_entropy_thresh: 0.5
+  cut_ctg_thresh: 30.0
+  cut_budget_cap: 10
   lookahead_k: 3             # candidates evaluated with dynamics lookahead
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
