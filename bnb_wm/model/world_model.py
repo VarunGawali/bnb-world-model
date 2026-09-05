@@ -77,11 +77,6 @@ class BnBWorldModel(nn.Module):
         # Reward head (Fix 3): predicts per-step reward from the predicted latent.
         self.dyn_reward = nn.Linear(hidden_dim, 1)
 
-        # Global search-state context (Gap 1).
-        self.n_global = 6
-        self.global_proj = nn.Linear(self.n_global, hidden_dim)
-        nn.init.zeros_(self.global_proj.weight)
-        nn.init.zeros_(self.global_proj.bias)
 
     # ------------------------------------------------------------------
     # Primary forward (Phase 1 training)
@@ -188,16 +183,6 @@ class BnBWorldModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Single-step inference with token buffer."""
         return self.dynamics.step(z_t, a_t, past_tokens, d_t)
-
-    def add_global_context(
-        self,
-        z: torch.Tensor,
-        global_ctx: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Add projected global search-state context to z."""
-        if global_ctx is None:
-            return z
-        return z + self.global_proj(global_ctx)
 
     def dynamics_bound_pred(self, z: torch.Tensor) -> torch.Tensor:
         """Predict the normalised dual bound from a predicted latent."""

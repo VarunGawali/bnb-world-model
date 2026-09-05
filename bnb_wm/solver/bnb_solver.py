@@ -115,7 +115,6 @@ class BnBSolver:
         ctg_weight: float = 0.0,
         branch_factor: int = 1,
         node_selection: str = "bound",
-        use_global_context: bool = False,
         use_reward_return: bool = False,
         cut_mode: str = "learned",
     ):
@@ -133,7 +132,6 @@ class BnBSolver:
         self.ctg_weight          = ctg_weight         # cost-to-go penalty (Gap 3)
         self.branch_factor       = branch_factor      # rollout tree width (Gap 4)
         self.node_selection      = node_selection     # "bound" | "cost_to_go" (Gap 5)
-        self.use_global_context  = use_global_context  # inject global scalars (Gap 1)
         self.use_reward_return   = use_reward_return   # MuZero-style return (Fix 3)
         # Cut-selection mode for the ablation: "learned" (CuttingPlaneHead),
         # "heuristic" (max-violation over the valid Gomory pool), "none".
@@ -283,15 +281,6 @@ class BnBSolver:
                 A, b, c, x_lp, dual, node.var_lb, node.var_ub,
                 node.inherited_cuts,
             )
-
-            # Gap 1: inject global search-state context into z (no-op unless
-            # enabled and fine-tuned; the projection is zero-initialised).
-            if self.use_global_context:
-                gctx = self._global_context(
-                    n_open=len(heap), depth=node.depth, lp_obj=lp_obj,
-                    global_ub=global_ub, global_lb=node.lb,
-                )
-                z = self.model.add_global_context(z, gctx)
 
             # IntegralityHead: detect near-leaf — skip cut generation
             frac_vals = np.abs(x_lp - np.round(x_lp))
@@ -729,32 +718,6 @@ class BnBSolver:
     # ------------------------------------------------------------------
     # Branching variable selection
     # ------------------------------------------------------------------
-
-    def _global_context(
-        self,
-        n_open: int,
-        depth: int,
-        lp_obj: float,
-        global_ub: float,
-        global_lb: float,
-    ) -> torch.Tensor:
-        """Build the 6-dim global search-state context vector (Gap 1).
-
-        All features are bounded transforms so the vector is well-conditioned
-        regardless of instance scale. Returns a [1, 6] tensor on self.device.
-        """
-        has_inc = np.isfinite(global_ub)
-        denom   = abs(global_ub) + 1.0 if has_inc else abs(lp_obj) + 1.0
-        gap     = (global_ub - global_lb) / denom if has_inc else 1.0
-        feats = [
-            np.log1p(max(n_open, 0)) / 10.0,       # frontier size
-            float(np.clip(gap, 0.0, 1.0)),          # optimality gap
-            depth / 50.0,                            # normalised depth
-            1.0 if has_inc else 0.0,                 # incumbent found?
-            float(np.tanh(lp_obj / denom)),          # relative node bound
-            float(np.tanh(global_lb / denom)),       # relative global bound
-        ]
-        return torch.tensor([feats], dtype=torch.float32, device=self.device)
 
     def _select_branch_var(
         self,
