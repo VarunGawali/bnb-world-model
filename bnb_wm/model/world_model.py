@@ -652,6 +652,7 @@ class BnBWorldModel(nn.Module):
         branch_factor: int = 1,
         use_reward_return: bool = False,
         expand_both_children: bool = True,
+        uncertainty_weight: float = 0.0,
     ) -> torch.Tensor:
         """Evaluate all K root candidates in a single batched rollout pass.
 
@@ -662,7 +663,10 @@ class BnBWorldModel(nn.Module):
         scores are scatter-added to the correct per-candidate accumulator.
 
         Args:
-            cand_indices: LongTensor [K] of root candidate variable indices.
+            cand_indices      : LongTensor [K] of root candidate variable indices.
+            uncertainty_weight: penalise candidates whose +1/-1 child scores
+                                diverge (high spread = high dynamics uncertainty).
+                                0.0 disables the penalty (default, no extra cost).
 
         Returns:
             scores: FloatTensor [K], one score per candidate (higher = better).
@@ -752,6 +756,17 @@ class BnBWorldModel(nn.Module):
         # per_cand [K]: scatter-add scores to the owning candidate.
         per_cand = torch.zeros(K, dtype=z.dtype, device=device)
         per_cand.scatter_add_(0, cand_id, score_root)
+
+        # Direction-spread uncertainty proxy (free — score_root already computed).
+        # score_root is ordered [cand_0_dir_0, cand_0_dir_1, ..., cand_K_dir_{D-1}]
+        # so reshape to [K, n_dirs] and compute per-candidate max-min spread.
+        # spread → 0 means both directions agree (confident); spread → large means
+        # the two children diverge (dynamics is uncertain about this candidate).
+        if uncertainty_weight != 0.0 and n_dirs > 1:
+            dir_scores = score_root.reshape(K, n_dirs)
+            spread = dir_scores.max(dim=1).values - dir_scores.min(dim=1).values
+        else:
+            spread = None
 
         if size_weight != 0.0:
             size_root = self.subtree_size_pred(
@@ -917,6 +932,9 @@ class BnBWorldModel(nn.Module):
                 0, frontier_cand_id,
                 continuation_discount * frontier_weights * leaf_value,
             )
+
+        if spread is not None:
+            per_cand = per_cand - uncertainty_weight * spread
 
         return per_cand
 

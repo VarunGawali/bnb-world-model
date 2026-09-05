@@ -104,6 +104,11 @@ solver:
   # using the predicted per-step reward + one leaf value bootstrap; false = sum
   # the value at every step (double-counts; kept as the ablation baseline).
   use_reward_return: true
+  # Direction-spread uncertainty penalty. Candidates whose +1/-1 child rollout
+  # scores diverge are penalised: score_adj = score - uncertainty_weight * spread.
+  # 0.0 = disabled (default). Suggested starting value: 0.1-0.5.
+  # Free at runtime — spread uses root-level scores already computed.
+  uncertainty_weight: 0.0
   # Global search-state context (Gap 1). Injects scalar frontier/bound features
   # into z. GATED OFF: the projection is zero-initialised and the frozen traces
   # lack per-node frontier signals to train it, so it is a no-op until a future

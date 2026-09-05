@@ -169,6 +169,7 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
         size_weight=0.0, ctg_weight=cfg["ctg_weight"],
         branch_factor=cfg["branch_factor"],
         use_reward_return=cfg["use_reward_return"],
+        uncertainty_weight=cfg.get("uncertainty_weight", 0.0),
     )
     rets = rets_t.cpu().tolist()
 

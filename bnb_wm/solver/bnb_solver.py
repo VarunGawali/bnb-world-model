@@ -116,6 +116,7 @@ class BnBSolver:
         branch_factor: int = 1,
         node_selection: str = "bound",
         use_reward_return: bool = False,
+        uncertainty_weight: float = 0.0,
         cut_mode: str = "learned",
         cut_depth_max: int = 3,
         cut_entropy_thresh_root: float = 0.2,   # depth=0: fire unless very confident
@@ -139,6 +140,7 @@ class BnBSolver:
         self.branch_factor       = branch_factor      # rollout tree width (Gap 4)
         self.node_selection      = node_selection     # "bound" | "cost_to_go" (Gap 5)
         self.use_reward_return   = use_reward_return   # MuZero-style return (Fix 3)
+        self.uncertainty_weight  = uncertainty_weight  # direction-spread penalty (0=off)
         # Cut-selection mode for the ablation: "learned" (CuttingPlaneHead),
         # "heuristic" (max-violation over the valid Gomory pool), "none".
         # P0.8: `learned` requires a Phase-5-trained cut head. Running the
@@ -851,6 +853,7 @@ class BnBSolver:
                 ctg_weight=self.ctg_weight,
                 branch_factor=self.branch_factor,
                 use_reward_return=self.use_reward_return,
+                uncertainty_weight=self.uncertainty_weight,
             )   # [k] FloatTensor
 
             best_var = int(top_k[cand_scores.argmax()].item())

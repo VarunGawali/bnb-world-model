@@ -61,6 +61,8 @@ _SKIP_CONFIDENT: float | None = None
 # None = disabled (full budget always).
 _ADAPTIVE_CONF_HIGH: float | None = None
 _ADAPTIVE_CONF_MID:  float | None = None
+# Direction-spread uncertainty penalty (0.0 = disabled). See solver config.
+_UNCERTAINTY_WEIGHT: float = 0.0
 
 
 def apply_config(cfg: dict | None):
@@ -75,7 +77,7 @@ def apply_config(cfg: dict | None):
         return
     global _LOOKAHEAD_K, _LOOKAHEAD_DEPTH, _LOOKAHEAD_GAMMA, _SIZE_WEIGHT
     global _CTG_WEIGHT, _BRANCH_FACTOR, _USE_REWARD_RETURN, _SKIP_CONFIDENT
-    global _ADAPTIVE_CONF_HIGH, _ADAPTIVE_CONF_MID
+    global _ADAPTIVE_CONF_HIGH, _ADAPTIVE_CONF_MID, _UNCERTAINTY_WEIGHT
     b = {**cfg.get("solver", {}), **cfg.get("benchmark", {})}   # benchmark wins
     _LOOKAHEAD_K       = int(b.get("lookahead_k", _LOOKAHEAD_K))
     _LOOKAHEAD_DEPTH   = int(b.get("lookahead_depth", _LOOKAHEAD_DEPTH))
@@ -90,6 +92,7 @@ def apply_config(cfg: dict | None):
         _ADAPTIVE_CONF_HIGH = float(b["adaptive_conf_high"])
     if "adaptive_conf_mid" in b:
         _ADAPTIVE_CONF_MID = float(b["adaptive_conf_mid"])
+    _UNCERTAINTY_WEIGHT = float(b.get("uncertainty_weight", _UNCERTAINTY_WEIGHT))
 
 
 def _format_obs(obs, device):
@@ -233,6 +236,7 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None, depth=0
         ctg_weight=_CTG_WEIGHT,
         branch_factor=_BRANCH_FACTOR,
         use_reward_return=_USE_REWARD_RETURN,
+        uncertainty_weight=_UNCERTAINTY_WEIGHT,
     )
     best_action = int(top_k_global[int(scores.argmax())])
 
