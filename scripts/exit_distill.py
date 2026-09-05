@@ -94,6 +94,10 @@ def relabel(model, loader, device, topk, depth, gamma, temp, ctg_weight,
             h_g = h_vars[offset: offset + n_v]
             z_g = z[g:g + 1]
             aset = meta["action_set"].to(device)               # local indices
+            # Candidate mask: restricts rollout imagined branching to real
+            # fractional variables, matching inference behaviour in ablation.py.
+            valid_mask = torch.zeros(n_v, dtype=torch.bool, device=device)
+            valid_mask[aset] = True
             # policy top-k within the candidate set
             k = min(topk, aset.numel())
             cand_scores = g_scores[aset]
@@ -102,7 +106,7 @@ def relabel(model, loader, device, topk, depth, gamma, temp, ctg_weight,
             rs = torch.tensor(
                 [model.rollout_candidate(
                     z_g, h_g, int(c), depth=depth, gamma=gamma,
-                    valid_mask=None, past_tokens=None,
+                    valid_mask=valid_mask, past_tokens=None,
                     size_weight=0.0, ctg_weight=ctg_weight,
                     branch_factor=branch_factor,
                     use_reward_return=use_reward_return)
