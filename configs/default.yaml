@@ -75,7 +75,7 @@ solver:
   # cut_entropy_thresh: minimum policy entropy (nats) over fractional vars to fire.
   # cut_ctg_thresh: minimum predicted remaining nodes — skip cheap-to-finish nodes.
   # cut_budget_cap: hard cap on total cuts injected per solve() call.
-  cut_depth_max: 3
+  cut_depth_max: 0     # root only — oracle evidence exists only at depth 0
   cut_entropy_thresh: 0.5
   cut_ctg_thresh: 30.0
   cut_budget_cap: 10
