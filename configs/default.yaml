@@ -109,3 +109,14 @@ benchmark:
   size_weight: 0.0           # gated off: non-DFS traces (see solver.size_weight)
   ctg_weight: 1.0            # cost-to-go penalty in rollout score (Gap 3)
   branch_factor: 2           # rollout tree width (Gap 4); 1 = single path
+  use_reward_return: true    # MuZero-style return (mirrors solver.use_reward_return)
+  # Confidence gate: skip rollout entirely when softmax top-1 mass >= threshold.
+  # null = disabled. Try 0.9 to skip only near-certain decisions.
+  skip_confident: null
+  # Adaptive rollout compute (items 10+11). Shrinks k and depth for high/medium-
+  # confidence decisions so the expensive lookahead focuses on genuinely hard
+  # choices. null = disabled (full k/depth always). Suggested starting values:
+  #   adaptive_conf_high: 0.70   # p_top >= 0.70 -> k=1, depth=1
+  #   adaptive_conf_mid:  0.40   # p_top >= 0.40 -> k=min(K,2), depth=min(D,2)
+  adaptive_conf_high: null
+  adaptive_conf_mid: null
