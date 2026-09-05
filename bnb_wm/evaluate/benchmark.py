@@ -51,6 +51,10 @@ _BRANCH_FACTOR = 2
 _USE_REWARD_RETURN = True
 # Integrality probability threshold above which lookahead is skipped
 _LEAF_PROB_SKIP = 0.8
+# Confidence gate: if softmax(policy)[top-1 candidate] >= this threshold,
+# trust the policy and skip the expensive rollout entirely. None = disabled.
+# Mirrors the skip_confident parameter in ablation.py.
+_SKIP_CONFIDENT: float | None = None
 
 
 def apply_config(cfg: dict | None):
@@ -64,7 +68,7 @@ def apply_config(cfg: dict | None):
     if not cfg:
         return
     global _LOOKAHEAD_K, _LOOKAHEAD_DEPTH, _LOOKAHEAD_GAMMA, _SIZE_WEIGHT
-    global _CTG_WEIGHT, _BRANCH_FACTOR, _USE_REWARD_RETURN
+    global _CTG_WEIGHT, _BRANCH_FACTOR, _USE_REWARD_RETURN, _SKIP_CONFIDENT
     b = {**cfg.get("solver", {}), **cfg.get("benchmark", {})}   # benchmark wins
     _LOOKAHEAD_K       = int(b.get("lookahead_k", _LOOKAHEAD_K))
     _LOOKAHEAD_DEPTH   = int(b.get("lookahead_depth", _LOOKAHEAD_DEPTH))
@@ -73,6 +77,8 @@ def apply_config(cfg: dict | None):
     _CTG_WEIGHT        = float(b.get("ctg_weight", _CTG_WEIGHT))
     _BRANCH_FACTOR     = int(b.get("branch_factor", _BRANCH_FACTOR))
     _USE_REWARD_RETURN = bool(b.get("use_reward_return", _USE_REWARD_RETURN))
+    if "skip_confident" in b:
+        _SKIP_CONFIDENT = float(b["skip_confident"])
 
 
 def _format_obs(obs, device):
@@ -182,6 +188,14 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None, depth=0
     if leaf_prob > _LEAF_PROB_SKIP:
         best_action = int(masked.argmax())
         return best_action, past_tokens
+
+    # Confidence gate: if the policy already assigns high softmax mass to its
+    # top candidate within the action set, the rollout almost always agrees —
+    # skip the expensive lookahead and return the policy pick directly.
+    if _SKIP_CONFIDENT is not None:
+        p_top = float(torch.softmax(scores_all[aset_t], dim=0).max())
+        if p_top >= _SKIP_CONFIDENT:
+            return int(masked.argmax()), past_tokens
 
     # --- real multi-step latent rollout over top-k candidates ---
     # For each candidate the model predicts BOTH z_{t+1} and h_vars_{t+1},
