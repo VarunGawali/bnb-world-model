@@ -138,7 +138,7 @@ def _format_obs(obs, device):
     return Batch.from_data_list([data])
 
 
-def _gnn_pick_action(model, batch, action_set, device, past_tokens=None):
+def _gnn_pick_action(model, batch, action_set, device, past_tokens=None, depth=0):
     """
     Pick the best branching variable using the full model at inference.
 
@@ -160,10 +160,16 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None):
     h_vars, z = model.encode(batch)
     var_mask  = batch.node_type == 0
     var_batch = batch.batch[var_mask]
+    x_var     = batch.x[var_mask]
 
     # --- integrality check: skip lookahead for near-leaf nodes ---
+    # Pass real depth + n_frac so IntegralityHead sees the same inputs it was
+    # trained on (matching ablation.py / trainer.py behaviour).
+    n_frac_val = float((x_var[:, 14] > 0.05).sum()) if x_var.size(1) > 14 else 0.0
+    depth_t = torch.tensor([float(depth)], device=device)
+    nfrac_t = torch.tensor([n_frac_val], device=device)
     leaf_prob = torch.sigmoid(
-        model.integrality_logit(z)
+        model.integrality_logit(z, depth_t, nfrac_t)
     ).item()
 
     # --- policy scores ---
@@ -305,7 +311,7 @@ def run_macro_benchmark(
             while not done and action_set is not None and len(action_set) > 0:
                 batch = _format_obs(obs, device)
                 action, past_tokens = _gnn_pick_action(
-                    model, batch, action_set, device, past_tokens
+                    model, batch, action_set, device, past_tokens, depth=gnn_nodes
                 )
                 obs, action_set, _, done, _ = env.step(action)
                 gnn_nodes += 1
