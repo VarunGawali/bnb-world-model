@@ -119,8 +119,9 @@ class BnBSolver:
         uncertainty_weight: float = 0.0,
         cut_mode: str = "learned",
         cut_depth_max: int = 3,
-        cut_entropy_thresh_root: float = 0.2,   # depth=0: fire unless very confident
-        cut_ctg_thresh_root: float = 10.0,      # depth=0: fire unless nearly solved
+        force_root_cuts: bool = True,           # always attempt cuts at depth=0
+        cut_entropy_thresh_root: float = 0.2,   # depth=0 fallback (only when force_root_cuts=False)
+        cut_ctg_thresh_root: float = 10.0,
         cut_entropy_thresh: float = 0.5,        # depth 1+: require more uncertainty
         cut_ctg_thresh: float = 30.0,           # depth 1+: require larger subtree
         cut_budget_cap: int = 10,
@@ -157,6 +158,7 @@ class BnBSolver:
             cut_mode = "heuristic"
         self.cut_mode                = cut_mode
         self.cut_depth_max           = cut_depth_max
+        self.force_root_cuts         = force_root_cuts
         self.cut_entropy_thresh_root = cut_entropy_thresh_root
         self.cut_ctg_thresh_root     = cut_ctg_thresh_root
         self.cut_entropy_thresh      = cut_entropy_thresh
@@ -1001,6 +1003,13 @@ class BnBSolver:
         frac_mask_np = (x_lp > 1e-4) & (x_lp < 1 - 1e-4)
         if not frac_mask_np.any():
             return False, None
+
+        # Root node: always attempt cuts (highest ROI; skip entropy/CTG gate).
+        if node.depth == 0 and self.force_root_cuts:
+            with torch.no_grad():
+                bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
+                scores = self.model.policy_scores(h_vars, z, bvec)
+            return True, scores
 
         with torch.no_grad():
             bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)

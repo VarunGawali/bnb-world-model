@@ -76,6 +76,7 @@ solver:
   # cut_ctg_thresh: minimum predicted remaining nodes — skip cheap-to-finish nodes.
   # cut_budget_cap: hard cap on total cuts injected per solve() call.
   cut_depth_max: 3
+  force_root_cuts: true       # always attempt cuts at root (depth=0); bypasses entropy/CTG gate
   cut_entropy_thresh_root: 0.2   # root node (depth=0): fire aggressively, highest ROI
   cut_ctg_thresh_root: 10.0      # root node: lower remaining-nodes bar
   cut_entropy_thresh: 0.5        # internal nodes (depth 1-cut_depth_max)
