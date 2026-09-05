@@ -138,8 +138,18 @@ def main():
         except Exception as e:
             print(f"[{i+1}] extract failed: {e}", flush=True); continue
         n = len(c)
+        # Solve LP relaxation first — used for violation check in Gomory generator
+        # and for cut violation scoring below.
+        try:
+            import scipy.optimize as so
+            res = so.linprog(c, A_ub=-A, b_ub=-b, bounds=[(0, 1)] * n, method="highs")
+            x_lp = res.x if res.success else np.zeros(n)
+        except Exception:
+            x_lp = np.zeros(n)
+
         N0, obj0, ok0 = solve(A, b, c)
-        pool = generate_root_gomory_cuts(A, b, c, highspy, max_cuts=args.max_pool) if ok0 else []
+        pool = generate_root_gomory_cuts(A, b, c, highspy, max_cuts=args.max_pool,
+                                         x_lp=x_lp) if ok0 else []
 
         rec = {"N0": N0, "solved": ok0, "pool": len(pool)}
         if not ok0:
@@ -152,14 +162,6 @@ def main():
 
         rec["redundancy"] = _redundancy(pool)
         audit.append(rec)
-
-        # pre-filter to top pool_cap by violation to bound the search cost
-        try:
-            import scipy.optimize as so
-            res = so.linprog(c, A_ub=-A, b_ub=-b, bounds=[(0, 1)] * n, method="highs")
-            x_lp = res.x if res.success else np.zeros(n)
-        except Exception:
-            x_lp = np.zeros(n)
         viol = np.array([_cut_features(np.asarray(l), float(r), x_lp, c, n)[0]
                          for (l, r) in pool])
         # Greedy max-coverage diversity filter: walk violation-sorted cuts and

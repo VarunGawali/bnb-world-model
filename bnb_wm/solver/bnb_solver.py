@@ -895,7 +895,7 @@ class BnBSolver:
         # Build the global Gomory cut pool once (root), then reuse everywhere.
         if getattr(self, "_gomory_pool", None) is None:
             from .gomory import generate_root_gomory_cuts
-            pool = generate_root_gomory_cuts(A, b, c, self._highs)
+            pool = generate_root_gomory_cuts(A, b, c, self._highs, x_lp=x_lp)
             self._gomory_pool = [
                 CutData(lhs=np.asarray(lhs, dtype=np.float64),
                         rhs=float(rhs), cut_type="gomory")

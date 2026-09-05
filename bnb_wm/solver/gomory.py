@@ -1,48 +1,47 @@
 """
-gomory.py — Provably valid Gomory fractional cuts for the neural B&C solver.
+gomory.py — Globally valid Gomory fractional cuts for binary set-cover B&C.
 
-Replaces the previous pairwise "intersection >= 1" cut, which was mathematically
-INVALID for a covering system (it rounded a >= constraint's coefficients down,
-which can cut off feasible integer points). Gomory fractional cuts, by contrast,
-are valid for *every* integer-feasible point of the problem.
+Validity scope
+--------------
+This implementation is designed specifically for binary set-cover instances
+with integer A and b (A x >= b, x in {0,1}^n). The upper-bound transformation
+x_j + t_j = 1 requires x_j to be binary/integer for t_j to also be integer,
+which is a prerequisite for the Gomory fractional cut argument. Do NOT use
+this generator for general MILPs without auditing the validity claim.
 
-Global validity
----------------
-A Gomory cut is globally valid only if it is derived from globally valid rows,
-not from a node's local branching bounds. We therefore derive cuts ONCE at the
-root, from the original covering constraints A x >= 1 together with the box
-0 <= x <= 1, with NO branching bounds applied. The resulting cuts hold at every
-node and are safely propagated to descendants.
+Global validity: cuts are derived once at the root from the original covering
+constraints with NO branching bounds, so they hold at every descendant node.
 
-Standard form (all variables >= 0, equalities)
-----------------------------------------------
-We lift the upper bounds x <= 1 into explicit rows so that every nonbasic
-variable sits at its lower bound 0 — the clean regime for the textbook Gomory
-fractional cut (no bounded-variable book-keeping):
+Standard form
+-------------
+We lift upper bounds x <= 1 into explicit rows so every nonbasic variable
+sits at its lower bound 0 (clean regime for the textbook GMI cut):
 
-    cover  i :  sum_j A_ij x_j - s_i = 1,     s_i >= 0     (m rows)
-    ubound j :  x_j + t_j        = 1,          t_j >= 0     (n rows)
-    variables ordered [ x (n) | s (m) | t (n) ],  all >= 0
+    cover  i:  sum_j A_ij x_j - s_i = b_i,   s_i >= 0   (m rows)
+    ubound j:  x_j + t_j = 1,                 t_j >= 0   (n rows)
+    variables: [ x (n) | s (m) | t (n) ],  all >= 0
 
-For a basic *structural* variable x_j whose LP value is fractional, with tableau
-row  x_j + sum_{k in N} a_k v_k = b̄  (v_k the nonbasic variables, all >= 0), the
-Gomory fractional cut is
+For a basic structural variable x_j with fractional LP value b̄_r, tableau row
+    x_j + sum_{k in N} a_k v_k = b̄_r,
+the GMI cut is:
+    sum_{k in N} frac(a_k) v_k >= frac(b̄_r).
+Back-substituting s_i = A_i x - b_i and t_j = 1 - x_j yields a globally valid
+inequality  alpha^T x >= beta  in the original variables.
 
-    sum_{k in N} frac(a_k) v_k  >=  frac(b̄).
-
-We then substitute the slack definitions  s_i = (A x)_i - 1  and  t_j = 1 - x_j
-to express the cut purely in the structural variables x, yielding a globally
-valid inequality  alpha^T x >= beta.
-
-Robustness
-----------
-This routine requires highspy (to read the optimal basis). If highspy is
-unavailable or anything numerically doubtful occurs, it returns [] — i.e. NO
-cuts — so the solver stays correct (no cuts is provably correct) and never emits
-an invalid cut. Validity is the invariant; coverage is best-effort.
+Cut validity is not guaranteed post-hoc: we verify every generated cut is
+actually violated by the current LP solution before returning it.
 """
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Tolerances — separated by role for easier auditing
+# ---------------------------------------------------------------------------
+_INTEG_TOL  = 1e-6   # a value is "integer" if its fractional part < this
+_COEFF_TOL  = 1e-8   # tableau coefficients smaller than this are zero
+_VIOL_TOL   = 1e-6   # a cut must be violated by at least this much to be kept
+_COEFF_CAP  = 1e8    # reject cuts with absurdly large coefficients
 
 
 def _frac(y):
@@ -50,21 +49,26 @@ def _frac(y):
     return y - np.floor(y)
 
 
-def generate_root_gomory_cuts(A, b, c, highspy, max_cuts=50, tol=1e-6):
+def generate_root_gomory_cuts(
+    A, b, c, highspy,
+    max_cuts: int = 50,
+    x_lp: "np.ndarray | None" = None,
+):
     """
     Generate globally valid Gomory fractional cuts at the root.
 
     Args:
-        A       : [m, n] covering matrix (A x >= b, b = 1 for Set Cover)
-        b       : [m]    right-hand side
-        c       : [n]    objective
-        highspy : the imported highspy module (basis access); if None -> []
-        max_cuts: cap on the number of cuts returned
-        tol     : numerical tolerance for "fractional" and "nonzero"
+        A       : [m, n] covering matrix (A x >= b)
+        b       : [m]    right-hand side (integer, typically all-ones for set cover)
+        c       : [n]    objective coefficients
+        highspy : imported highspy module; returns [] if None
+        max_cuts: maximum number of cuts to return
+        x_lp    : [n] current LP optimal solution; used for violation check.
+                  If None, violation check is skipped (weaker — not recommended).
 
     Returns:
-        list of (lhs [n] float64, rhs float) with the meaning  lhs @ x >= rhs.
-        Empty if highspy is unavailable or nothing valid could be derived.
+        list of (lhs [n] float64, rhs float) where  lhs @ x >= rhs  is a
+        globally valid and LP-violated cut.  Empty on any failure.
     """
     if highspy is None:
         return []
@@ -83,120 +87,143 @@ def generate_root_gomory_cuts(A, b, c, highspy, max_cuts=50, tol=1e-6):
     d = np.zeros(M, dtype=np.float64)
 
     # cover rows:  A x - s = b
-    E[:m, :n] = A
-    E[:m, n:n + m] = -np.eye(m)
-    d[:m] = b
+    E[:m, :n]    = A
+    E[:m, n:n+m] = -np.eye(m)
+    d[:m]        = b
     # ubound rows: x + t = 1
-    E[m:, :n] = np.eye(n)
-    E[m:, n + m:] = np.eye(n)
-    d[m:] = 1.0
+    E[m:, :n]    = np.eye(n)
+    E[m:, n+m:]  = np.eye(n)
+    d[m:]        = 1.0
 
-    # objective over [x | s | t]: only x has cost
     cost = np.concatenate([c, np.zeros(m), np.zeros(n)])
 
-    # ---- solve the standard-form LP with highspy, read the basis -----------
+    # ---- solve the standard-form LP with highspy, read the basis ------------
     try:
-        basic_cols, zval = _solve_standard_form(highspy, E, d, cost, N, M, tol)
+        basic_cols, z_sf = _solve_standard_form(highspy, E, d, cost, N, M)
     except Exception:
         return []
     if basic_cols is None:
         return []
 
-    # ---- assemble B, B^{-1}, and generate cuts from fractional basic x_j ----
+    # ---- factorise B using LU (safer than explicit inverse) -----------------
     try:
-        B = E[:, basic_cols]                       # [M, M]
-        Binv = np.linalg.inv(B)
+        B = E[:, basic_cols]           # [M, M]
+        # bbar: values of basic variables in the optimal BFS
+        bbar = np.linalg.solve(B, d)   # B x = d  ->  x = B^-1 d
     except np.linalg.LinAlgError:
         return []
 
-    bbar = Binv @ d                                # basic-variable values
     nonbasic = np.setdiff1d(np.arange(N), basic_cols, assume_unique=False)
 
-    cuts = []
-    seen = set()
+    cuts   = []
+    seen   = set()
+
     for r, col in enumerate(basic_cols):
-        if col >= n:                               # only structural x_j
+        if col >= n:                           # only structural x_j
             continue
         f0 = _frac(bbar[r])
-        if f0 < tol or f0 > 1.0 - tol:             # basic value ~integer -> skip
+        if f0 < _INTEG_TOL or f0 > 1.0 - _INTEG_TOL:
+            continue                          # basic value ~integer → no cut
+
+        # tableau row for this basic variable:  e_r^T B^{-1} E
+        # Solved as  B^T y = e_r  then  arow = y^T E  (avoids forming B^-1)
+        e_r  = np.zeros(M); e_r[r] = 1.0
+        try:
+            y = np.linalg.solve(B.T, e_r)    # B^T y = e_r
+        except np.linalg.LinAlgError:
             continue
+        arow = y @ E                          # [N] — full tableau row
 
-        # tableau row over ALL columns: e_r^T B^{-1} E
-        arow = Binv[r, :] @ E                      # [N]
-
-        # Gomory cut in (x, s, t) space: sum_{k in N} frac(a_k) v_k >= f0
-        alpha = np.zeros(n, dtype=np.float64)      # coefficients on x
-        beta = f0                                  # rhs accumulator
+        # GMI cut in (x, s, t) space: sum_{k nonbasic} frac(a_k) v_k >= f0
+        # Back-substitute:
+        #   s_i = A_i x - b_i   →  add w*A_i to alpha, add w*b_i to beta
+        #   t_j = 1   - x_j     →  subtract w from alpha[j], subtract w from beta
+        alpha = np.zeros(n, dtype=np.float64)
+        beta  = f0
         any_coeff = False
+
         for k in nonbasic:
             w = _frac(arow[k])
-            if w < tol or w > 1.0 - tol:
+            if w < _COEFF_TOL or w > 1.0 - _COEFF_TOL:
                 continue
             any_coeff = True
-            if k < n:                              # v_k = x_k
+            if k < n:                         # v_k = x_k
                 alpha[k] += w
-            elif k < n + m:                        # v_k = s_i = (A x)_i - 1
+            elif k < n + m:                   # v_k = s_i = A_i x - b_i
                 i = k - n
-                alpha += w * A[i, :]
-                beta += w                          # move -w constant to rhs
-            else:                                  # v_k = t_j = 1 - x_j
+                alpha    += w * A[i, :]
+                beta     += w * b[i]          # ← correct for general b
+            else:                             # v_k = t_j = 1 - x_j
                 j = k - n - m
                 alpha[j] -= w
-                beta -= w                          # move +w constant to rhs
+                beta     -= w
 
         if not any_coeff:
             continue
-        # beta can legitimately be negative after back-substituting t_j = 1 - x_j
-        # terms; the cut alpha @ x >= beta is valid for any beta. Only skip if
-        # the LHS is entirely zero (caught above via any_coeff).
-        # clean tiny coefficients
-        alpha[np.abs(alpha) < tol] = 0.0
-        if not np.any(np.abs(alpha) > tol):
+        # Trim tiny coefficients (numerical noise)
+        alpha[np.abs(alpha) < _COEFF_TOL] = 0.0
+        if not np.any(np.abs(alpha) > _COEFF_TOL):
             continue
 
-        key = (tuple(np.round(alpha, 6)), round(beta, 6))
+        # Sanity / finite check
+        if not (np.all(np.isfinite(alpha)) and np.isfinite(beta)):
+            continue
+        if np.max(np.abs(alpha)) > _COEFF_CAP:
+            continue
+
+        # Violation check: the cut must be violated by the current LP solution.
+        # alpha @ x_lp < beta - tol  (the cut is NOT satisfied → it cuts x_lp)
+        if x_lp is not None:
+            violation = beta - float(alpha @ x_lp)
+            if violation <= _VIOL_TOL:
+                continue
+
+        # Normalize to inf-norm = 1 for stable deduplication and scoring
+        inf_norm = np.max(np.abs(alpha))
+        if inf_norm < _COEFF_TOL:
+            continue
+        alpha_n = alpha / inf_norm
+        beta_n  = beta  / inf_norm
+
+        # Deduplicate on normalized representation
+        key = (tuple(np.round(alpha_n, 5)), round(beta_n, 5))
         if key in seen:
             continue
         seen.add(key)
-        cuts.append((alpha, float(beta)))
+
+        cuts.append((alpha_n, float(beta_n)))
         if len(cuts) >= max_cuts:
             break
 
     return cuts
 
 
-def _solve_standard_form(highspy, E, d, cost, N, M, tol):
+def _solve_standard_form(highspy, E, d, cost, N, M):
     """
-    Solve  min cost^T z  s.t.  E z = d,  z >= 0  with highspy, and return
-    (basic_column_indices, z_values). Returns (None, None) if not solved.
-
-    Uses the version-stable passModel(HighsLp) API (the incremental
-    addVars/changeCols* API differs across highspy releases).
+    Solve  min cost^T z  s.t.  E z = d,  z >= 0  with highspy.
+    Returns (basic_column_indices, z_values) or (None, None) on failure.
     """
     inf = highspy.kHighsInf
 
     lp = highspy.HighsLp()
-    lp.num_col_ = N
-    lp.num_row_ = M
+    lp.num_col_   = N
+    lp.num_row_   = M
     lp.col_cost_  = cost.astype(np.float64).tolist()
     lp.col_lower_ = [0.0] * N
     lp.col_upper_ = [inf] * N
-    # equality rows: lower == upper == d
     lp.row_lower_ = d.astype(np.float64).tolist()
     lp.row_upper_ = d.astype(np.float64).tolist()
 
-    # Constraint matrix in column-wise (CSC) form.
-    lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
+    lp.a_matrix_.format_  = highspy.MatrixFormat.kColwise
     lp.a_matrix_.num_col_ = N
     lp.a_matrix_.num_row_ = M
     start, index, value = [], [], []
     for j in range(N):
         start.append(len(index))
-        col = E[:, j]
-        nz = np.where(np.abs(col) > 1e-12)[0]
+        nz = np.where(np.abs(E[:, j]) > 1e-12)[0]
         for i in nz:
             index.append(int(i))
-            value.append(float(col[i]))
+            value.append(float(E[i, j]))
     start.append(len(index))
     lp.a_matrix_.start_ = start
     lp.a_matrix_.index_ = index
@@ -207,19 +234,17 @@ def _solve_standard_form(highspy, E, d, cost, N, M, tol):
     if h.passModel(lp) != highspy.HighsStatus.kOk:
         return None, None
     h.run()
-
     if h.getModelStatus() != highspy.HighsModelStatus.kOptimal:
         return None, None
 
-    sol = h.getSolution()
-    z = np.array(sol.col_value[:N], dtype=np.float64)
-
-    basis = h.getBasis()
-    kBasic = highspy.HighsBasisStatus.kBasic
-    col_status = list(basis.col_status)
-    basic_cols = np.array([j for j in range(N) if col_status[j] == kBasic],
-                          dtype=np.int64)
-    # A valid basis for M equality rows has exactly M basic columns.
+    sol      = h.getSolution()
+    z        = np.array(sol.col_value[:N], dtype=np.float64)
+    basis    = h.getBasis()
+    kBasic   = highspy.HighsBasisStatus.kBasic
+    basic_cols = np.array(
+        [j for j in range(N) if list(basis.col_status)[j] == kBasic],
+        dtype=np.int64,
+    )
     if basic_cols.size != M:
         return None, None
     return basic_cols, z
