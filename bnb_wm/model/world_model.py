@@ -425,6 +425,7 @@ class BnBWorldModel(nn.Module):
                 leaf_value = self.value_pred(
                     z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
                 )
+                # frontier_weights are all 1.0 here (root directions, no K averaging)
                 total_score = total_score + g * leaf_value.sum()
             return total_score
 
@@ -440,11 +441,15 @@ class BnBWorldModel(nn.Module):
         frontier_tok = tok_front
         frontier_masks = child_masks
 
-        # Continuation contribution is discounted by gamma once per transition.
-        # Initialise to 1.0 so that the multiply at the top of each iteration
-        # gives gamma^level, keeping leaf-bootstrap discount consistent with
-        # the recursive branch() which uses the same g for rewards and the
-        # value bootstrap at the terminal depth.
+        # frontier_weights [F]: cumulative averaging weight for each element.
+        # Root directions are summed (weight=1); each K-expansion divides by K
+        # to replicate the recursive `sum(cont) / len(cont)` averaging. This
+        # ensures the batched version is numerically identical to the recursive
+        # one for all branch_factor values, not just branch_factor=1.
+        frontier_weights = torch.ones(F_root, dtype=z.dtype, device=device)
+
+        # Continuation discount starts at 1.0; multiplied by gamma at the top
+        # of each loop iteration so level l contributes gamma^l.
         continuation_discount = 1.0
 
         for level in range(1, depth):
@@ -476,8 +481,9 @@ class BnBWorldModel(nn.Module):
                     terminal_score = self.value_pred(
                         z_term, h_term_flat, bvec_term, frac_mask=fm_term_flat,
                     )
+                    w_term = frontier_weights[terminal]
                     total_score = total_score + (
-                        continuation_discount * terminal_score.sum()
+                        continuation_discount * (w_term * terminal_score).sum()
                     )
 
             if not bool(expandable.any()):
@@ -492,6 +498,7 @@ class BnBWorldModel(nn.Module):
                 frontier_masks[exp_idx]
                 if frontier_masks is not None else None
             )
+            w_exp = frontier_weights[exp_idx]  # [E]
 
             k = b
             next_idx = self._policy_topk_batched(
@@ -585,27 +592,24 @@ class BnBWorldModel(nn.Module):
                 )
                 step_score = step_score - ctg_weight * ctg
 
-            # Each parent selected action averages its K continuations; the
-            # original recursive implementation sums directions and averages
-            # over selected next actions. Reshape exactly that structure.
-            step_score = step_score.view(E, K, n_dirs)
-            continuation = step_score.sum(dim=2).mean(dim=1)
+            # Weights for step children: divide by K (averaging over K actions)
+            # and replicate for n_dirs (directions are summed, not averaged).
+            # Shape: [E*K*n_dirs], ordering (i, k, d).
+            w_step = (w_exp / K).unsqueeze(1).expand(
+                -1, K * n_dirs
+            ).reshape(E * K * n_dirs)
 
-            total_score = total_score + continuation_discount * continuation.sum()
+            total_score = total_score + continuation_discount * (
+                w_step * step_score
+            ).sum()
 
             # The frontier after this level consists of all direction-expanded
-            # children. Terminal children are retained so their reward-return
-            # leaf bootstrap can be added on the next iteration.
+            # children, carrying their cumulative averaging weights.
             frontier_z = z_next
             frontier_h = h_next
             frontier_tok = tok_next
             frontier_masks = fm_child
-
-            # Advance discount for subsequent levels only. The leaf bootstrap
-            # (below) is at the same depth as this level's step scores, so it
-            # must use the same continuation_discount — not the next level's.
-            if level < depth - 1:
-                continuation_discount *= gamma
+            frontier_weights = w_step
 
         # For reward-return mode, the final frontier gets a single value
         # bootstrap, matching sum(rewards) + gamma^k V(leaf).
@@ -617,7 +621,9 @@ class BnBWorldModel(nn.Module):
             leaf_value = self.value_pred(
                 frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat,
             )
-            total_score = total_score + continuation_discount * leaf_value.sum()
+            total_score = total_score + continuation_discount * (
+                frontier_weights * leaf_value
+            ).sum()
 
         return total_score
 
