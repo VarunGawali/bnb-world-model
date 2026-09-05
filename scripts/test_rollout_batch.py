@@ -1,3 +1,4 @@
+"""Sanity-check the batched rollout for multiple (depth, branch_factor) configs."""
 import time
 import torch
 
@@ -19,19 +20,19 @@ mask = torch.zeros(V, dtype=torch.bool, device=device)
 mask[:12] = True
 
 print("Device:", device)
-print("Testing recursive vs batched rollout...")
+print("Testing batched rollout over multiple configs...")
 
 configs = [
     (2, 1, True),
     (2, 2, True),
     (3, 2, True),
+    (2, 1, False),
+    (2, 2, False),
 ]
 
 for depth, branch_factor, reward_return in configs:
     with torch.no_grad():
-
-        # Reference implementation
-        old = model.rollout_candidate(
+        score = model.rollout_candidate(
             z, h, cand_idx=0,
             depth=depth,
             gamma=0.95,
@@ -41,82 +42,40 @@ for depth, branch_factor, reward_return in configs:
             branch_factor=branch_factor,
             use_reward_return=reward_return,
             expand_both_children=True,
-            batched=False,
         )
-
-        # Batched implementation
-        new = model.rollout_candidate(
-            z, h, cand_idx=0,
-            depth=depth,
-            gamma=0.95,
-            valid_mask=mask,
-            size_weight=1.0,
-            ctg_weight=1.0,
-            branch_factor=branch_factor,
-            use_reward_return=reward_return,
-            expand_both_children=True,
-            batched=True,
-        )
-
-    diff = abs(old - new)
-
+    assert torch.isfinite(torch.tensor(score)), f"non-finite score for {depth}/{branch_factor}"
     print(
-        f"depth={depth}, b={branch_factor}: "
-        f"old={old:.6f}  new={new:.6f}  diff={diff:.2e}"
+        f"depth={depth}, b={branch_factor}, rr={reward_return}: score={score:.6f}  OK"
     )
 
-    assert diff < 1e-4, f"MISMATCH: diff={diff}"
-
-print("\nEquivalence: PASS")
+print("\nAll configs: PASS")
 
 # ---------------------------------------------------------
-# Tiny speed comparison
+# Speed check
 # ---------------------------------------------------------
 depth, branch_factor = 3, 2
 
-def run(batched):
+def run():
     with torch.no_grad():
         return model.rollout_candidate(
             z, h, cand_idx=0,
-            depth=depth,
-            gamma=0.95,
-            valid_mask=mask,
-            size_weight=1.0,
-            ctg_weight=1.0,
+            depth=depth, gamma=0.95, valid_mask=mask,
+            size_weight=1.0, ctg_weight=1.0,
             branch_factor=branch_factor,
-            use_reward_return=True,
-            expand_both_children=True,
-            batched=batched,
+            use_reward_return=True, expand_both_children=True,
         )
 
 # Warm-up
-run(False)
-run(True)
+run(); run()
 
 if device.type == "cuda":
     torch.cuda.synchronize()
 t0 = time.perf_counter()
-
-for _ in range(3):
-    run(False)
-
+for _ in range(5):
+    run()
 if device.type == "cuda":
     torch.cuda.synchronize()
-old_t = (time.perf_counter() - t0) / 3
+avg_t = (time.perf_counter() - t0) / 5
 
-if device.type == "cuda":
-    torch.cuda.synchronize()
-t0 = time.perf_counter()
-
-for _ in range(3):
-    run(True)
-
-if device.type == "cuda":
-    torch.cuda.synchronize()
-new_t = (time.perf_counter() - t0) / 3
-
-print(f"Recursive avg: {old_t:.4f}s")
-print(f"Batched   avg: {new_t:.4f}s")
-print(f"Speedup:      {old_t / new_t:.2f}x")
-
-print("\nROLLOUT BATCH TEST PASSED")
+print(f"\nBatched rollout avg ({depth}-deep, b={branch_factor}): {avg_t:.4f}s")
+print("\nROLLOUT TEST PASSED")

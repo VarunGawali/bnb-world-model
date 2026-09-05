@@ -629,120 +629,22 @@ class BnBWorldModel(nn.Module):
         branch_factor: int = 1,
         use_reward_return: bool = False,
         expand_both_children: bool = True,
-        batched: bool = True,
     ) -> float:
-        """Estimate candidate quality using latent rollout.
-
-        By default this dispatches to the level-wise batched implementation.
-        Set batched=False to retain the original recursive implementation for
-        exact A/B equivalence testing.
-        """
-        if batched:
-            return float(
-                self.rollout_candidate_batched(
-                    z=z,
-                    h_vars=h_vars,
-                    cand_idx=cand_idx,
-                    depth=depth,
-                    gamma=gamma,
-                    valid_mask=valid_mask,
-                    past_tokens=past_tokens,
-                    size_weight=size_weight,
-                    ctg_weight=ctg_weight,
-                    branch_factor=branch_factor,
-                    use_reward_return=use_reward_return,
-                    expand_both_children=expand_both_children,
-                ).detach().cpu().item()
-            )
-
-        # ------------------------------------------------------------------
-        # Reference recursive implementation retained for equivalence testing.
-        # ------------------------------------------------------------------
-        bvec = torch.zeros(
-            h_vars.size(0), dtype=torch.long, device=z.device
+        """Estimate candidate quality using level-wise batched latent rollout."""
+        return float(
+            self.rollout_candidate_batched(
+                z=z,
+                h_vars=h_vars,
+                cand_idx=cand_idx,
+                depth=depth,
+                gamma=gamma,
+                valid_mask=valid_mask,
+                past_tokens=past_tokens,
+                size_weight=size_weight,
+                ctg_weight=ctg_weight,
+                branch_factor=branch_factor,
+                use_reward_return=use_reward_return,
+                expand_both_children=expand_both_children,
+            ).detach().cpu().item()
         )
-        b = max(1, branch_factor)
-        directions = (1.0, -1.0) if expand_both_children else (0.0,)
-        size_estimate = [0.0]
-        neg_inf = float("-inf")
-
-        def branch(z_cur, h_cur, tokens_cur, a_idx, depth_left, g, is_root, mask):
-            a_emb = h_cur[a_idx].unsqueeze(0)
-
-            if mask is not None:
-                child_mask = mask.clone()
-                child_mask[a_idx] = False
-                fm = child_mask if bool(child_mask.any()) else None
-            else:
-                child_mask, fm = None, None
-
-            subtree = 0.0
-            for direction in directions:
-                z_n, h_n, tok = self.dynamics.step_full(
-                    z_cur, a_emb, h_cur, tokens_cur, direction
-                )
-
-                if use_reward_return:
-                    child_score = g * self.dynamics_reward_pred(z_n).item()
-                else:
-                    child_score = g * self.value(
-                        z_n, h_n, bvec, frac_mask=fm
-                    ).item()
-
-                if ctg_weight != 0.0:
-                    ctg = self.cost_to_go(
-                        z_n, h_n, bvec, frac_mask=fm
-                    ).item()
-                    child_score -= ctg_weight * g * ctg
-
-                if is_root and size_weight != 0.0:
-                    size_estimate[0] += self.subtree_size(
-                        z_n, h_n, bvec, frac_mask=fm
-                    ).item()
-
-                can_expand = (
-                    depth_left > 1
-                    and (child_mask is None or bool(child_mask.any()))
-                )
-
-                if not can_expand:
-                    if use_reward_return:
-                        child_score += g * self.value(
-                            z_n, h_n, bvec, frac_mask=fm
-                        ).item()
-                else:
-                    scores = self.policy(
-                        h_n, z_n.expand(h_n.size(0), -1)
-                    )
-                    if child_mask is not None:
-                        scores = scores.masked_fill(~child_mask, neg_inf)
-                        k = min(
-                            b, int(child_mask.sum().item())
-                        )
-                    else:
-                        k = min(b, scores.size(0))
-
-                    next_actions = scores.topk(k).indices
-                    cont = [
-                        branch(
-                            z_n, h_n, tok, int(na),
-                            depth_left - 1, g * gamma,
-                            False, child_mask
-                        )
-                        for na in next_actions
-                    ]
-                    child_score += sum(cont) / len(cont)
-
-                subtree += child_score
-
-            return subtree
-
-        init_mask = (
-            valid_mask.clone() if valid_mask is not None else None
-        )
-        total = branch(
-            z, h_vars, past_tokens, cand_idx, depth,
-            1.0, True, init_mask
-        )
-        return total - size_weight * size_estimate[0]
 
