@@ -112,6 +112,18 @@ class BnBWorldModel(nn.Module):
             edge_attr=edge_attr,
         )
 
+    def pool_entropy(self, batch):
+        """Diagnostic: returns (z, v_eff) where v_eff[b] = exp(H(attn_b)).
+        v_eff → 1 means peaked (instance-specific z); v_eff → V means diffuse
+        (attention ≈ mean pool, z carries little instance info).
+        """
+        edge_attr = getattr(batch, "edge_attr", None)
+        _h_vars, z, _h_cons, v_eff = self.encoder(
+            batch.x, batch.edge_index, batch.node_type, batch.batch,
+            edge_attr=edge_attr, return_pool_entropy=True,
+        )
+        return z, v_eff
+
     # ------------------------------------------------------------------
     # Individual head helpers
     # ------------------------------------------------------------------

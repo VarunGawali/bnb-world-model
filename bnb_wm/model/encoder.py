@@ -47,23 +47,44 @@ class CrossAttentionPool(nn.Module):
         self.W_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.scale = hidden_dim ** -0.5
 
-    def forward(self, h_vars: torch.Tensor, batch_vec: torch.Tensor) -> torch.Tensor:
-        # Vectorised segment attention (no Python per-graph loop): compute the
-        # scalar query-key logit for every variable, softmax it *within each
-        # graph* via segment_softmax, then scatter-sum the weighted values back
-        # to one row per graph. Mathematically identical to the old per-b loop
-        # but runs as a handful of GPU kernels instead of batch_size Python
-        # iterations — the pooling was a major CPU-bound bottleneck.
+    def forward(
+        self,
+        h_vars: torch.Tensor,
+        batch_vec: torch.Tensor,
+        return_entropy: bool = False,
+    ):
+        """
+        Args:
+            h_vars        : [total_vars, H]
+            batch_vec     : [total_vars] batch assignment
+            return_entropy: if True, also return per-graph effective V_eff
+                            (exp of attention entropy) for diagnostics.
+        Returns:
+            z             : [batch_size, H]
+            (optional) v_eff : [batch_size] effective number of attended variables
+        """
         batch_size = int(batch_vec.max().item()) + 1
         keys   = self.W_k(h_vars)   # [total_vars, H]
         values = self.W_v(h_vars)   # [total_vars, H]
 
-        # Per-variable attention logit = <query, key_i> / sqrt(H)
         logits = (keys * self.query).sum(dim=-1) * self.scale       # [total_vars]
         attn   = segment_softmax(logits, batch_vec, num_nodes=batch_size)  # [total_vars]
         weighted = values * attn.unsqueeze(-1)                      # [total_vars, H]
-        return scatter(weighted, batch_vec, dim=0,
-                       dim_size=batch_size, reduce="sum")           # [batch_size, H]
+        z = scatter(weighted, batch_vec, dim=0,
+                    dim_size=batch_size, reduce="sum")              # [batch_size, H]
+
+        if return_entropy:
+            # V_eff = exp(H(α)) where H(α) = -sum α log α, per graph.
+            # V_eff → 1 means peaked (instance-specific); V_eff → V means
+            # diffuse (attention ≈ mean pool — nearly no information in z).
+            eps = 1e-12
+            h_alpha = scatter(
+                -(attn * torch.log(attn + eps)),
+                batch_vec, dim=0, dim_size=batch_size, reduce="sum",
+            )  # [batch_size]
+            return z, torch.exp(h_alpha)
+
+        return z
 
 
 class BipartiteGNN(nn.Module):
@@ -137,6 +158,13 @@ class BipartiteGNN(nn.Module):
             [nn.LayerNorm(hidden_dim) for _ in range(n_layers)]
         )
 
+        # Terminal normalisation of the residual stream before readout.
+        # h accumulates L residual updates (h ← h + LN(ReLU(conv))), so
+        # ‖h‖ ~ O(L) without this. Initialised to identity (weight=1, bias=0)
+        # so loading an existing checkpoint is a no-op; scale stabilises on
+        # the next training run.
+        self.final_norm = nn.LayerNorm(hidden_dim)
+
         # Graph-level readout
         self.pool = CrossAttentionPool(hidden_dim)
 
@@ -159,18 +187,22 @@ class BipartiteGNN(nn.Module):
         node_type: torch.Tensor,
         batch_vec: torch.Tensor,
         edge_attr: torch.Tensor | None = None,
+        return_pool_entropy: bool = False,
     ):
         """
         Args:
-            x          : [N, 19]  combined node feature matrix
-            edge_index : [2, E]   edges (any direction; split internally)
-            node_type  : [N]      0=variable, 1=constraint
-            batch_vec  : [N]      batch assignment
-            edge_attr  : [E, 3]   per-edge features (optional; zeros if None)
+            x                  : [N, 19]  combined node feature matrix
+            edge_index         : [2, E]   edges (any direction; split internally)
+            node_type          : [N]      0=variable, 1=constraint
+            batch_vec          : [N]      batch assignment
+            edge_attr          : [E, 3]   per-edge features (optional; zeros if None)
+            return_pool_entropy: if True, also return V_eff per graph (diagnostic)
 
         Returns:
-            h_vars : [num_vars, hidden_dim]
-            z      : [batch_size, hidden_dim]
+            h_vars  : [num_vars, hidden_dim]
+            z       : [batch_size, hidden_dim]
+            h_cons  : [num_cons, hidden_dim]
+            (optional) v_eff : [batch_size]  effective attended variables (diagnostic)
         """
         var_mask = node_type == 0
         con_mask = node_type == 1
@@ -230,7 +262,11 @@ class BipartiteGNN(nn.Module):
                                 h[con_mask] + upd_c)
                 h_cons_out = h[con_mask]   # updated after each non-last layer
 
-        h_vars = h[var_mask]
-        z = self.pool(h_vars, batch_vec[var_mask])
+        h_vars = self.final_norm(h[var_mask])
 
+        if return_pool_entropy:
+            z, v_eff = self.pool(h_vars, batch_vec[var_mask], return_entropy=True)
+            return h_vars, z, h_cons_out, v_eff
+
+        z = self.pool(h_vars, batch_vec[var_mask])
         return h_vars, z, h_cons_out
