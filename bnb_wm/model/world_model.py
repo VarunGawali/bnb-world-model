@@ -601,6 +601,12 @@ class BnBWorldModel(nn.Module):
             frontier_tok = tok_next
             frontier_masks = fm_child
 
+            # Advance discount for subsequent levels only. The leaf bootstrap
+            # (below) is at the same depth as this level's step scores, so it
+            # must use the same continuation_discount — not the next level's.
+            if level < depth - 1:
+                continuation_discount *= gamma
+
         # For reward-return mode, the final frontier gets a single value
         # bootstrap, matching sum(rewards) + gamma^k V(leaf).
         if use_reward_return and frontier_z.size(0) > 0:
