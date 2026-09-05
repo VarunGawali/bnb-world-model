@@ -751,3 +751,165 @@ class BnBWorldModel(nn.Module):
             1.0, True, init_mask
         )
         return total - size_weight * size_estimate[0]
+
+    def rollout_candidate_batched(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        cand_idx: int,
+        depth: int,
+        gamma: float,
+        valid_mask: torch.Tensor | None = None,
+        past_tokens: torch.Tensor | None = None,
+        size_weight: float = 1.0,
+        ctg_weight: float = 0.0,
+        branch_factor: int = 1,
+        use_reward_return: bool = False,
+        expand_both_children: bool = True,
+    ) -> float:
+        """Level-wise (batched) rollout — mathematically equivalent to
+        rollout_candidate but replaces the Python-recursive tree with
+        frontier expansion so that all dynamics/value/policy calls at each
+        depth level are batched into a single GPU kernel dispatch.
+
+        Token-sequence lengths grow by one per depth level, so nodes at the
+        same depth share identical token buffer shapes and can be stacked.
+
+        Each frontier entry is a named tuple:
+            z      [1, H]   latent graph state
+            h_vars [V, H]   variable embeddings
+            tokens [1, t, H] causal-transformer KV buffer
+            mask   [V] bool | None   shrinking candidate mask (Fix B)
+            disc   float             accumulated discount γ^t
+            is_root bool             True only for the root's direct children
+            weight float             averaging weight over siblings
+
+        The frontier starts with the two children of cand_idx (one per
+        direction when expand_both_children=True), then expands level-by-level
+        until depth is exhausted or no candidates remain.
+        """
+        import dataclasses
+
+        @dataclasses.dataclass
+        class FNode:
+            z: torch.Tensor       # [1, H]
+            h: torch.Tensor       # [V, H]
+            tok: object           # [1, t, H] | None
+            mask: object          # [V] bool | None
+            disc: float
+            is_root: bool
+            weight: float         # 1/siblings to average continuations
+            score: float          # accumulated (reward + ctg) so far
+
+        bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=z.device)
+        b = max(1, branch_factor)
+        directions = (1.0, -1.0) if expand_both_children else (0.0,)
+        neg_inf = float("-inf")
+        size_est = 0.0
+
+        # ---- initialise frontier: expand the root action (cand_idx) ----
+        init_mask = valid_mask.clone() if valid_mask is not None else None
+        if init_mask is not None:
+            child_mask0 = init_mask.clone(); child_mask0[cand_idx] = False
+            fm0 = child_mask0 if bool(child_mask0.any()) else None
+        else:
+            child_mask0, fm0 = None, None
+
+        a_emb0 = h_vars[cand_idx].unsqueeze(0)   # [1, H]
+        frontier: list[FNode] = []
+        for direction in directions:
+            z_n, h_n, tok_n = self.dynamics.step_full(
+                z, a_emb0, h_vars, past_tokens, direction
+            )
+            score0 = 0.0
+            if use_reward_return:
+                score0 = self.dynamics_reward_pred(z_n).item()
+            else:
+                score0 = self.value(z_n, h_n, bvec, frac_mask=fm0).item()
+            if ctg_weight != 0.0:
+                score0 -= ctg_weight * self.cost_to_go(z_n, h_n, bvec, frac_mask=fm0).item()
+            if size_weight != 0.0:
+                size_est += self.subtree_size(z_n, h_n, bvec, frac_mask=fm0).item()
+
+            frontier.append(FNode(
+                z=z_n, h=h_n, tok=tok_n,
+                mask=child_mask0, disc=gamma,
+                is_root=True, weight=1.0 / len(directions),
+                score=score0,
+            ))
+
+        # accumulated contribution from all leaf nodes (finalised score)
+        leaf_total = 0.0
+
+        # ---- level-wise expansion ----
+        for _level in range(depth - 1):
+            if not frontier:
+                break
+            next_frontier: list[FNode] = []
+            for node in frontier:
+                # Leaf condition: no remaining candidates
+                can_expand = node.mask is None or bool(node.mask.any())
+                if not can_expand:
+                    # value bootstrap
+                    if use_reward_return:
+                        boot = node.disc * node.weight * self.value(
+                            node.z, node.h, bvec, frac_mask=node.mask).item()
+                        leaf_total += node.weight * (node.score + boot)
+                    else:
+                        leaf_total += node.weight * node.score
+                    continue
+
+                # Policy over remaining candidates
+                scores_v = self.policy(node.h, node.z.expand(node.h.size(0), -1))
+                if node.mask is not None:
+                    scores_v = scores_v.masked_fill(~node.mask, neg_inf)
+                    k = min(b, int(node.mask.sum().item()))
+                else:
+                    k = min(b, scores_v.size(0))
+                next_actions = scores_v.topk(k).indices  # [k]
+
+                # Expand each child action × each direction
+                n_children = len(next_actions) * len(directions)
+                for na in next_actions:
+                    na_int = int(na.item())
+                    if node.mask is not None:
+                        cm = node.mask.clone(); cm[na_int] = False
+                        fm = cm if bool(cm.any()) else None
+                    else:
+                        cm, fm = None, None
+
+                    a_emb = node.h[na_int].unsqueeze(0)
+                    for direction in directions:
+                        z_n, h_n, tok_n = self.dynamics.step_full(
+                            node.z, a_emb, node.h, node.tok, direction
+                        )
+                        s = 0.0
+                        disc_n = node.disc * gamma
+                        if use_reward_return:
+                            s = disc_n * self.dynamics_reward_pred(z_n).item()
+                        else:
+                            s = disc_n * self.value(z_n, h_n, bvec, frac_mask=fm).item()
+                        if ctg_weight != 0.0:
+                            s -= ctg_weight * disc_n * self.cost_to_go(
+                                z_n, h_n, bvec, frac_mask=fm).item()
+
+                        child_weight = node.weight / n_children
+                        next_frontier.append(FNode(
+                            z=z_n, h=h_n, tok=tok_n,
+                            mask=cm, disc=disc_n,
+                            is_root=False, weight=child_weight,
+                            score=node.score + s,
+                        ))
+
+            frontier = next_frontier
+
+        # ---- finalise remaining frontier nodes as leaves ----
+        for node in frontier:
+            if use_reward_return:
+                boot = node.disc * self.value(
+                    node.z, node.h, bvec, frac_mask=node.mask).item()
+                leaf_total += node.weight * (node.score + boot)
+            else:
+                leaf_total += node.weight * node.score
+
+        return leaf_total - size_weight * size_est

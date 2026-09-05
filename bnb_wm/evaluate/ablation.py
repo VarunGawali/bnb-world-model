@@ -152,7 +152,7 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
 
     rets = []
     for cand in top_k:
-        rets.append(model.rollout_candidate(
+        rets.append(model.rollout_candidate_batched(
             z, h_vars, int(cand),
             depth=cfg["depth"], gamma=cfg["gamma"],
             valid_mask=valid_mask, past_tokens=past_tokens,
