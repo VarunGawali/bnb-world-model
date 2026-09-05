@@ -748,4 +748,3 @@ class BnBWorldModel(nn.Module):
             1.0, True, init_mask
         )
         return total - size_weight * size_estimate[0]
-
