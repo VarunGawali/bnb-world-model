@@ -19,7 +19,9 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from bnb_wm.model.world_model import BnBWorldModel
-from bnb_wm.data.dataset import BnBDataset
+from bnb_wm.data.datasets import (
+    list_trajectory_files, split_files, TransitionDataset,
+)
 
 
 def main():
@@ -46,8 +48,10 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.to(device).eval()
 
-    dataset = BnBDataset(args.data_root, split="test",
-                         max_files=args.n_instances)
+    all_files = list_trajectory_files(args.data_root)
+    _, _, test_files = split_files(all_files)
+    test_files = test_files[:args.n_instances]
+    dataset = TransitionDataset(test_files)
     loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
     all_veff, all_V = [], []
