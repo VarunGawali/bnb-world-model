@@ -612,6 +612,282 @@ class BnBWorldModel(nn.Module):
 
         return total_score
 
+    def rollout_top_k_batched(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        cand_indices: torch.Tensor,
+        depth: int,
+        gamma: float,
+        valid_mask: torch.Tensor | None = None,
+        past_tokens: torch.Tensor | None = None,
+        size_weight: float = 1.0,
+        ctg_weight: float = 0.0,
+        branch_factor: int = 1,
+        use_reward_return: bool = False,
+        expand_both_children: bool = True,
+    ) -> torch.Tensor:
+        """Evaluate all K root candidates in a single batched rollout pass.
+
+        Equivalent to calling rollout_candidate_batched K times and stacking
+        the results, but uses one shared forward pass per depth level instead
+        of K separate passes. All K candidates' frontier trees are processed
+        together; each candidate's subtree is tracked via a cand_id index so
+        scores are scatter-added to the correct per-candidate accumulator.
+
+        Args:
+            cand_indices: LongTensor [K] of root candidate variable indices.
+
+        Returns:
+            scores: FloatTensor [K], one score per candidate (higher = better).
+        """
+        if z.dim() != 2 or z.size(0) != 1:
+            raise ValueError("z must have shape [1, H].")
+        if h_vars.dim() != 2:
+            raise ValueError("h_vars must have shape [V, H].")
+        if cand_indices.dim() != 1 or cand_indices.numel() == 0:
+            raise ValueError("cand_indices must be a non-empty 1-D LongTensor.")
+
+        device = z.device
+        V = h_vars.size(0)
+        K = cand_indices.size(0)
+        b = max(1, int(branch_factor))
+        directions = (1.0, -1.0) if expand_both_children else (0.0,)
+        n_dirs = len(directions)
+
+        # ------------------------------------------------------------------
+        # Root expansion: all K candidates × n_dirs in one dynamics call.
+        # ------------------------------------------------------------------
+        # z_root  [K*n_dirs, H]
+        z_root = z.expand(K * n_dirs, -1)
+        # a_root  [K*n_dirs, H]: each candidate repeated n_dirs times
+        a_root = h_vars[cand_indices].unsqueeze(1).expand(
+            -1, n_dirs, -1
+        ).reshape(K * n_dirs, -1)
+        # h_root  [K*n_dirs, V, H]
+        h_root = h_vars.unsqueeze(0).expand(K * n_dirs, -1, -1)
+
+        # Per-candidate child masks: clone valid_mask and remove each cand's
+        # own index, then replicate for n_dirs.
+        if valid_mask is not None:
+            root_mask = valid_mask.to(device=device, dtype=torch.bool)
+            # [K, V]: each row is root_mask with cand_indices[i] cleared
+            cand_masks = root_mask.unsqueeze(0).expand(K, -1).clone()
+            cand_masks[torch.arange(K, device=device), cand_indices] = False
+            # [K*n_dirs, V]
+            child_masks_root = cand_masks.unsqueeze(1).expand(
+                -1, n_dirs, -1
+            ).reshape(K * n_dirs, V)
+        else:
+            child_masks_root = None
+
+        d_root = torch.tensor(directions, dtype=z.dtype, device=device).repeat(K)
+        z_front, h_front, tok_front = self.dynamics_step_full_batched(
+            z_root, a_root, h_root, past_tokens, d_root
+        )
+
+        # F = K*n_dirs frontier elements after the root step.
+        F_root = z_front.size(0)  # == K * n_dirs
+        # cand_id [F]: which root candidate each frontier element belongs to.
+        cand_id = torch.arange(K, device=device).repeat_interleave(n_dirs)
+
+        # ------------------------------------------------------------------
+        # Score root children.
+        # ------------------------------------------------------------------
+        h_front_flat = h_front.reshape(F_root * V, -1)
+        bvec_root = torch.arange(F_root, device=device).repeat_interleave(V)
+
+        if child_masks_root is not None:
+            # [K, V] → pick the first direction's mask (same for all dirs of one cand)
+            fm_root_base = cand_masks  # [K, V]
+            fm_root_flat = child_masks_root.reshape(-1)  # [F*V]
+        else:
+            fm_root_flat = None
+
+        if use_reward_return:
+            score_root = self.dynamics_reward_pred(z_front)  # [F]
+        else:
+            score_root = self.value_pred(
+                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+            )  # [F]
+
+        if ctg_weight != 0.0:
+            ctg_root = self.cost_to_go_pred(
+                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+            )
+            score_root = score_root - ctg_weight * ctg_root
+
+        # per_cand [K]: scatter-add scores to the owning candidate.
+        per_cand = torch.zeros(K, dtype=z.dtype, device=device)
+        per_cand.scatter_add_(0, cand_id, score_root)
+
+        if size_weight != 0.0:
+            size_root = self.subtree_size_pred(
+                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+            )
+            per_cand.scatter_add_(
+                0, cand_id, -size_weight * size_root
+            )
+
+        # frontier_weights [F]: cumulative averaging weights (starts at 1).
+        frontier_weights = torch.ones(F_root, dtype=z.dtype, device=device)
+        frontier_cand_id = cand_id  # tracks owner across levels
+
+        if depth == 1:
+            if use_reward_return:
+                leaf_value = self.value_pred(
+                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+                )
+                per_cand.scatter_add_(0, frontier_cand_id, leaf_value)
+            return per_cand
+
+        frontier_z = z_front
+        frontier_h = h_front
+        frontier_tok = tok_front
+        frontier_masks = child_masks_root
+        continuation_discount = 1.0
+
+        for level in range(1, depth):
+            continuation_discount *= gamma
+            F = frontier_z.size(0)
+
+            if frontier_masks is None:
+                expandable = torch.ones(F, dtype=torch.bool, device=device)
+            else:
+                expandable = frontier_masks.any(dim=1)
+
+            terminal = ~expandable
+
+            if bool(terminal.any()) and use_reward_return:
+                z_term = frontier_z[terminal]
+                h_term = frontier_h[terminal]
+                N_term = z_term.size(0)
+                h_term_flat = h_term.reshape(N_term * V, -1)
+                bvec_term = torch.arange(N_term, device=device).repeat_interleave(V)
+                fm_term = (
+                    frontier_masks[terminal].reshape(-1)
+                    if frontier_masks is not None else None
+                )
+                terminal_score = self.value_pred(
+                    z_term, h_term_flat, bvec_term, frac_mask=fm_term
+                )
+                w_term = frontier_weights[terminal]
+                id_term = frontier_cand_id[terminal]
+                per_cand.scatter_add_(
+                    0, id_term,
+                    continuation_discount * w_term * terminal_score,
+                )
+
+            if not bool(expandable.any()):
+                break
+
+            exp_idx = expandable.nonzero(as_tuple=False).squeeze(1)
+            z_exp = frontier_z[exp_idx]
+            h_exp = frontier_h[exp_idx]
+            tok_exp = frontier_tok[exp_idx]
+            masks_exp = frontier_masks[exp_idx] if frontier_masks is not None else None
+            w_exp = frontier_weights[exp_idx]
+            id_exp = frontier_cand_id[exp_idx]
+
+            k_eff = b
+            next_idx = self._policy_topk_batched(h_exp, z_exp, masks_exp, k_eff)
+            E, K_act = next_idx.shape
+
+            H_dim = h_exp.size(-1)
+            h_expanded = h_exp.unsqueeze(1).expand(-1, K_act, -1, -1)
+            gather_idx = next_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, H_dim)
+            a_exp = torch.gather(h_expanded, 2, gather_idx).squeeze(2)  # [E,K,H]
+
+            z_parent = z_exp.unsqueeze(1).expand(-1, K_act, -1).reshape(E * K_act, H_dim)
+            a_flat = a_exp.reshape(E * K_act, H_dim)
+            h_parent = h_exp.unsqueeze(1).expand(-1, K_act, -1, -1).reshape(E * K_act, V, H_dim)
+            tok_parent = tok_exp.unsqueeze(1).expand(
+                -1, K_act, -1, -1
+            ).reshape(E * K_act, tok_exp.size(1), H_dim)
+
+            if masks_exp is not None:
+                masks_parent = masks_exp.unsqueeze(1).expand(-1, K_act, -1).reshape(
+                    E * K_act, V
+                ).clone()
+                row = torch.arange(E * K_act, device=device)
+                masks_parent[row, next_idx.reshape(-1)] = False
+                fm_parent = masks_parent
+            else:
+                fm_parent = None
+
+            z_child_in = z_parent.unsqueeze(1).expand(-1, n_dirs, -1).reshape(E * K_act * n_dirs, H_dim)
+            a_child_in = a_flat.unsqueeze(1).expand(-1, n_dirs, -1).reshape(E * K_act * n_dirs, H_dim)
+            h_child_in = h_parent.unsqueeze(1).expand(-1, n_dirs, -1, -1).reshape(E * K_act * n_dirs, V, H_dim)
+            tok_child_in = tok_parent.unsqueeze(1).expand(
+                -1, n_dirs, -1, -1
+            ).reshape(E * K_act * n_dirs, tok_parent.size(1), H_dim)
+            d = torch.tensor(directions, dtype=z.dtype, device=device).view(
+                1, n_dirs
+            ).expand(E * K_act, -1).reshape(-1)
+            fm_child = (
+                fm_parent.unsqueeze(1).expand(-1, n_dirs, -1).reshape(E * K_act * n_dirs, V)
+                if fm_parent is not None else None
+            )
+
+            z_next, h_next, tok_next = self.dynamics_step_full_batched(
+                z_child_in, a_child_in, h_child_in, tok_child_in, d
+            )
+
+            N_step = z_next.size(0)
+            h_next_flat = h_next.reshape(N_step * V, -1)
+            bvec_step = torch.arange(N_step, device=device).repeat_interleave(V)
+            fm_step_flat = fm_child.reshape(-1) if fm_child is not None else None
+
+            if use_reward_return:
+                step_score = self.dynamics_reward_pred(z_next)
+            else:
+                step_score = self.value_pred(z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat)
+
+            if ctg_weight != 0.0:
+                step_score = step_score - ctg_weight * self.cost_to_go_pred(
+                    z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat
+                )
+
+            # Weights: divide by K_act (averaging) × n_dirs (summed per direction).
+            # Each expandable parent's weight is divided by K_act, then replicated
+            # for K_act children and n_dirs directions.
+            w_step = (w_exp / K_act).unsqueeze(1).expand(
+                -1, K_act * n_dirs
+            ).reshape(E * K_act * n_dirs)
+
+            # Propagate candidate ownership: each parent's K_act*n_dirs children
+            # inherit the parent's cand_id.
+            id_step = id_exp.unsqueeze(1).expand(
+                -1, K_act * n_dirs
+            ).reshape(E * K_act * n_dirs)
+
+            per_cand.scatter_add_(
+                0, id_step,
+                continuation_discount * w_step * step_score,
+            )
+
+            frontier_z = z_next
+            frontier_h = h_next
+            frontier_tok = tok_next
+            frontier_masks = fm_child
+            frontier_weights = w_step
+            frontier_cand_id = id_step
+
+        if use_reward_return and frontier_z.size(0) > 0:
+            N_leaf = frontier_z.size(0)
+            h_leaf_flat = frontier_h.reshape(N_leaf * V, -1)
+            bvec_leaf = torch.arange(N_leaf, device=device).repeat_interleave(V)
+            fm_leaf_flat = frontier_masks.reshape(-1) if frontier_masks is not None else None
+            leaf_value = self.value_pred(
+                frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat
+            )
+            per_cand.scatter_add_(
+                0, frontier_cand_id,
+                continuation_discount * frontier_weights * leaf_value,
+            )
+
+        return per_cand
+
     # ------------------------------------------------------------------
     # Real latent rollout for candidate selection
     # ------------------------------------------------------------------

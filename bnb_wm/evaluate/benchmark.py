@@ -198,34 +198,27 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None, depth=0
             return int(masked.argmax()), past_tokens
 
     # --- real multi-step latent rollout over top-k candidates ---
-    # For each candidate the model predicts BOTH z_{t+1} and h_vars_{t+1},
-    # re-runs the policy on the predicted state to pick the next action, and
-    # accumulates discounted value estimates — a genuine branching-sequence
-    # simulation rather than replaying the same variable.
+    # All K candidates are evaluated in a single batched forward pass via
+    # rollout_top_k_batched, replacing K sequential rollout_candidate calls.
+    # GNN embeddings (z, h_vars) are already computed once above and reused.
     k            = min(_LOOKAHEAD_K, len(action_set))
     top_k_global = masked.topk(k).indices
 
     valid_mask = torch.zeros(scores_all.size(0), dtype=torch.bool, device=device)
     valid_mask[aset_t] = True
 
-    best_action = int(top_k_global[0])
-    best_return = -float("inf")
-
-    for cand_idx in top_k_global:
-        discounted_return = model.rollout_candidate(
-            z, h_vars, int(cand_idx),
-            depth=_LOOKAHEAD_DEPTH,
-            gamma=_LOOKAHEAD_GAMMA,
-            valid_mask=valid_mask,
-            past_tokens=past_tokens,
-            size_weight=_SIZE_WEIGHT,
-            ctg_weight=_CTG_WEIGHT,
-            branch_factor=_BRANCH_FACTOR,
-            use_reward_return=_USE_REWARD_RETURN,
-        )
-        if discounted_return > best_return:
-            best_return = discounted_return
-            best_action = int(cand_idx)
+    scores = model.rollout_top_k_batched(
+        z, h_vars, top_k_global,
+        depth=_LOOKAHEAD_DEPTH,
+        gamma=_LOOKAHEAD_GAMMA,
+        valid_mask=valid_mask,
+        past_tokens=past_tokens,
+        size_weight=_SIZE_WEIGHT,
+        ctg_weight=_CTG_WEIGHT,
+        branch_factor=_BRANCH_FACTOR,
+        use_reward_return=_USE_REWARD_RETURN,
+    )
+    best_action = int(top_k_global[int(scores.argmax())])
 
     # Advance the token buffer with the chosen action
     a_emb_chosen = h_vars[best_action].unsqueeze(0)

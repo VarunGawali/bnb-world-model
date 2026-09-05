@@ -150,16 +150,16 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
     valid_mask = torch.zeros(scores_all.size(0), dtype=torch.bool, device=device)
     valid_mask[aset_t] = True
 
-    rets = []
-    for cand in top_k:
-        rets.append(model.rollout_candidate_batched(
-            z, h_vars, int(cand),
-            depth=cfg["depth"], gamma=cfg["gamma"],
-            valid_mask=valid_mask, past_tokens=past_tokens,
-            size_weight=0.0, ctg_weight=cfg["ctg_weight"],
-            branch_factor=cfg["branch_factor"],
-            use_reward_return=cfg["use_reward_return"],
-        ))
+    # Evaluate all k candidates in a single batched forward pass.
+    rets_t = model.rollout_top_k_batched(
+        z, h_vars, top_k,
+        depth=cfg["depth"], gamma=cfg["gamma"],
+        valid_mask=valid_mask, past_tokens=past_tokens,
+        size_weight=0.0, ctg_weight=cfg["ctg_weight"],
+        branch_factor=cfg["branch_factor"],
+        use_reward_return=cfg["use_reward_return"],
+    )
+    rets = rets_t.cpu().tolist()
 
     lam = cfg.get("anchor_lambda")
     if lam is None:
