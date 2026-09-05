@@ -80,7 +80,22 @@ _LEAF_SKIP = 0.8
 # Parameterized branching-variable selection
 # ---------------------------------------------------------------------------
 
-def _pick_action(model, batch, action_set, device, cfg, past_tokens):
+class _NodeDepth:
+    """Ecole information function exposing the current node's B&B depth, so the
+    IntegralityHead gets the SAME depth input at inference that it saw in training
+    (Phase 4). Without it, depth defaulted to 0 -> the leaf-probability gate that
+    decides whether to skip the rollout was systematically wrong."""
+    def before_reset(self, model):
+        pass
+
+    def extract(self, model, done):
+        try:
+            return int(model.as_pyscipopt().getDepth())
+        except Exception:
+            return 0
+
+
+def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
     """Pick a branching variable under one ablation config; returns (action, tokens)."""
     mode = cfg["mode"]
 
@@ -111,7 +126,12 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens):
     if cfg["mode"] == "policy":
         return int(masked.argmax()), past_tokens
 
-    leaf_prob = torch.sigmoid(model.integrality_logit(z)).item()
+    # Real depth + n_frac for the integrality gate (match Phase-4 training inputs).
+    x_var = batch.x[var_mask]
+    n_frac_val = float((x_var[:, 14] > 0.05).sum()) if x_var.size(1) > 14 else 0.0
+    depth_t = torch.tensor([float(depth)], device=device)
+    nfrac_t = torch.tensor([n_frac_val], device=device)
+    leaf_prob = torch.sigmoid(model.integrality_logit(z, depth_t, nfrac_t)).item()
     if leaf_prob > _LEAF_SKIP:
         return int(masked.argmax()), past_tokens
 
@@ -230,6 +250,7 @@ def run(model, device, configs, n_instances, generator_kwargs,
     }
     env = ecole.environment.Branching(
         observation_function=ecole.observation.NodeBipartite(),
+        information_function={"depth": _NodeDepth()},
         scip_params=scip_params,
     )
 
@@ -293,15 +314,16 @@ def run(model, device, configs, n_instances, generator_kwargs,
 
         # ---- each learned config ----
         for name, cfg in configs.items():
-            obs, action_set, _, done, _ = env.reset(instance.copy_orig())
+            obs, action_set, _, done, info = env.reset(instance.copy_orig())
             steps, past = 0, None
             with torch.no_grad():
                 while not done and action_set is not None and len(action_set) > 0:
                     batch = _format_obs(obs, device)
+                    depth = int(info.get("depth", 0)) if isinstance(info, dict) else 0
                     action, past = _pick_action(
-                        model, batch, action_set, device, cfg, past
+                        model, batch, action_set, device, cfg, past, depth=depth
                     )
-                    obs, action_set, _, done, _ = env.step(action)
+                    obs, action_set, _, done, info = env.step(action)
                     steps += 1
             n, opt, t, c = _episode_stats(env, steps)
             nodes[name].append(n)
