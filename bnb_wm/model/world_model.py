@@ -378,6 +378,15 @@ class BnBWorldModel(nn.Module):
             z_root, a_root, h_root, past_tokens, d_root
         )
 
+        # Flatten [F,V,H] -> [F*V,H] and build proper per-graph batch index.
+        F_root = z_front.size(0)
+        h_front_flat = h_front.reshape(F_root * V, -1)
+        bvec_root = torch.arange(F_root, device=device).repeat_interleave(V)
+        fm_root_flat = (
+            fm_root.unsqueeze(0).expand(F_root, -1).reshape(-1)
+            if fm_root is not None else None
+        )
+
         # Accumulate root-child scores. Keep everything tensor-valued until
         # the final scalar conversion so no .item() calls force GPU sync.
         g = 1.0
@@ -390,7 +399,7 @@ class BnBWorldModel(nn.Module):
         else:
             score_front.append(
                 g * self.value_pred(
-                    z_front, h_front, bvec, frac_mask=fm_root
+                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
                 )
             )
 
@@ -398,7 +407,7 @@ class BnBWorldModel(nn.Module):
             score_front[-1] = score_front[-1] - (
                 ctg_weight * g *
                 self.cost_to_go_pred(
-                    z_front, h_front, bvec, frac_mask=fm_root
+                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
                 )
             )
 
@@ -406,7 +415,7 @@ class BnBWorldModel(nn.Module):
 
         if size_weight != 0.0:
             size_root = self.subtree_size_pred(
-                z_front, h_front, bvec, frac_mask=fm_root
+                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
             )
             total_score = total_score - size_weight * size_root.sum()
 
@@ -414,7 +423,7 @@ class BnBWorldModel(nn.Module):
         if depth == 1:
             if use_reward_return:
                 leaf_value = self.value_pred(
-                    z_front, h_front, bvec, frac_mask=fm_root
+                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
                 )
                 total_score = total_score + g * leaf_value.sum()
             return total_score
@@ -454,17 +463,13 @@ class BnBWorldModel(nn.Module):
                         frontier_masks[terminal]
                         if frontier_masks is not None else None
                     )
-                    # bvec is graph-local and therefore identical for every
-                    # single-graph frontier element.
+                    N_term = z_term.size(0)
+                    h_term_flat = h_term.reshape(N_term * V, -1)
+                    bvec_term = torch.arange(N_term, device=device).repeat_interleave(V)
+                    fm_term_flat = masks_term.reshape(-1) if masks_term is not None else None
                     terminal_score = self.value_pred(
-                        z_term, h_term,
-                        bvec.expand(z_term.size(0), -1).reshape(-1),
-                        frac_mask=masks_term.reshape(-1)
-                        if masks_term is not None else None,
+                        z_term, h_term_flat, bvec_term, frac_mask=fm_term_flat,
                     )
-                    # The value head's batching contract may require a graph
-                    # index vector rather than a [B,V] mask. For the single
-                    # graph frontier, use a flattened representation.
                     total_score = total_score + (
                         continuation_discount * terminal_score.sum()
                     )
@@ -556,28 +561,21 @@ class BnBWorldModel(nn.Module):
                 z_child_in, a_child_in, h_child_in, tok_child_in, d
             )
 
+            N_step = z_next.size(0)
+            h_next_flat = h_next.reshape(N_step * V, -1)
+            bvec_step = torch.arange(N_step, device=device).repeat_interleave(V)
+            fm_step_flat = fm_child.reshape(-1) if fm_child is not None else None
+
             if use_reward_return:
                 step_score = self.dynamics_reward_pred(z_next)
             else:
-                if fm_child is None:
-                    step_score = self.value_pred(
-                        z_next, h_next,
-                        bvec.expand(z_next.size(0), -1).reshape(-1),
-                        frac_mask=None,
-                    )
-                else:
-                    step_score = self.value_pred(
-                        z_next, h_next,
-                        bvec.expand(z_next.size(0), -1).reshape(-1),
-                        frac_mask=fm_child.reshape(-1),
-                    )
+                step_score = self.value_pred(
+                    z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
+                )
 
             if ctg_weight != 0.0:
                 ctg = self.cost_to_go_pred(
-                    z_next, h_next,
-                    bvec.expand(z_next.size(0), -1).reshape(-1),
-                    frac_mask=fm_child.reshape(-1)
-                    if fm_child is not None else None,
+                    z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
                 )
                 step_score = step_score - ctg_weight * ctg
 
@@ -602,18 +600,13 @@ class BnBWorldModel(nn.Module):
         # For reward-return mode, the final frontier gets a single value
         # bootstrap, matching sum(rewards) + gamma^k V(leaf).
         if use_reward_return and frontier_z.size(0) > 0:
-            if frontier_masks is None:
-                leaf_value = self.value_pred(
-                    frontier_z, frontier_h,
-                    bvec.expand(frontier_z.size(0), -1).reshape(-1),
-                    frac_mask=None,
-                )
-            else:
-                leaf_value = self.value_pred(
-                    frontier_z, frontier_h,
-                    bvec.expand(frontier_z.size(0), -1).reshape(-1),
-                    frac_mask=frontier_masks.reshape(-1),
-                )
+            N_leaf = frontier_z.size(0)
+            h_leaf_flat = frontier_h.reshape(N_leaf * V, -1)
+            bvec_leaf = torch.arange(N_leaf, device=device).repeat_interleave(V)
+            fm_leaf_flat = frontier_masks.reshape(-1) if frontier_masks is not None else None
+            leaf_value = self.value_pred(
+                frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat,
+            )
             total_score = total_score + continuation_discount * leaf_value.sum()
 
         return total_score
