@@ -441,9 +441,15 @@ class BnBWorldModel(nn.Module):
         frontier_masks = child_masks
 
         # Continuation contribution is discounted by gamma once per transition.
-        continuation_discount = gamma
+        # Initialise to 1.0 so that the multiply at the top of each iteration
+        # gives gamma^level, keeping leaf-bootstrap discount consistent with
+        # the recursive branch() which uses the same g for rewards and the
+        # value bootstrap at the terminal depth.
+        continuation_discount = 1.0
 
         for level in range(1, depth):
+            continuation_discount *= gamma
+
             F = frontier_z.size(0)
 
             # Determine which frontier elements can actually expand.
@@ -594,8 +600,6 @@ class BnBWorldModel(nn.Module):
             frontier_h = h_next
             frontier_tok = tok_next
             frontier_masks = fm_child
-
-            continuation_discount *= gamma
 
         # For reward-return mode, the final frontier gets a single value
         # bootstrap, matching sum(rewards) + gamma^k V(leaf).
