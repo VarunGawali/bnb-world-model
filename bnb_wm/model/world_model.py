@@ -220,6 +220,45 @@ class BnBWorldModel(nn.Module):
         """Predict raw logit for P(next node is leaf)."""
         return self.integrality(z, depth, n_frac)
 
+    def multi_head_pred(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        batch_vec: torch.Tensor,
+        frac_mask: torch.Tensor | None = None,
+        value: bool = True,
+        subtree_size: bool = False,
+        cost_to_go: bool = False,
+    ) -> dict:
+        """Evaluate multiple heads over z in one pass by sharing frac_mean.
+
+        frac_mean = scatter_mean(h_vars[frac_mask], batch_vec) is computed once
+        and reused for every requested head — eliminates redundant scatter ops
+        when two or more enriched heads are needed for the same z.
+
+        Args:
+            z          : [B, H]
+            h_vars     : [B*V, H] (flat)
+            batch_vec  : [B*V]
+            frac_mask  : [B*V] bool or None
+            value      : include ValueHead output
+            subtree_size: include SubtreeSizeHead output
+            cost_to_go : include CostToGoHead output
+
+        Returns:
+            dict with requested keys: 'value', 'subtree_size', 'cost_to_go'
+            Each value is a [B] tensor.
+        """
+        fm = compute_frac_mean(z, h_vars, batch_vec, frac_mask)
+        out = {}
+        if value:
+            out["value"]       = self.value(z, h_vars, batch_vec, frac_mask, fm)
+        if subtree_size:
+            out["subtree_size"] = self.subtree_size(z, h_vars, batch_vec, frac_mask, fm)
+        if cost_to_go:
+            out["cost_to_go"]  = self.cost_to_go(z, h_vars, batch_vec, frac_mask, fm)
+        return out
+
     def cut_scores(
         self,
         cut_embeds: torch.Tensor,
@@ -1040,20 +1079,21 @@ class BnBWorldModel(nn.Module):
 
             leaf_score = frontier_z.new_zeros(N_leaf)
 
+            need_v = use_reward_return or (value_weight != 0.0 and not use_reward_return)
+            need_s = size_weight != 0.0 and not use_reward_return
+            need_c = ctg_weight  != 0.0 and not use_reward_return
+            heads = self.multi_head_pred(
+                frontier_z, h_leaf_flat, bvec_leaf,
+                frac_mask=fm_leaf_flat,
+                value=need_v, subtree_size=need_s, cost_to_go=need_c,
+            )
+
             if use_reward_return:
-                leaf_score = leaf_score + self.value_pred(
-                    frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat
-                )
-
-            if size_weight != 0.0 and not use_reward_return:
-                leaf_score = leaf_score - size_weight * self.subtree_size_pred(
-                    frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat
-                )
-
-            if ctg_weight != 0.0 and not use_reward_return:
-                leaf_score = leaf_score - ctg_weight * self.cost_to_go_pred(
-                    frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat
-                )
+                leaf_score = leaf_score + heads["value"]
+            if need_s:
+                leaf_score = leaf_score - size_weight * heads["subtree_size"]
+            if need_c:
+                leaf_score = leaf_score - ctg_weight  * heads["cost_to_go"]
 
             per_cand.scatter_add_(
                 0, frontier_cand_id,
@@ -1135,11 +1175,13 @@ class BnBWorldModel(nn.Module):
         C = cut_embeds.size(0) if cut_embeds is not None and cut_embeds.numel() > 0 else 0
         bvec_single = torch.zeros(h_vars.size(0), dtype=torch.long, device=device)
 
-        # NO-CUT baseline: score the current state without any cuts.
+        # NO-CUT baseline: score the current state — V and S computed together.
         with torch.no_grad():
-            baseline_score = self.value_pred(
-                z, h_vars, bvec_single, frac_mask=frac_mask
-            ).item()
+            _bl = self.multi_head_pred(
+                z, h_vars, bvec_single, frac_mask=frac_mask,
+                value=True, subtree_size=True,
+            )
+            baseline_score = (_bl["value"] - _bl["subtree_size"]).item()
 
         # No cuts available → skip to branch rollout immediately.
         if C == 0 or cut_rounds == 0:
@@ -1224,7 +1266,13 @@ class BnBWorldModel(nn.Module):
                     bvec_c = torch.arange(C, device=device).repeat_interleave(h_vars.size(0))
                     fm_c   = (frac_mask.unsqueeze(0).expand(C, -1).reshape(-1)
                               if frac_mask is not None else None)
-                    scores_c = self.value_pred(z_next, h_next_flat, bvec_c, frac_mask=fm_c)
+                    # Compute V and S together — frac_mean computed once, shared.
+                    heads_c = self.multi_head_pred(
+                        z_next, h_next_flat, bvec_c, frac_mask=fm_c,
+                        value=True, subtree_size=True,
+                    )
+                    # Score: V - size_weight * S  (same formula as branch rollout leaf)
+                    scores_c = heads_c["value"] - heads_c["subtree_size"]
 
                     for ci in range(C):
                         candidates.append((
