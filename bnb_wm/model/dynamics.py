@@ -397,7 +397,10 @@ class DynamicsTransformer(nn.Module):
                 new_caches.append(new_kv)
 
         feat = self.out_norm(x)
-        return self._decode(feat, z_in), feat, new_caches
+        # Training forward: z_in is [B,T,H] matching feat — decode all timesteps.
+        # Inference (step): z_in is [B,H] while feat is [B,T,H] — use last token only.
+        feat_for_decode = feat if feat.shape == z_in.shape else feat[..., -1, :]
+        return self._decode(feat_for_decode, z_in), feat, new_caches
 
     # ------------------------------------------------------------------
     # Parallel training forward
@@ -486,7 +489,8 @@ class DynamicsTransformer(nn.Module):
                 torch.tensor([T_full - 1], device=z_t.device)
             ).view(*([1] * (token.dim() - 2)), 1, self.hidden_dim)
             x = token + pos_new
-            _, feat, new_kv_caches = self._decode_sequence(x, z_t, kv_caches=kv_caches)
+            _, feat_kv, new_kv_caches = self._decode_sequence(x, z_t, kv_caches=kv_caches)
+            feat = feat_kv[..., -1, :]   # extract last (only) token
         else:
             pos = self.pos_emb(
                 torch.arange(T_full, device=z_t.device)
