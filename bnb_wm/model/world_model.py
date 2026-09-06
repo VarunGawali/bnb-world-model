@@ -939,6 +939,184 @@ class BnBWorldModel(nn.Module):
         return per_cand
 
     # ------------------------------------------------------------------
+    # Cut-branch beam search via latent dynamics
+    # ------------------------------------------------------------------
+    def rollout_cut_branch_beam(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        cut_embeds: torch.Tensor,
+        cand_indices: torch.Tensor,
+        frac_mask: torch.Tensor | None = None,
+        past_tokens: torch.Tensor | None = None,
+        cut_beam: int = 3,
+        cut_rounds: int = 2,
+        entropy_thresh: float = 0.0,
+        pre_filter_k: int = 0,
+        **branch_kwargs,
+    ) -> tuple:
+        """Evaluate cut candidates in latent space, then branch from the best state.
+
+        Two-phase unified rollout: cut steps and branch steps share the same
+        past_tokens buffer, so the dynamics Transformer sees
+        [cut_tok, cut_tok, branch_tok, ...] as one causal sequence. Branch
+        predictions are conditioned on the cuts that preceded them.
+
+        Phase A — cut beam search (no LP re-solve):
+          For each round in cut_rounds, expand each beam state with every cut
+          candidate, simulate via Dynamics(z, cut_embed, d=0.0), score with
+          ValueHead, prune to top cut_beam states. The cut token is appended
+          to past_tokens so subsequent dynamics steps see the full history.
+
+        Phase B — branch rollout from best post-cut state:
+          Call rollout_top_k_batched from z_best with tok_best as context.
+          The branch dynamics now "knows" which cuts preceded it.
+
+        Args:
+            z            : [1, H]   current node latent state
+            h_vars       : [V, H]   variable embeddings (fixed, from GNN encode)
+            cut_embeds   : [C, H]   GNN-structured cut embeddings
+                                    (= Σ coeff_j * h_vars[j] per cut, from cg_cuts)
+            cand_indices : [K]      branch candidate variable indices (LongTensor)
+            frac_mask    : [V] bool fractional variable mask; stays fixed during
+                                    latent rollout (no LP re-solve in this phase)
+            past_tokens  : [1,T,H] or None — token history up to this node
+            cut_beam     : number of beam states kept after each cut round
+            cut_rounds   : number of interleaved cut simulation steps
+            entropy_thresh: stop cut rounds early when policy entropy (nats) over
+                            fractional vars drops below this — policy is confident
+            pre_filter_k : cheap linear pre-filter before Dynamics; keep top
+                           pre_filter_k cuts by value_pred(z + cut_embed_proj).
+                           0 = disabled (use all C candidates directly).
+            **branch_kwargs: forwarded to rollout_top_k_batched (depth, gamma, …)
+
+        Returns:
+            cut_indices  : list[int] — indices into cut_embeds of the chosen cuts
+                           (one per committed round; empty = NO-CUT baseline won)
+            branch_scores: FloatTensor [K] — per-candidate branch scores from
+                           rollout_top_k_batched at the best post-cut state
+            z_best       : [1, H]   best post-cut latent state
+            tok_best     : [1, T', H] updated token buffer (includes cut tokens)
+        """
+        if z.dim() != 2 or z.size(0) != 1:
+            raise ValueError("z must be [1, H]")
+        if h_vars.dim() != 2:
+            raise ValueError("h_vars must be [V, H]")
+
+        device = z.device
+        H = z.size(1)
+        C = cut_embeds.size(0) if cut_embeds is not None and cut_embeds.numel() > 0 else 0
+        bvec_single = torch.zeros(h_vars.size(0), dtype=torch.long, device=device)
+
+        # NO-CUT baseline: score the current state without any cuts.
+        with torch.no_grad():
+            baseline_score = self.value_pred(
+                z, h_vars, bvec_single, frac_mask=frac_mask
+            ).item()
+
+        # No cuts available → skip to branch rollout immediately.
+        if C == 0 or cut_rounds == 0:
+            branch_scores = self.rollout_top_k_batched(
+                z, h_vars, cand_indices, past_tokens=past_tokens,
+                **branch_kwargs,
+            )
+            return [], branch_scores, z, past_tokens
+
+        # ----------------------------------------------------------------
+        # Optional cheap pre-filter: rank cuts by value_pred(z + cut_embed)
+        # without a full Dynamics forward pass — linear approximation of
+        # the value change. Keeps only pre_filter_k cuts for Dynamics.
+        # ----------------------------------------------------------------
+        if pre_filter_k > 0 and C > pre_filter_k:
+            with torch.no_grad():
+                # Linear approx: shift z by a small fraction of cut_embed direction
+                z_approx = z + 0.1 * cut_embeds           # [C, H] broadcast
+                # score each shifted z; h_vars/bvec replicated for C pseudo-graphs
+                h_rep = h_vars.unsqueeze(0).expand(C, -1, -1).reshape(C * h_vars.size(0), H)
+                bvec_rep = torch.arange(C, device=device).repeat_interleave(h_vars.size(0))
+                fm_rep = (frac_mask.unsqueeze(0).expand(C, -1).reshape(-1)
+                          if frac_mask is not None else None)
+                approx_scores = self.value_pred(z_approx, h_rep, bvec_rep, frac_mask=fm_rep)
+                _, top_pre = approx_scores.topk(min(pre_filter_k, C))
+            cut_embeds = cut_embeds[top_pre]
+            C = cut_embeds.size(0)
+
+        # ----------------------------------------------------------------
+        # Phase A: cut beam search in latent space.
+        # Each beam state = (z [1,H], past_tokens [1,T,H], score float,
+        #                    cut_idx_list list[int])
+        # ----------------------------------------------------------------
+        beams = [(z, past_tokens, baseline_score, [])]   # start: NO-CUT state
+        best_cut_indices = []                             # indices of chosen cuts
+
+        with torch.no_grad():
+            for _round in range(cut_rounds):
+                # Early stop: check policy entropy on the current best beam state
+                if entropy_thresh > 0.0 and frac_mask is not None and frac_mask.any():
+                    z_cur, _, _, _ = beams[0]
+                    logits = self.policy_scores(h_vars, z_cur, bvec_single)
+                    probs  = torch.softmax(logits[frac_mask], dim=0)
+                    H_pi   = float(-(probs * (probs + 1e-12).log()).sum())
+                    if H_pi < entropy_thresh:
+                        break   # policy confident enough — stop cutting
+
+                candidates = []   # (z', tok', score, cut_indices_so_far)
+                for z_s, tok_s, _score_s, idx_list in beams:
+                    # Expand: simulate each cut from this beam state
+                    z_exp  = z_s.expand(C, -1)        # [C, H]
+                    h_exp  = h_vars.unsqueeze(0).expand(C, -1, -1)  # [C, V, H]
+                    tok_exp = (tok_s.expand(C, -1, -1)
+                               if tok_s is not None else None)
+                    d_cut  = torch.zeros(C, dtype=z.dtype, device=device)  # d=0 for cuts
+
+                    z_next, h_next, tok_next = self.dynamics_step_full_batched(
+                        z_exp, cut_embeds, h_exp, tok_exp, d_cut
+                    )   # z_next [C,H], tok_next [C,T+1,H]
+
+                    # Score each post-cut state with ValueHead
+                    h_next_flat = h_next.reshape(C * h_vars.size(0), H)
+                    bvec_c = torch.arange(C, device=device).repeat_interleave(h_vars.size(0))
+                    fm_c   = (frac_mask.unsqueeze(0).expand(C, -1).reshape(-1)
+                              if frac_mask is not None else None)
+                    scores_c = self.value_pred(z_next, h_next_flat, bvec_c, frac_mask=fm_c)
+
+                    for ci in range(C):
+                        candidates.append((
+                            z_next[ci:ci+1],             # [1, H]
+                            tok_next[ci:ci+1],           # [1, T+1, H]
+                            float(scores_c[ci].item()),
+                            idx_list + [ci],
+                        ))
+
+                # Also keep NO-CUT continuation (don't discard baseline beam)
+                candidates.extend(beams)
+
+                # Prune to top cut_beam states by value score (higher = better)
+                candidates.sort(key=lambda x: -x[2])
+                beams = candidates[:cut_beam]
+
+            # Best beam after all rounds
+            z_best, tok_best, best_score, best_cut_indices = beams[0]
+
+            # If the best state is the NO-CUT baseline, return empty cut list.
+            if best_score <= baseline_score + 1e-6 and not best_cut_indices:
+                z_best, tok_best = z, past_tokens
+                best_cut_indices = []
+
+        # ----------------------------------------------------------------
+        # Phase B: branch rollout from z_best, conditioned on cut tokens.
+        # The causal Transformer sees [cut_tok, ..., branch_tok, ...] as
+        # one unified sequence — cuts condition all branch predictions.
+        # ----------------------------------------------------------------
+        branch_scores = self.rollout_top_k_batched(
+            z_best, h_vars, cand_indices,
+            past_tokens=tok_best,
+            **branch_kwargs,
+        )
+
+        return best_cut_indices, branch_scores, z_best, tok_best
+
+    # ------------------------------------------------------------------
     # Real latent rollout for candidate selection
     # ------------------------------------------------------------------
     def rollout_candidate(

@@ -82,6 +82,11 @@ solver:
   cut_entropy_thresh: 0.5        # internal nodes (depth 1-cut_depth_max)
   cut_ctg_thresh: 30.0           # internal nodes: require larger remaining subtree
   cut_budget_cap: 10
+  # Latent cut-branch beam search (cut_mode: latent).
+  # cut_beam:   beam width for cut candidate evaluation via Dynamics
+  # cut_rounds: number of interleaved cut simulation steps per node
+  cut_beam: 3
+  cut_rounds: 2
   lookahead_k: 3             # candidates evaluated with dynamics lookahead
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
