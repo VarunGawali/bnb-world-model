@@ -168,7 +168,8 @@ def run_pipeline(data_dir):
         sc = make_sequence_collate(include_vars=True)
         def sl(fl):
             ds = SequenceDataset(fl, model, device, include_vars=True,
-                                 max_vars_recon=8)
+                                 max_vars_recon=8,
+                                 allow_visitation_fallback=True)
             return DataLoader(ds, batch_size=4, shuffle=True, collate_fn=sc)
         trainer.train_dynamics(sl(tr), sl(va), epochs=1, overshoot_depth=3)
     stage("Phase 3 dynamics (+overshoot)", phase3)

@@ -814,9 +814,8 @@ class Trainer:
                     var_mask, bvec = _var_mask_and_batch(pyg_batch)
                     frac_mask      = _frac_mask_from_features(pyg_batch.x[var_mask])
 
-                    # Broadcast z to each variable for Pointer Network
-                    z_per_var = z[pyg_batch.batch[var_mask]]
-                    scores    = self.model.policy(h_vars, z_per_var)
+                    var_batch_idx = pyg_batch.batch[var_mask]
+                    scores        = self.model.policy_scores(h_vars, z, var_batch_idx)
 
                     # Policy loss (and collect expert-chosen var embeddings)
                     p_losses, top1 = [], 0
@@ -857,7 +856,7 @@ class Trainer:
                     # on its own distribution, removing the OOD gap it would
                     # otherwise face during the latent rollout at inference.
                     a_chosen = h_vars[torch.tensor(chosen_idx, device=self.device)]
-                    z_pred1, _ = self.model.dynamics_step(z, a_chosen)
+                    z_pred1, _, _kv = self.model.dynamics_step(z, a_chosen)
                     bvec_g   = torch.zeros(z.size(0), dtype=torch.long, device=self.device)
                     v_on_pred = self.model.value_pred(z_pred1, z_pred1, bvec_g, None)
                     v_consist = F.mse_loss(v_on_pred, v_pred_real.detach())

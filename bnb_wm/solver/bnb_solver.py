@@ -836,7 +836,7 @@ class BnBSolver:
 
         # Add variables
         h.addVars(n, var_lb.tolist(), var_ub.tolist())
-        h.changeColsCostByRange(0, n - 1, c.tolist())
+        h.changeColsCost(n, np.arange(n, dtype=np.int32), c.astype(np.float64))
 
         # Add constraints: A_all x >= b_all  →  b_all <= A_all x <= +inf
         inf = self._highs.kHighsInf
