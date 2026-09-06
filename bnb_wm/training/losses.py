@@ -1,11 +1,12 @@
 """
 losses.py — Loss functions for each training phase.
 
-Phase 1 — policy_loss_masked   : cross-entropy over candidate action set
-Phase 2 — value_loss           : Huber loss on normalised dual bound
-Phase 3 — dynamics_loss        : MSE + cosine on latent transitions
-Phase 4 — integrality_loss     : weighted BCE on leaf prediction
-Phase 5 — cutting_plane_loss   : weighted BCE on cut selection
+Phase 1 — policy_loss_masked      : cross-entropy over candidate action set
+Phase 1 — policy_loss_soft        : soft/ranking KL blend using full SB scores
+Phase 2 — value_loss              : Huber loss on normalised dual bound
+Phase 3 — dynamics_loss           : masked MSE + masked cosine on latent transitions
+Phase 3 — candidate_ranking_loss  : listwise ranking over imagined next states
+Phase 4 — integrality_loss        : weighted BCE on leaf prediction
 """
 
 import torch
@@ -93,28 +94,105 @@ def value_loss(v_pred, target):
     """
     Huber loss for dual-bound regression.
 
+    delta=0.1 keeps robustness meaningful when targets are normalised to [0,1]
+    — with delta=1.0 all residuals fall in the quadratic region and Huber
+    degenerates to MSE.
+
     Args:
         v_pred : [batch] predicted normalised dual bounds
         target : [batch] true normalised dual bounds
     """
-    return F.huber_loss(v_pred.squeeze(), target.squeeze(), delta=1.0)
+    return F.huber_loss(v_pred.squeeze(-1), target.squeeze(-1), delta=0.1)
 
 
-def dynamics_loss(z_pred, z_target):
+def dynamics_loss(z_pred, z_target, step_mask=None):
     """
-    MSE + cosine loss for latent transition prediction.
+    Masked MSE + masked cosine loss for latent transition prediction.
+
+    Both terms are masked so padding timesteps (zero vectors) do not dilute
+    gradient signal. Without masking, padded zero rows contribute 0 to MSE
+    numerator while inflating the denominator, and contribute cos=0 → term=1.0
+    to the cosine mean — the maximum possible cosine penalty on every pad step.
 
     Args:
-        z_pred   : [B, T, H] or [batch, H]  predicted next latent state
-        z_target : same shape                true next latent state
+        z_pred    : [B, T, H] or [batch, H]  predicted next latent state
+        z_target  : same shape                true next latent state
+        step_mask : [B, T] bool or None — True where the timestep is real
+                    (non-padding). If None, all positions are treated as real.
+
+    Returns:
+        scalar loss
     """
-    mse = F.mse_loss(z_pred, z_target)
-    cos = 1.0 - F.cosine_similarity(
-        z_pred.reshape(-1, z_pred.size(-1)),
-        z_target.reshape(-1, z_target.size(-1)),
-        dim=-1,
-    ).mean()
+    H = z_pred.size(-1)
+    flat_pred   = z_pred.reshape(-1, H)
+    flat_target = z_target.reshape(-1, H)
+
+    if step_mask is not None:
+        m = step_mask.reshape(-1).float()          # [B*T]
+        n = m.sum().clamp_min(1.0)
+        # Masked MSE: sum over valid positions, normalise by valid count * H
+        mse = ((flat_pred - flat_target) ** 2 * m.unsqueeze(-1)).sum() / (n * H)
+        # Masked cosine: average cos-distance over valid positions only
+        cos_per = 1.0 - F.cosine_similarity(flat_pred, flat_target, dim=-1)  # [B*T]
+        cos = (cos_per * m).sum() / n
+    else:
+        mse = F.mse_loss(flat_pred, flat_target)
+        cos = (1.0 - F.cosine_similarity(flat_pred, flat_target, dim=-1)).mean()
+
     return mse + 0.1 * cos
+
+
+def candidate_ranking_loss(
+    z_imagined: torch.Tensor,
+    sb_scores: torch.Tensor,
+    temp: float = 1.0,
+) -> torch.Tensor:
+    """Listwise ranking loss on imagined next latent states.
+
+    This is the missing objective for counterfactual planning. The dynamics
+    model is trained on expert-only trajectories (one action per state), so the
+    cheapest MSE solution is to ignore the action and predict from position
+    alone — exactly what action-sensitivity measurements confirm.
+
+    This loss directly supervises the *ordering* that rollout_top_k_batched
+    produces: given k candidates with SB scores, the dynamics rolls each one
+    step, a downstream head decodes a scalar quality estimate from each
+    resulting latent, and we train that ordering to match the SB ordering via
+    a listwise softmax cross-entropy.
+
+    The caller is responsible for running the dynamics step and decoding a
+    per-candidate scalar (e.g. negative predicted subtree size, or value head
+    output). This function only computes the ranking loss given those scalars.
+
+    Args:
+        z_imagined : [k] float — decoded scalar for each candidate's next
+                     latent state (higher = better candidate predicted)
+        sb_scores  : [k] float — SB quality scores, same order as z_imagined
+                     (higher = SB thinks this candidate is better)
+        temp       : temperature for the soft SB target (default 1.0)
+
+    Returns:
+        scalar loss — listwise KL(SB_dist || imagined_dist)
+
+    Usage in trainer:
+        # For one node with k candidates:
+        z_next_preds = [dynamics.step(z, a_cand[i], ...) for i in range(k)]
+        scalars = value_head(torch.stack(z_next_preds))   # [k]
+        loss = candidate_ranking_loss(scalars, sb_scores_for_node)
+    """
+    if z_imagined.size(0) < 2:
+        return z_imagined.new_zeros(())
+
+    sb = sb_scores.float()
+    if not torch.isfinite(sb).all():
+        return z_imagined.new_zeros(())
+
+    # Standardise SB scores per node (magnitudes vary wildly across nodes)
+    sb = (sb - sb.mean()) / (sb.std() + 1e-6)
+    tgt = F.softmax(sb / max(temp, 1e-3), dim=0)                    # [k]
+    logp = F.log_softmax(z_imagined.float(), dim=0)                 # [k]
+    # KL(SB_dist || imagined_dist): train imagined ordering → SB ordering
+    return F.kl_div(logp, tgt, reduction="sum")
 
 
 def var_reconstruction_loss(h_pred, h_target, var_mask=None):
@@ -170,7 +248,7 @@ def subtree_size_loss(pred_log_size, target_size):
         target_size   : [batch]  true subtree node counts (raw, >= 1)
     """
     target_log = torch.log1p(target_size.clamp_min(0.0))
-    return F.huber_loss(pred_log_size.squeeze(), target_log.squeeze(), delta=1.0)
+    return F.huber_loss(pred_log_size.squeeze(-1), target_log.squeeze(-1), delta=1.0)
 
 
 def cost_to_go_loss(pred_log_ctg, target_steps):
@@ -188,7 +266,7 @@ def cost_to_go_loss(pred_log_ctg, target_steps):
         target_steps : [batch]  true remaining node counts (n_steps - t, >= 0)
     """
     target_log = torch.log1p(target_steps.clamp_min(0.0))
-    return F.huber_loss(pred_log_ctg.squeeze(), target_log.squeeze(), delta=1.0)
+    return F.huber_loss(pred_log_ctg.squeeze(-1), target_log.squeeze(-1), delta=1.0)
 
 
 def integrality_loss(logit, target, pos_weight):
@@ -209,17 +287,14 @@ def cutting_plane_loss(scores, labels, pos_weight=None):
     """
     Weighted BCE for cut selection imitation.
 
-    Labels are 1 if a cut was selected by the expert solver (SCIP) and
-    meaningfully improved the LP bound, 0 otherwise. pos_weight corrects
-    for imbalance (most candidate cuts are not useful).
+    Retained for backward compatibility with any existing scripts that import
+    it. Phase 5 is now a no-op (ZeroShotCutScorer has no trainable parameters),
+    so this function is no longer called by the trainer.
 
     Args:
-        scores     : [n_cuts]  raw logits from CuttingPlaneHead
+        scores     : [n_cuts]  raw logits
         labels     : [n_cuts]  binary labels (1 = good cut)
         pos_weight : scalar tensor or None — n_neg / n_pos
-
-    Returns:
-        loss : scalar tensor
     """
     return F.binary_cross_entropy_with_logits(
         scores.reshape(-1), labels.float().reshape(-1), pos_weight=pos_weight

@@ -22,6 +22,7 @@ from .losses import (
     value_loss as _value_loss,
     integrality_loss,
     dynamics_loss as _dynamics_loss,
+    candidate_ranking_loss as _cand_rank_loss,
     var_reconstruction_loss as _var_recon_loss,
     subtree_size_loss as _subtree_size_loss,
     cost_to_go_loss as _cost_to_go_loss,
@@ -347,8 +348,13 @@ class Trainer:
     # Phase 3 — Dynamics
     # ------------------------------------------------------------------
     def _transition_loss(self, z_pred, z_next, logvar, tmask):
-        """Base one-step transition loss: masked MSE, or Gaussian NLL when the
-        model is heteroscedastic (logvar given)."""
+        """Base one-step transition loss: masked MSE+cosine, or Gaussian NLL.
+
+        When tmask is given, both the MSE and cosine terms are restricted to
+        real (non-padding) timesteps. Previously only MSE was masked here while
+        cosine was dropped entirely in the masked path — padding zeros contributed
+        cos=0 → penalty=1.0 (maximum) per pad step, diluting valid gradients.
+        """
         if logvar is not None:
             logvar = logvar.clamp(-8.0, 8.0)     # numerical stability
             per = 0.5 * (torch.exp(-logvar) * (z_pred - z_next) ** 2 + logvar)
@@ -356,11 +362,8 @@ class Trainer:
                 return per.mean()
             m = tmask.unsqueeze(-1).float()
             return (per * m).sum() / (m.sum().clamp_min(1.0) * z_pred.size(-1))
-        if tmask is None:
-            return _dynamics_loss(z_pred, z_next)
-        m = tmask.unsqueeze(-1).float()
-        return ((z_pred - z_next) ** 2 * m).sum() / \
-            (m.sum().clamp_min(1.0) * z_pred.size(-1))
+        # _dynamics_loss now accepts step_mask and masks both MSE and cosine.
+        return _dynamics_loss(z_pred, z_next, step_mask=tmask)
 
     def _overshoot_and_ground(self, z_seq, a_seq, d_seq, z_next_seq, tmask,
                               bound_tgt):
@@ -593,10 +596,59 @@ class Trainer:
                 loss = loss + 0.5 * (per * tmask.float()).sum() / \
                     tmask.float().sum().clamp_min(1.0)
 
+        # Candidate ranking loss — the missing counterfactual objective.
+        #
+        # The dynamics is trained on expert-only trajectories: one action per
+        # state. The minimum-MSE solution is to ignore the action and predict
+        # from position alone. candidate_ranking_loss directly supervises the
+        # *ordering* that rollout_top_k_batched uses: roll each of K candidates
+        # one step, decode value, train the induced ordering to match SB scores.
+        #
+        # Activated when the batch carries "cand_actions_seq" [B, T, K, H] and
+        # "cand_sb_scores_seq" [B, T, K] — pre-computed by the DAgger collector
+        # from sb_scores, which it already writes. Only DAgger files have these;
+        # the loss simply skips on base trajectories.
+        if d.get("cand_actions_seq") is not None and \
+                d.get("cand_sb_scores_seq") is not None:
+            cand_a  = d["cand_actions_seq"].to(self.device)    # [B, T, K, H]
+            cand_sb = d["cand_sb_scores_seq"].to(self.device)  # [B, T, K]
+            B, T, K, H = cand_a.shape
+            rank_losses = []
+            for b in range(B):
+                for t in range(T):
+                    if tmask is not None and not tmask[b, t]:
+                        continue
+                    z_t = z_seq[b, t]                          # [H]
+                    d_t = d_seq[b, t] if d_seq is not None else None
+                    candidates = cand_a[b, t]                  # [K, H]
+                    sb_k = cand_sb[b, t]                       # [K]
+                    if not torch.isfinite(sb_k).all() or K < 2:
+                        continue
+                    # Step each candidate through dynamics, decode value.
+                    z_nexts = []
+                    for k in range(K):
+                        z_k, _, _ = self.model.dynamics.step(
+                            z_t.unsqueeze(0), candidates[k].unsqueeze(0),
+                            d_t.unsqueeze(0) if d_t is not None else None,
+                        )
+                        z_nexts.append(z_k.squeeze(0))
+                    z_nexts_stacked = torch.stack(z_nexts, dim=0)   # [K, H]
+                    # Decode scalar per candidate (negative value = better)
+                    scalars = self.model.value(
+                        z_nexts_stacked,
+                        z_nexts_stacked,            # h_vars placeholder
+                        torch.zeros(K, dtype=torch.long, device=self.device),
+                    )                                               # [K]
+                    rank_losses.append(_cand_rank_loss(scalars, sb_k))
+            if rank_losses:
+                cand_rank_w = getattr(self, "cand_rank_weight", 0.5)
+                loss = loss + cand_rank_w * torch.stack(rank_losses).mean()
+
         return loss
 
     def train_dynamics(self, train_loader, val_loader, epochs, lr=5e-4,
-                       overshoot_depth=0, patience=None):
+                       overshoot_depth=0, patience=None,
+                       cand_rank_weight: float = 0.5):
         """
         Train DynamicsTransformer on pre-computed trajectory sequences.
 
@@ -618,6 +670,7 @@ class Trainer:
             (z_seq, a_seq, z_next_seq, hv_seq, hv_next_seq, var_mask)
         """
         self.overshoot_depth = overshoot_depth
+        self.cand_rank_weight = cand_rank_weight
         # Train the dynamics transformer AND its two prediction heads. dyn_bound
         # (Gap 2) and dyn_reward (Fix 3) are top-level modules whose parameter
         # names do NOT contain "dynamics", so they must be named explicitly or

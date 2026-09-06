@@ -25,6 +25,7 @@ training:
   epochs_phase3: 60     # dynamics Transformer — the world-model core; needs more
                         # (cheap: encode-once cache, only epoch 1 pays encoding)
   overshoot_depth: 3    # Phase 3 latent-overshooting horizon (0 = one-step only)
+  cand_rank_weight: 0.5 # Phase 3 candidate-ranking loss weight (0 = disabled)
   epochs_phase4: 25     # joint fine-tuning
   epochs_phase5: 20     # cut selection head
   patience: 6           # early-stop after this many epochs without val improvement
