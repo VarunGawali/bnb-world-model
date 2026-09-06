@@ -29,7 +29,36 @@ from .heads import (
     PolicyHead, ValueHead, IntegralityHead, CuttingPlaneHead, SubtreeSizeHead,
     CostToGoHead,
 )
-from .dynamics import DynamicsTransformer
+from .dynamics import DynamicsTransformer, _VarDynamics
+
+
+def migrate_var_dynamics_checkpoint(ckpt_path: str, out_path: str | None = None) -> dict:
+    """Rewrite a legacy _VarDynamics checkpoint to the decomposed-projection format.
+
+    Old format: dynamics.var_dynamics.net.{0,3}.{weight,bias}
+    New format: dynamics.var_dynamics.{W_h,W_z,W_a,out}.{weight,bias}
+
+    Args:
+        ckpt_path : path to the old .pt checkpoint (dict with key "model")
+        out_path  : if given, torch.save() the migrated checkpoint there
+
+    Returns:
+        migrated state_dict (model key already updated)
+    """
+    import torch
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = ckpt["model"]
+
+    # Infer hidden_dim from the norm layer (always present)
+    H = sd["dynamics.var_dynamics.norm.weight"].shape[0]
+    _, new_sd = _VarDynamics.from_legacy_state(sd, H)
+    ckpt["model"] = new_sd
+
+    if out_path is not None:
+        torch.save(ckpt, out_path)
+        print(f"Migrated checkpoint saved to {out_path}")
+
+    return ckpt
 
 
 class BnBWorldModel(nn.Module):

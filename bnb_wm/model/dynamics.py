@@ -133,7 +133,7 @@ class _FFN(nn.Module):
 
 class _VarDynamics(nn.Module):
     """
-    Per-variable latent transition head.
+    Per-variable latent transition head — decomposed first layer.
 
     Supports arbitrary leading batch dimensions.
 
@@ -141,18 +141,40 @@ class _VarDynamics(nn.Module):
         z_next: [..., H]
         a:      [..., H]
 
-    The shared MLP therefore works unchanged for both the original single
-    graph rollout and a batched rollout frontier.
+    The original formulation expanded z_next and a to [..., V, H] and
+    concatenated them with h_vars before the MLP, running the first
+    Linear(3H → 2H) V times even though 2/3 of its input was identical
+    across variables. For V = 100k, H = 128 this wastes ≈200k redundant
+    matmuls per dynamics step.
+
+    Fix: split the first Linear(3H → 2H) into three H → 2H projections,
+    exploiting linearity:
+        W @ [h, z, a] = W_h(h) + W_z(z) + W_a(a)
+
+    W_z(z) and W_a(a) are computed once (O(H²)), then broadcast-added to
+    the per-variable W_h(h) result (O(V·H²)).  Total first-layer cost drops
+    from O(V·3H²) to O(V·H² + 2H²) ≈ O(V·H²) with a 3× coefficient saving.
+
+    The second Linear(2H → H) is unavoidable (output is per-variable) but is
+    applied to h_vars.size(0)*H² flops regardless of formulation.
+
+    Checkpoint migration:
+        Old:  dynamics.var_dynamics.net.{0,3}.{weight,bias}
+        New:  dynamics.var_dynamics.{W_h,W_z,W_a,out}.{weight,bias}
+        Use _VarDynamics.from_legacy_state(old_sd, hidden_dim) to convert.
     """
 
     def __init__(self, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(3 * hidden_dim, 2 * hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(2 * hidden_dim, hidden_dim),
-        )
+        H2 = 2 * hidden_dim
+        # Per-variable projection (bias lives here)
+        self.W_h = nn.Linear(hidden_dim, H2, bias=True)
+        # Shared projections (no bias — bias is absorbed into W_h)
+        self.W_z = nn.Linear(hidden_dim, H2, bias=False)
+        self.W_a = nn.Linear(hidden_dim, H2, bias=False)
+        self.act  = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.out  = nn.Linear(H2, hidden_dim, bias=True)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(
@@ -161,10 +183,50 @@ class _VarDynamics(nn.Module):
         z_next: torch.Tensor,   # [..., H]
         a: torch.Tensor,        # [..., H]
     ) -> torch.Tensor:
-        z_b = z_next.unsqueeze(-2).expand_as(h_vars)
-        a_b = a.unsqueeze(-2).expand_as(h_vars)
-        delta = self.net(torch.cat([h_vars, z_b, a_b], dim=-1))
+        # Shared contributions: computed once, O(H²) per batch element.
+        shared = self.W_z(z_next) + self.W_a(a)              # [..., H2]
+        # Per-variable first hidden: broadcast-add shared to W_h output.
+        hidden = self.act(
+            self.W_h(h_vars) + shared.unsqueeze(-2)           # [..., V, H2]
+        )
+        delta = self.out(self.drop(hidden))                    # [..., V, H]
         return self.norm(h_vars + delta)
+
+    @classmethod
+    def from_legacy_state(
+        cls, legacy_sd: dict, hidden_dim: int, dropout: float = 0.1
+    ) -> "tuple[_VarDynamics, dict]":
+        """Construct a new _VarDynamics and migrate old net.{0,3} weights.
+
+        Args:
+            legacy_sd  : full model state_dict from an old checkpoint
+            hidden_dim : hidden dimension used by the model
+            dropout    : dropout rate
+
+        Returns:
+            (module, new_sd) where new_sd is legacy_sd with the
+            var_dynamics keys rewritten to the new format.
+        """
+        import copy
+        sd = copy.copy(legacy_sd)
+        pfx = "dynamics.var_dynamics."
+
+        old_w0 = sd.pop(pfx + "net.0.weight")   # [2H, 3H]
+        old_b0 = sd.pop(pfx + "net.0.bias")     # [2H]
+        old_w3 = sd.pop(pfx + "net.3.weight")   # [H, 2H]
+        old_b3 = sd.pop(pfx + "net.3.bias")     # [H]
+
+        H = hidden_dim
+        sd[pfx + "W_h.weight"] = old_w0[:, :H].contiguous()
+        sd[pfx + "W_h.bias"]   = old_b0
+        sd[pfx + "W_z.weight"] = old_w0[:, H:2*H].contiguous()
+        sd[pfx + "W_a.weight"] = old_w0[:, 2*H:].contiguous()
+        sd[pfx + "out.weight"] = old_w3
+        sd[pfx + "out.bias"]   = old_b3
+        # norm keys (norm.weight / norm.bias) are unchanged
+
+        mod = cls(hidden_dim, dropout)
+        return mod, sd
 
 
 class DynamicsTransformer(nn.Module):
