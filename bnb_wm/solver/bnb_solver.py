@@ -28,6 +28,7 @@ Constraint format assumed:
 
 import time
 import heapq
+import random
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -65,6 +66,9 @@ class Node:
     warm_basis: Optional[tuple] = None
     # ΔLP from the last cut round applied at this node's parent (0 = no prior cut)
     last_cut_gain: float = 0.0
+    # ORS significance score and incumbent at push time (for pre-LP-solve pruning)
+    significance_score: float = 1.0   # 1.0 = not flagged; low = ORS-flagged
+    ub_at_push: float = float("inf")  # global_ub when this node was pushed
 
     def __lt__(self, other):
         # Max-heap by priority (higher priority = processed first)
@@ -185,6 +189,10 @@ class BnBSolver:
         katz_weight: float = 1.0,   # additive weight for log1p(katz) in policy logits
         katz_alpha: float = 0.1,    # path-length decay (safe for row-normalised A)
         katz_n_iters: int = 5,      # power-iteration steps
+        # ORS (Optimized Relativity Search) pre-LP-solve pruning
+        ors_sig_thresh: float = -0.5,   # significance below this → flagged
+        ors_p_explore: float = 0.05,    # probability of processing a flagged node anyway
+        ors_ub_tol: float = 0.02,       # re-evaluate flag if ub improved by > this fraction
     ):
         self.model               = model
         self.device              = device
@@ -245,6 +253,9 @@ class BnBSolver:
         self.katz_weight             = katz_weight
         self.katz_alpha              = katz_alpha
         self.katz_n_iters            = katz_n_iters
+        self.ors_sig_thresh          = ors_sig_thresh
+        self.ors_p_explore           = ors_p_explore
+        self.ors_ub_tol              = ors_ub_tol
         self._cuts_added         = 0                   # per-solve cut counter
         # Latent fidelity diagnostic: track ‖z' - z''‖ / ‖z''‖ across cut commits.
         # z' = dynamics prediction; z'' = GNN re-encode after physical cut commit.
@@ -367,6 +378,18 @@ class BnBSolver:
             # Bound pruning
             if node.lb >= global_ub - 1e-6:
                 continue
+
+            # ORS pre-LP-solve gate: skip flagged low-significance nodes.
+            # A node is flagged when its push-time significance score (V - 0.5*S)
+            # is below ors_sig_thresh.  At pop time we skip the LP solve unless:
+            #   (a) the incumbent tightened since push (new info → re-evaluate), or
+            #   (b) random exploration fires (ors_p_explore probability, ~5%).
+            # Saves ~LP-solve cost per skipped node — the dominant 89% bottleneck.
+            if node.significance_score < self.ors_sig_thresh:
+                ub_tightened = (node.ub_at_push < float("inf")
+                                and global_ub < node.ub_at_push * (1.0 - self.ors_ub_tol))
+                if not ub_tightened and random.random() > self.ors_p_explore:
+                    continue   # skip: low significance, bound unchanged, no exploration roll
 
             # Solve node LP (warmstart from parent basis)
             lp_obj, x_lp, dual, feasible, node_basis = self._solve_lp(
@@ -697,6 +720,14 @@ class BnBSolver:
                     if tier1 or tier2:
                         continue   # prune: don't push to heap
 
+                # ORS significance score: V(z_child) - 0.5*S(z_child).
+                # Positive = looks promising (good LP quality, small subtree).
+                # Negative = flagged as low-significance; may be skipped at pop
+                # without LP solve if the incumbent hasn't tightened since push.
+                ors_sig = 1.0
+                if s_child is not None and v_child is not None:
+                    ors_sig = float(v_child - 0.5 * s_child)
+
                 child = Node(
                     lb=lp_obj,
                     depth=node.depth + 1,
@@ -708,6 +739,8 @@ class BnBSolver:
                     warm_basis=node_basis,   # child warmstarts from current node's basis
                     past_tokens=child_tokens,
                     last_cut_gain=cut_gain,  # ΔLP stopping rule for child's cut gate
+                    significance_score=ors_sig,
+                    ub_at_push=global_ub,
                 )
                 heapq.heappush(heap, child)
 

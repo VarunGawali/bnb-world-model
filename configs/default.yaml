@@ -145,6 +145,17 @@ solver:
   katz_weight: 1.0
   katz_alpha: 0.1
   katz_n_iters: 5
+  # ORS (Optimized Relativity Search) pre-LP-solve pruning.
+  # Flags nodes at push time using significance = V(z_child) - 0.5*S(z_child).
+  # At pop time, flagged nodes skip the LP solve unless:
+  #   (a) the incumbent tightened by > ors_ub_tol since push (re-evaluate), or
+  #   (b) random exploration fires (ors_p_explore probability).
+  # ors_sig_thresh: flag threshold; more negative = more aggressive reduction.
+  # ors_p_explore: exploration rate to avoid systematically missing optimal paths.
+  # ors_ub_tol: fractional ub improvement that triggers re-evaluation (0.02 = 2%).
+  ors_sig_thresh: -0.5
+  ors_p_explore: 0.05
+  ors_ub_tol: 0.02
   # Dive bonus: add leaf_prob_child * dive_bonus to child priority.
   # 0.0 = disabled. ~0.5 gives meaningful incumbent-finding bias without
   # overriding the primary node selection signal.
