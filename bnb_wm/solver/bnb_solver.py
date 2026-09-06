@@ -1266,12 +1266,18 @@ class BnBSolver:
             self._cuts_added += len(selected)
             return selected
 
-        # learned: score the valid candidates with the CuttingPlaneHead.
-        feat_np = self._cut_features(candidates, x_lp, c)
-        feat_t  = torch.tensor(feat_np, dtype=torch.float32, device=self.device)
+        # learned: score using ZeroShotCutScorer (GNN-native cut embeddings).
+        # Compute GNN-native cut embeddings and violations for each candidate.
+        embed_list, viol_list = [], []
+        for cut in candidates:
+            lhs_t = torch.tensor(cut.lhs, dtype=torch.float32, device=self.device)
+            embed_list.append((lhs_t @ h_vars))  # [H]
+            viol_list.append(max(0.0, float(cut.rhs - float(cut.lhs @ x_lp))))
+        cut_embeds = torch.stack(embed_list)   # [C, H]
+        violations = torch.tensor(viol_list, dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
-            scores = self.model.cut_scores(feat_t, z.squeeze(0))
+            scores = self.model.cut_scores(cut_embeds, z, violations)
             probs  = torch.sigmoid(scores).cpu().numpy()
 
         selected = []

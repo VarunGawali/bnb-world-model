@@ -25,7 +25,6 @@ from .losses import (
     var_reconstruction_loss as _var_recon_loss,
     subtree_size_loss as _subtree_size_loss,
     cost_to_go_loss as _cost_to_go_loss,
-    cutting_plane_loss,
 )
 import json
 from .checkpoint import save_checkpoint, load_weights_only
@@ -916,7 +915,10 @@ class Trainer:
         """Pairwise cosine repulsion among the top-k scored cuts.
 
         Penalises near-parallel cut directions so the selected pool covers
-        diverse constraint directions. No new parameters — uses cut_feats directly.
+        diverse constraint directions. Operates on cut_embeds [C, H] — the
+        GNN-native H-dim embeddings (Σ coeff_j * h_vars[j]) rather than the
+        6-dim feature vectors, so the diversity signal lives in the same space
+        as the cosine similarity score itself.
 
         L_div = weight * mean(ReLU(|cos(c_i, c_j)| - margin)) over pairs i<j
         """
@@ -926,143 +928,26 @@ class Trainer:
             return torch.tensor(0.0, device=cut_feats.device, requires_grad=True)
         k = min(top_k, cut_feats.size(0))
         _, top_idx = scores.detach().topk(k)
-        selected = cut_feats[top_idx]                            # [k, 6]
-        normed = F.normalize(selected, dim=-1)                   # [k, 6]
+        selected = cut_feats[top_idx]                            # [k, H]
+        normed = F.normalize(selected, dim=-1)                   # [k, H]
         sim = normed @ normed.T                                  # [k, k]
         # upper triangle, exclude diagonal
         mask = torch.triu(torch.ones(k, k, dtype=torch.bool, device=sim.device), diagonal=1)
         repulsion = torch.relu(sim.abs()[mask] - margin)
         return weight * repulsion.mean()
 
-    def train_cuts(self, train_loader, val_loader, epochs, lr=5e-4,
+    def train_cuts(self, train_loader=None, val_loader=None, epochs=0, lr=5e-4,
                    pos_weight=None, patience=None, div_weight: float = 0.1):
+        """Phase 5 is a no-op: ZeroShotCutScorer has no trainable parameters.
+
+        Cut scoring is done entirely via cosine similarity between GNN-native
+        cut embeddings (Σ coeff_j * h_vars[j]) and the graph embedding z,
+        plus a violation bonus. No parameters → no training required.
+
+        The diversity repulsion penalty (_cut_diversity_loss) runs at solve
+        time inside rollout_cut_branch_beam to prune near-parallel cuts from
+        the beam — it is not a training objective.
         """
-        Train CuttingPlaneHead to imitate SCIP's cut selection.
-
-        Encoder is frozen; only CuttingPlaneHead parameters are updated.
-
-        Loader yields (pyg_batch, metas) where each meta contains:
-            cut_features : Tensor [n_cuts, 6]   per-cut feature vectors
-            cut_labels   : Tensor [n_cuts]       1 = cut selected by SCIP
-                                                  and improved LP bound
-
-        After training, all parameters are unfrozen for Phase 4 joint
-        fine-tuning if it has not already been run.
-        """
-        for name, p in self.model.named_parameters():
-            p.requires_grad = "cutting_planes" in name
-
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
-        print(f"Trainable params (Phase 5): {sum(p.numel() for p in trainable):,}")
-
-        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs, eta_min=1e-5
-        )
-        pw = pos_weight.to(self.device) if pos_weight is not None else None
-        best_val_loss = float("inf")
-        no_improve = 0
-
-        for epoch in range(1, epochs + 1):
-            self.model.train()
-            total_loss = n = 0
-
-            for batch in tqdm(
-                train_loader, desc=f"Cuts Train Epoch {epoch}", leave=False
-            ):
-                pyg_batch, metas = batch
-                pyg_batch = pyg_batch.to(self.device)
-
-                optimizer.zero_grad(set_to_none=True)
-
-                try:
-                    with autocast("cuda", enabled=self.amp):
-                        _, z = self.model.encode(pyg_batch)
-
-                        cut_losses = []
-                        for b_idx, meta in enumerate(metas):
-                            cut_feats  = meta["cut_features"].to(self.device)   # [n_cuts, 6]
-                            cut_labels = meta["cut_labels"].to(self.device)     # [n_cuts]
-                            if cut_feats.size(0) == 0:
-                                continue
-                            scores = self.model.cut_scores(cut_feats, z[b_idx])
-                            l_cls = cutting_plane_loss(scores, cut_labels, pw)
-                            l_div = self._cut_diversity_loss(
-                                cut_feats, scores, weight=div_weight,
-                            )
-                            cut_losses.append(l_cls + l_div)
-
-                        if not cut_losses:
-                            continue
-                        loss = torch.stack(cut_losses).mean()
-
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-                    self.scaler.step(optimizer)
-                    self.scaler.update()
-
-                    total_loss += loss.item()
-                    n += 1
-                except RuntimeError as e:
-                    if _is_oom(e):
-                        _recover_oom(optimizer)
-                        continue
-                    raise
-
-            # Validation
-            self.model.eval()
-            val_loss_sum = val_n = 0
-            with torch.no_grad():
-                for batch in tqdm(val_loader, desc="Cuts Val", leave=False):
-                    pyg_batch, metas = batch
-                    pyg_batch = pyg_batch.to(self.device)
-                    _, z = self.model.encode(pyg_batch)
-                    for b_idx, meta in enumerate(metas):
-                        cut_feats  = meta["cut_features"].to(self.device)
-                        cut_labels = meta["cut_labels"].to(self.device)
-                        if cut_feats.size(0) == 0:
-                            continue
-                        scores = self.model.cut_scores(cut_feats, z[b_idx])
-                        val_loss_sum += cutting_plane_loss(
-                            scores, cut_labels, pw
-                        ).item()
-                        val_n += 1
-
-            train_loss = total_loss / max(n, 1)
-            val_loss   = val_loss_sum / max(val_n, 1)
-            scheduler.step()
-
-            self.history["p5_train_loss"].append(train_loss)
-            self.history["p5_val_loss"].append(val_loss)
-
-            print(
-                f"[Phase5] Epoch {epoch:02d} | "
-                f"TrainLoss={train_loss:.4f} | ValLoss={val_loss:.4f}"
-            )
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                no_improve = 0
-                # P0.8: mark the cut head as trained so the saved checkpoint (and
-                # any solver loading it) knows cut_mode=learned is now valid.
-                if hasattr(self.model, "cut_head_trained"):
-                    self.model.cut_head_trained.fill_(True)
-                save_checkpoint(
-                    self.model, optimizer, epoch,
-                    {"val_loss": val_loss},
-                    self.ckpt_dir / "phase5_best.pt",
-                )
-                print("  Saved best Phase 5 model")
-            else:
-                no_improve += 1
-                if patience and no_improve >= patience:
-                    print(f"  Early stop at epoch {epoch} "
-                          f"(no val improvement for {patience} epochs)")
-                    break
-
-        save_checkpoint(
-            self.model, optimizer, epochs, {}, self.ckpt_dir / "phase5_final.pt"
-        )
+        print("[Phase 5] ZeroShotCutScorer requires no training — skipping.")
         for p in self.model.parameters():
             p.requires_grad = True

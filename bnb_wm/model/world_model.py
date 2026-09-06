@@ -26,8 +26,8 @@ import torch
 import torch.nn as nn
 from .encoder import BipartiteGNN
 from .heads import (
-    PolicyHead, ValueHead, IntegralityHead, CuttingPlaneHead, SubtreeSizeHead,
-    CostToGoHead,
+    PolicyHead, ValueHead, IntegralityHead, ZeroShotCutScorer, SubtreeSizeHead,
+    CostToGoHead, compute_frac_mean,
 )
 from .dynamics import DynamicsTransformer, _VarDynamics
 
@@ -86,12 +86,10 @@ class BnBWorldModel(nn.Module):
         self.subtree_size = SubtreeSizeHead(hidden_dim)
         self.cost_to_go = CostToGoHead(hidden_dim)
         self.integrality = IntegralityHead(hidden_dim)
-        self.cutting_planes = CuttingPlaneHead(hidden_dim, cut_feat_dim)
-
-        # P0.8: persisted flag — set True only when Phase 5 (cut selection) has
-        # trained this head. Saved/restored with the state_dict so the solver can
-        # refuse `cut_mode=learned` on a model whose cut head is untrained.
-        self.register_buffer("cut_head_trained", torch.tensor(False))
+        # ZeroShotCutScorer: no parameters, no Phase 5 training required.
+        # Scores CG cuts by cosine alignment between their GNN-native embedding
+        # (Σ coeff_j·h_vars[j]) and the current node latent z.
+        self.cut_scorer = ZeroShotCutScorer(violation_weight=1.0)
 
         self.dynamics = DynamicsTransformer(
             hidden_dim=hidden_dim, n_layers=n_dyn_layers,
@@ -112,13 +110,13 @@ class BnBWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def forward(self, batch):
         edge_attr = getattr(batch, "edge_attr", None)
-        h_vars, z = self.encoder(
+        h_vars, z, _h_cons = self.encoder(
             batch.x, batch.edge_index, batch.node_type, batch.batch,
             edge_attr=edge_attr,
         )
         var_mask = batch.node_type == 0
-        z_per_var = z[batch.batch[var_mask]]
-        scores = self.policy(h_vars, z_per_var)
+        var_batch = batch.batch[var_mask]
+        scores = self.policy(h_vars, z, var_batch)
         return scores, z
 
     # ------------------------------------------------------------------
@@ -162,8 +160,22 @@ class BnBWorldModel(nn.Module):
         z: torch.Tensor,
         var_batch: torch.Tensor,
     ) -> torch.Tensor:
-        """Score variable nodes for branching."""
-        return self.policy(h_vars, z[var_batch])
+        """Score variable nodes for branching.
+
+        z : [B, H]  — graph-level embeddings, one per graph in the batch.
+        var_batch : [V] — batch index for each variable node.
+        """
+        return self.policy(h_vars, z, var_batch)
+
+    def frac_mean(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        batch_vec: torch.Tensor,
+        frac_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Compute fractional-variable mean embedding once; pass to value/size/ctg heads."""
+        return compute_frac_mean(z, h_vars, batch_vec, frac_mask)
 
     def value_pred(
         self,
@@ -171,9 +183,10 @@ class BnBWorldModel(nn.Module):
         h_vars: torch.Tensor,
         batch_vec: torch.Tensor,
         frac_mask: torch.Tensor | None = None,
+        precomputed_frac_mean: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict normalised dual bound."""
-        return self.value(z, h_vars, batch_vec, frac_mask)
+        return self.value(z, h_vars, batch_vec, frac_mask, precomputed_frac_mean)
 
     def subtree_size_pred(
         self,
@@ -181,9 +194,10 @@ class BnBWorldModel(nn.Module):
         h_vars: torch.Tensor,
         batch_vec: torch.Tensor,
         frac_mask: torch.Tensor | None = None,
+        precomputed_frac_mean: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict log1p(subtree node count) rooted at the current node."""
-        return self.subtree_size(z, h_vars, batch_vec, frac_mask)
+        return self.subtree_size(z, h_vars, batch_vec, frac_mask, precomputed_frac_mean)
 
     def cost_to_go_pred(
         self,
@@ -191,9 +205,10 @@ class BnBWorldModel(nn.Module):
         h_vars: torch.Tensor,
         batch_vec: torch.Tensor,
         frac_mask: torch.Tensor | None = None,
+        precomputed_frac_mean: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict log1p(remaining B&B nodes) — the cost-to-go value."""
-        return self.cost_to_go(z, h_vars, batch_vec, frac_mask)
+        return self.cost_to_go(z, h_vars, batch_vec, frac_mask, precomputed_frac_mean)
 
     def integrality_logit(
         self,
@@ -206,11 +221,21 @@ class BnBWorldModel(nn.Module):
 
     def cut_scores(
         self,
-        cut_feats: torch.Tensor,
+        cut_embeds: torch.Tensor,
         z: torch.Tensor,
+        violations: torch.Tensor,
     ) -> torch.Tensor:
-        """Score candidate cuts for branch-and-cut selection."""
-        return self.cutting_planes(cut_feats, z)
+        """Score CG cuts by cosine alignment with z + violation bonus.
+
+        Args:
+            cut_embeds : [C, H]  GNN-native cut embeddings from cg_cuts.py
+            z          : [H] or [1, H]  current node latent
+            violations : [C]  LP violation amounts
+
+        Returns:
+            scores : [C]  (higher = more desirable cut)
+        """
+        return self.cut_scorer(cut_embeds, z, violations)
 
     # ------------------------------------------------------------------
     # Dynamics helpers
@@ -327,10 +352,12 @@ class BnBWorldModel(nn.Module):
             Callers should filter terminal/no-candidate nodes before invoking.
         """
         B, V, H = h_vars.shape
-        z_per_var = z.unsqueeze(1).expand(-1, V, -1)
+        # var_batch: [B*V] — variable i in graph b maps to index b
+        var_batch = torch.arange(B, device=z.device).repeat_interleave(V)
         scores = self.policy(
             h_vars.reshape(B * V, H),
-            z_per_var.reshape(B * V, H),
+            z,           # [B, H] — projected once per graph, not per variable
+            var_batch,   # [B*V] index into z
         ).reshape(B, V)
 
         if masks is not None:
