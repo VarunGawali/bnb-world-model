@@ -86,6 +86,27 @@ class CrossAttentionPool(nn.Module):
 
         return z
 
+    def forward_attn(
+        self,
+        h_vars: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return per-variable attention weights using an existing z as query.
+
+        Unlike forward() which uses the learnable self.query, this uses z
+        directly so the attention reflects the *current* latent state after
+        cut steps in the dynamics model.
+
+        Args:
+            h_vars : [V, H]  variable embeddings (fixed from GNN encode)
+            z      : [1, H]  current latent state (may be post-cut z')
+        Returns:
+            attn   : [V]     softmax attention weights (sum to 1)
+        """
+        keys   = self.W_k(h_vars)                                 # [V, H]
+        logits = (keys * z).sum(dim=-1) * self.scale              # [V]
+        return torch.softmax(logits, dim=0)                       # [V]
+
 
 class BipartiteGNN(nn.Module):
     """

@@ -1007,11 +1007,13 @@ class BnBSolver:
         # Root node: skip entropy gate (noisy at root) but keep CTG guard so we
         # don't waste an LP re-solve on instances the model predicts as trivial
         # (e.g. already-integral or single-node solves).
+        frac_t = torch.tensor(frac_mask_np, dtype=torch.bool, device=self.device)
+
         if node.depth == 0 and self.force_root_cuts:
             with torch.no_grad():
                 bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
                 scores = self.model.policy_scores(h_vars, z, bvec)
-                ctg    = self.model.cost_to_go_pred(z, h_vars, bvec, frac_mask=None).item()
+                ctg    = self.model.cost_to_go_pred(z, h_vars, bvec, frac_mask=frac_t).item()
             if ctg < self.cut_ctg_thresh_root:
                 return False, scores
             return True, scores
@@ -1020,7 +1022,6 @@ class BnBSolver:
             bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
             scores = self.model.policy_scores(h_vars, z, bvec)
 
-            frac_t  = torch.tensor(frac_mask_np, dtype=torch.bool, device=self.device)
             probs   = torch.softmax(scores[frac_t], dim=0)
             entropy = float(-(probs * torch.log(probs + 1e-12)).sum())
 
@@ -1029,7 +1030,7 @@ class BnBSolver:
                 return False, scores
 
             cth = self.cut_ctg_thresh_root if node.depth == 0 else self.cut_ctg_thresh
-            ctg = self.model.cost_to_go_pred(z, h_vars, bvec, frac_mask=None).item()
+            ctg = self.model.cost_to_go_pred(z, h_vars, bvec, frac_mask=frac_t).item()
             if ctg < cth:
                 return False, scores
 
