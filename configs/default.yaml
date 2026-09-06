@@ -135,6 +135,16 @@ solver:
   neural_prune_s_thresh: 4.0    # log1p subtree size threshold (~53 nodes); tier2=16.0
   neural_prune_v_thresh: 0.15   # value head threshold (LP quality poor)
   neural_prune_margin: 0.15     # prune when lp_obj within 15% of global_ub (tier 1)
+  # Katz centrality blend into policy logits.
+  # Adds LP-structure-aware variable importance: variables are up-weighted when
+  # fractional AND coupled to many other fractional variables through shared
+  # constraints (infinite-depth paths, α^k decay). Complements the GNN's
+  # 3-hop implicit centrality with zero additional parameters.
+  # katz_weight: 0.0 disables. 1.0 is a mild additive blend (log1p bounded).
+  # katz_alpha: < 1/σ_max(A^T A); row-normalised A makes 0.1 universally safe.
+  katz_weight: 1.0
+  katz_alpha: 0.1
+  katz_n_iters: 5
   # Dive bonus: add leaf_prob_child * dive_bonus to child priority.
   # 0.0 = disabled. ~0.5 gives meaningful incumbent-finding bias without
   # overriding the primary node selection signal.

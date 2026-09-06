@@ -93,6 +93,34 @@ class SolveResult:
 # Solver
 # ---------------------------------------------------------------------------
 
+def _katz_frac_scores(
+    A: np.ndarray,
+    x_lp: np.ndarray,
+    alpha: float = 0.1,
+    n_iters: int = 5,
+) -> np.ndarray:
+    """Fractionality-weighted Katz centrality on the LP bipartite graph.
+
+    A variable is important if it is fractional AND structurally coupled to
+    other fractional variables through shared constraints (and those through
+    further shared constraints), with α^k decay for paths of length k.
+
+    The power iteration c = α A^T A c + frac converges when α < 1/σ_max(A^T A).
+    Row-normalising A before the iteration makes α=0.1 safe for all densities.
+
+    Complements the GNN's 3-hop implicit centrality with infinite-depth
+    LP-structure-aware importance at O(nnz * n_iters) cost (~sub-ms).
+    """
+    frac = np.minimum(x_lp, 1.0 - x_lp).astype(np.float32)   # [n], in [0, 0.5]
+    row_norms = np.linalg.norm(A, axis=1, keepdims=True) + 1e-8
+    A_norm = (A / row_norms).astype(np.float32)
+    c = frac.copy()
+    for _ in range(n_iters):
+        c = alpha * (A_norm.T @ (A_norm @ c)) + frac
+    c_max = c.max()
+    return (c / c_max) if c_max > 1e-8 else c
+
+
 class BnBSolver:
     """
     Neural-guided Branch-and-Cut solver.
@@ -153,6 +181,10 @@ class BnBSolver:
         cut_min_nfrac: int = 3,                # skip cuts when very few fractional vars
         cut_min_gain: float = 1e-4,            # ΔLP stopping rule: skip if last gain tiny
         cut_subtree_thresh: float = 1.0,       # S(z) gate: skip cuts on tiny subtrees
+        # Katz centrality blend into policy logits
+        katz_weight: float = 1.0,   # additive weight for log1p(katz) in policy logits
+        katz_alpha: float = 0.1,    # path-length decay (safe for row-normalised A)
+        katz_n_iters: int = 5,      # power-iteration steps
     ):
         self.model               = model
         self.device              = device
@@ -210,6 +242,9 @@ class BnBSolver:
         self.cut_min_nfrac           = cut_min_nfrac
         self.cut_min_gain            = cut_min_gain
         self.cut_subtree_thresh      = cut_subtree_thresh
+        self.katz_weight             = katz_weight
+        self.katz_alpha              = katz_alpha
+        self.katz_n_iters            = katz_n_iters
         self._cuts_added         = 0                   # per-solve cut counter
         # Latent fidelity diagnostic: track ‖z' - z''‖ / ‖z''‖ across cut commits.
         # z' = dynamics prediction; z'' = GNN re-encode after physical cut commit.
@@ -422,6 +457,18 @@ class BnBSolver:
             # eliminating O(policy_head) redundant forward passes per node.
             with torch.no_grad():
                 node_policy_logits = self.model.policy_scores(h_vars, z, bvec_br)
+
+            # Katz centrality blend: augment policy logits with LP-structure-aware
+            # variable importance.  High-Katz variables are fractional AND tightly
+            # coupled to other fractional variables through many shared constraints —
+            # branching on them propagates more than the GNN's 3-hop view captures.
+            # log1p keeps the additive term bounded; katz_weight scales the influence.
+            if self.katz_weight > 0.0 and n_frac > 0:
+                katz_np = _katz_frac_scores(
+                    A, x_lp, alpha=self.katz_alpha, n_iters=self.katz_n_iters
+                )
+                katz_t = torch.tensor(katz_np, dtype=torch.float32, device=self.device)
+                node_policy_logits = node_policy_logits + self.katz_weight * torch.log1p(katz_t)
 
             if self.cut_mode == "latent" and self._should_cut(
                     z, h_vars, frac_mask_np, n_frac, frac_t, bvec_br,
