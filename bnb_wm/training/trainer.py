@@ -648,7 +648,8 @@ class Trainer:
 
     def train_dynamics(self, train_loader, val_loader, epochs, lr=5e-4,
                        overshoot_depth=0, patience=None,
-                       cand_rank_weight: float = 0.5):
+                       cand_rank_weight: float = 0.5,
+                       also_train: tuple[str, ...] = ()):
         """
         Train DynamicsTransformer on pre-computed trajectory sequences.
 
@@ -675,13 +676,15 @@ class Trainer:
         # (Gap 2) and dyn_reward (Fix 3) are top-level modules whose parameter
         # names do NOT contain "dynamics", so they must be named explicitly or
         # they would stay frozen and never learn.
+        _always = {"dynamics", "dyn_bound", "dyn_reward"}
+        _extra  = set(also_train)
+        _all_prefixes = _always | _extra
         for name, p in self.model.named_parameters():
-            p.requires_grad = (
-                "dynamics" in name or "dyn_bound" in name or "dyn_reward" in name
-            )
+            p.requires_grad = any(tok in name for tok in _all_prefixes)
 
         trainable = [p for p in self.model.parameters() if p.requires_grad]
-        print(f"Trainable params (Phase 3): {sum(p.numel() for p in trainable):,}"
+        extra_str = f" + {sorted(_extra)}" if _extra else ""
+        print(f"Trainable params (Phase 3{extra_str}): {sum(p.numel() for p in trainable):,}"
               f" | overshoot_depth={overshoot_depth}")
 
         optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)

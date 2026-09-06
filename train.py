@@ -103,6 +103,12 @@ def main():
                     help="load cut fields and enable Phase 5")
     ap.add_argument("--max_files", type=int, default=None,
                     help="cap number of trajectory files (fast experiments)")
+    ap.add_argument("--phase3_also_train", default="",
+                    help="comma-separated module name-prefixes to unfreeze in Phase 3 "
+                         "alongside dynamics/dyn_bound/dyn_reward. "
+                         "e.g. 'encoder' to do end-to-end dynamics, "
+                         "'encoder,policy,value' to also fine-tune those heads. "
+                         "Empty (default) = frozen encoder, dynamics only.")
     ap.add_argument("--num_workers", type=int, default=0,
                     help="DataLoader workers for the transition loaders "
                          "(parallel data loading; Phase 3 always uses 0). "
@@ -289,6 +295,9 @@ def main():
             return DataLoader(ds, batch_size=seq_bs, shuffle=shuffle,
                               collate_fn=seq_collate, num_workers=0)
 
+        also_train = tuple(
+            s.strip() for s in args.phase3_also_train.split(",") if s.strip()
+        )
         trainer.train_dynamics(
             sequence_loader(tr_files, True),
             sequence_loader(va_files, False),
@@ -297,6 +306,7 @@ def main():
             # Phase 3 gets its own (larger) patience so the overshoot curriculum
             # isn't misread as a plateau; falls back to the global patience.
             patience=tcfg.get("patience_phase3", patience),
+            also_train=also_train,
         )
         reload_best(model, ckpt_dir, 3, device)
 
