@@ -306,6 +306,9 @@ class BnBSolver:
                 A, b, c, x_lp, dual, node.var_lb, node.var_ub,
                 node.inherited_cuts,
             )
+            # Pooled constraint summary for dynamics injection [1, H].
+            # MeanPool is cheap; zero-init proj inside dynamics is a no-op until trained.
+            h_cons_summary = h_cons.mean(0, keepdim=True)  # [1, H]
 
             # IntegralityHead: detect near-leaf — skip cut generation
             frac_vals = np.abs(x_lp - np.round(x_lp))
@@ -481,7 +484,8 @@ class BnBSolver:
                     # so the child sees the full cut+branch history.
                     a_emb = h_vars[branch_var].unsqueeze(0)
                     z_child, h_child, child_tokens = self.model.dynamics_step_full(
-                        z_branch, a_emb, h_vars, tok_branch, direction
+                        z_branch, a_emb, h_vars, tok_branch, direction,
+                        h_cons_summary=h_cons_summary,
                     )
                     # P1.6/P1.1: both selection modes score the PREDICTED child
                     # state (z_child/h_child), which differs per child via the

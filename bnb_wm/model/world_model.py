@@ -201,9 +201,15 @@ class BnBWorldModel(nn.Module):
         a_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
         d_t: torch.Tensor | float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Single-step inference with token buffer."""
-        return self.dynamics.step(z_t, a_t, past_tokens, d_t)
+        h_cons_summary: torch.Tensor | None = None,
+        kv_caches: list | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, list | None]:
+        """Single-step inference with token buffer.
+
+        Returns (z_next, tokens, kv_caches).
+        Pass kv_caches from a previous step to use O(1) incremental attention.
+        """
+        return self.dynamics.step(z_t, a_t, past_tokens, d_t, h_cons_summary, kv_caches)
 
     def dynamics_bound_pred(self, z: torch.Tensor) -> torch.Tensor:
         """Predict the normalised dual bound from a predicted latent."""
@@ -220,10 +226,15 @@ class BnBWorldModel(nn.Module):
         h_vars_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
         d_t: torch.Tensor | float | None = None,
+        h_cons_summary: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Single-step latent transition that also predicts next h_vars."""
+        """Single-step latent transition that also predicts next h_vars.
+
+        h_cons_summary: optional [1, H] or [B, H] pooled constraint embedding
+            added to the dynamics token (zero-init projection → no-op at init).
+        """
         return self.dynamics.step_full(
-            z_t, a_t, h_vars_t, past_tokens, d_t
+            z_t, a_t, h_vars_t, past_tokens, d_t, h_cons_summary=h_cons_summary,
         )
 
     def dynamics_step_full_batched(

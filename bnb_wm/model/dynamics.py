@@ -35,7 +35,13 @@ import torch.nn.functional as F
 
 
 class _CausalSelfAttention(nn.Module):
-    """Single causal multi-head self-attention block (pre-norm)."""
+    """Single causal multi-head self-attention block (pre-norm).
+
+    KV-cache mode: when kv_cache is provided it holds (K_past, V_past) tensors
+    for all T_0 history tokens. Only the new token's Q/K/V are projected; K/V
+    are concatenated and the result K_full/V_full are returned for the next step.
+    Attention is then O(1) in new-token compute instead of O(T_0).
+    """
 
     def __init__(self, d_model: int, n_heads: int, max_seq: int, dropout: float = 0.1):
         super().__init__()
@@ -56,25 +62,53 @@ class _CausalSelfAttention(nn.Module):
         )
         self.register_buffer("causal_mask", mask)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x : [B, T, D]
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """
+        Args:
+            x        : [B, T, D] — full sequence (training) or
+                       [B, 1, D] — single new token (kv_cache inference)
+            kv_cache : (K_past [B,H,T_past,head_dim], V_past [B,H,T_past,head_dim])
+                       or None.  When not None, x is expected to be [B,1,D].
+
+        Returns:
+            out      : [B, T, D]
+            new_kv   : updated (K_full, V_full) when kv_cache is not None, else None
+        """
         B, T, D = x.shape
         residual = x
-        x = self.norm(x)
+        x_ln = self.norm(x)
 
-        Q, K, V = self.qkv(x).chunk(3, dim=-1)
+        Q, K, V = self.qkv(x_ln).chunk(3, dim=-1)
 
-        def split(t):
-            return t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        def split(t, seq):
+            return t.view(B, seq, self.n_heads, self.head_dim).transpose(1, 2)
 
-        Q, K, V = split(Q), split(K), split(V)
+        Q = split(Q, T)
+        K = split(K, T)
+        V = split(V, T)
 
-        attn = (Q @ K.transpose(-2, -1)) * self.scale
-        attn = attn + self.causal_mask[:T, :T]
-        attn = self.drop(F.softmax(attn, dim=-1))
+        new_kv = None
+        if kv_cache is not None:
+            K_past, V_past = kv_cache
+            K_full = torch.cat([K_past, K], dim=2)   # [B, H, T_past+1, head_dim]
+            V_full = torch.cat([V_past, V], dim=2)
+            new_kv = (K_full, V_full)
+            # Q is [B, H, 1, head_dim]; attend over full history
+            attn = (Q @ K_full.transpose(-2, -1)) * self.scale
+            # no causal mask needed: new token can attend to all past (causal by construction)
+            attn = self.drop(F.softmax(attn, dim=-1))
+            out = (attn @ V_full).transpose(1, 2).contiguous().view(B, T, D)
+        else:
+            attn = (Q @ K.transpose(-2, -1)) * self.scale
+            attn = attn + self.causal_mask[:T, :T]
+            attn = self.drop(F.softmax(attn, dim=-1))
+            out = (attn @ V).transpose(1, 2).contiguous().view(B, T, D)
 
-        out = (attn @ V).transpose(1, 2).contiguous().view(B, T, D)
-        return residual + self.proj(out)
+        return residual + self.proj(out), new_kv
 
 
 class _FFN(nn.Module):
@@ -93,6 +127,8 @@ class _FFN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.net(self.norm(x))
+
+
 
 
 class _VarDynamics(nn.Module):
@@ -184,6 +220,11 @@ class DynamicsTransformer(nn.Module):
         # Project [z_t || a_t || dir_t] -> d_model.
         self.input_proj = nn.Linear(2 * hidden_dim + 1, hidden_dim)
 
+        # Constraint-summary injection: pooled h_cons → token addend.
+        # Zero-init → identity at load; warm-start safe.
+        self.h_cons_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.h_cons_proj.weight)
+
         # Learned positional embeddings
         self.pos_emb = nn.Embedding(max_seq, hidden_dim)
 
@@ -228,6 +269,7 @@ class DynamicsTransformer(nn.Module):
         z: torch.Tensor,
         a: torch.Tensor,
         d: torch.Tensor | float | None,
+        h_cons_summary: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Build input tokens from latents, actions and direction.
@@ -238,6 +280,8 @@ class DynamicsTransformer(nn.Module):
             z/a: [..., H]
 
         d can be scalar, [...], [..., 1], or None.
+        h_cons_summary: optional [..., H] pooled constraint embedding;
+            added to the token after projection (zero-init projection → no-op at init).
         """
         if d is None:
             d = z.new_zeros(*z.shape[:-1], 1)
@@ -250,7 +294,10 @@ class DynamicsTransformer(nn.Module):
             elif d.dim() == 0:
                 d = d.expand(*z.shape[:-1], 1)
 
-        return self.input_proj(torch.cat([z, a, d], dim=-1))
+        tok = self.input_proj(torch.cat([z, a, d], dim=-1))
+        if h_cons_summary is not None:
+            tok = tok + self.h_cons_proj(h_cons_summary)
+        return tok
 
     def _decode(
         self,
@@ -267,14 +314,28 @@ class DynamicsTransformer(nn.Module):
         self,
         x: torch.Tensor,
         z_in: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run Transformer blocks and decode the final sequence."""
-        for attn, ffn in self.layers:
-            x = attn(x)
+        kv_caches: list | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, list | None]:
+        """Run Transformer blocks and decode the final sequence.
+
+        When kv_caches is provided (list of (K,V) per layer or list of None),
+        each attention layer uses cached K/V and returns an updated cache.
+
+        Returns:
+            z_pred     : decoded next latent
+            feat       : out_norm output (for logvar head, etc.)
+            new_caches : updated per-layer kv caches, or None in training mode
+        """
+        new_caches = [] if kv_caches is not None else None
+        for i, (attn, ffn) in enumerate(self.layers):
+            kvc = kv_caches[i] if kv_caches is not None else None
+            x, new_kv = attn(x, kv_cache=kvc)
             x = ffn(x)
+            if new_caches is not None:
+                new_caches.append(new_kv)
 
         feat = self.out_norm(x)
-        return self._decode(feat, z_in)
+        return self._decode(feat, z_in), feat, new_caches
 
     # ------------------------------------------------------------------
     # Parallel training forward
@@ -308,12 +369,7 @@ class DynamicsTransformer(nn.Module):
         pos = self.pos_emb(torch.arange(T, device=z_seq.device))
         x = tokens + pos
 
-        for attn, ffn in self.layers:
-            x = attn(x)
-            x = ffn(x)
-
-        feat = self.out_norm(x)
-        z_pred = self._decode(feat, z_seq)
+        z_pred, feat, _ = self._decode_sequence(x, z_seq, kv_caches=None)
 
         if return_logvar and self.logvar_proj is not None:
             return z_pred, self.logvar_proj(feat)
@@ -328,18 +384,28 @@ class DynamicsTransformer(nn.Module):
         a_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
         d_t: torch.Tensor | float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h_cons_summary: torch.Tensor | None = None,
+        kv_caches: list | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, list | None]:
         """
         Single-step inference.
 
         z_t/a_t may have arbitrary leading batch dimensions ending in H,
         while past_tokens must be [B, T, H] for the common batched path.
 
+        Args:
+            h_cons_summary: optional [..., H] pooled constraint embedding injected
+                            into the token before the Transformer (zero-init proj).
+            kv_caches     : list of (K_past, V_past) per layer from the previous step,
+                            or None for the first step / full-sequence (training) mode.
+                            When provided, only the new token is processed (O(1) attn).
+
         Returns:
-            z_next
-            new token buffer
+            z_next       : predicted next latent
+            tokens       : updated full token buffer [B, T+1, H] (appended)
+            new_kv_caches: updated per-layer KV caches, or None when kv_caches=None
         """
-        token = self._tokens(z_t, a_t, d_t).unsqueeze(-2)
+        token = self._tokens(z_t, a_t, d_t, h_cons_summary).unsqueeze(-2)  # [..., 1, H]
 
         if past_tokens is None:
             tokens = token
@@ -349,19 +415,26 @@ class DynamicsTransformer(nn.Module):
         if tokens.size(-2) > self.max_seq:
             tokens = tokens[..., -self.max_seq:, :]
 
-        T = tokens.size(-2)
-        pos = self.pos_emb(
-            torch.arange(T, device=z_t.device)
-        ).view(*([1] * (tokens.dim() - 2)), T, self.hidden_dim)
-        x = tokens + pos
+        T_full = tokens.size(-2)
 
-        for attn, ffn in self.layers:
-            x = attn(x)
-            x = ffn(x)
+        if kv_caches is not None:
+            # KV-cache path: new token only, attend over cached past K/V.
+            # pos for the new token = T_full - 1 (its position in the full seq).
+            pos_new = self.pos_emb(
+                torch.tensor([T_full - 1], device=z_t.device)
+            ).view(*([1] * (token.dim() - 2)), 1, self.hidden_dim)
+            x = token + pos_new
+            _, feat, new_kv_caches = self._decode_sequence(x, z_t, kv_caches=kv_caches)
+        else:
+            pos = self.pos_emb(
+                torch.arange(T_full, device=z_t.device)
+            ).view(*([1] * (tokens.dim() - 2)), T_full, self.hidden_dim)
+            x = tokens + pos
+            _, feat_seq, new_kv_caches = self._decode_sequence(x, z_t, kv_caches=None)
+            feat = feat_seq[..., -1, :]   # last token's feature
 
-        feat = self.out_norm(x[..., -1, :])
         z_next = self._decode(feat, z_t)
-        return z_next, tokens
+        return z_next, tokens, new_kv_caches
 
     # ------------------------------------------------------------------
     # Autoregressive latent rollout
@@ -390,9 +463,7 @@ class DynamicsTransformer(nn.Module):
 
         for j in range(a_seq.size(1)):
             d_j = d_seq[:, j] if d_seq is not None else None
-            z_cur, tokens = self.step(
-                z_cur, a_seq[:, j], tokens, d_j
-            )
+            z_cur, tokens, _ = self.step(z_cur, a_seq[:, j], tokens, d_j)
             preds.append(z_cur)
 
         return torch.stack(preds, dim=1)
@@ -407,6 +478,7 @@ class DynamicsTransformer(nn.Module):
         h_vars_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
         d_t: torch.Tensor | float | None = None,
+        h_cons_summary: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Single-step inference that also predicts next per-variable embeddings.
@@ -444,7 +516,7 @@ class DynamicsTransformer(nn.Module):
                 )
             h_vars_b = h_vars_t
 
-        z_next, tokens = self.step(z_t, a_t, past_tokens, d_t)
+        z_next, tokens, _ = self.step(z_t, a_t, past_tokens, d_t, h_cons_summary)
 
         # IMPORTANT: preserve the batch dimension. The old implementation
         # used z_next[0] and a_t[0], which made step_full effectively
@@ -470,6 +542,7 @@ class DynamicsTransformer(nn.Module):
         h_vars_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
         d_t: torch.Tensor | float | None = None,
+        h_cons_summary: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Explicit batch-oriented alias for step_full().
@@ -503,7 +576,7 @@ class DynamicsTransformer(nn.Module):
             )
 
         return self.step_full(
-            z_t, a_t, h_vars_t, past_tokens, d_t
+            z_t, a_t, h_vars_t, past_tokens, d_t, h_cons_summary
         )
 
     # ------------------------------------------------------------------

@@ -905,8 +905,37 @@ class Trainer:
     # ------------------------------------------------------------------
     # Phase 5 — Cut selection
     # ------------------------------------------------------------------
+    @staticmethod
+    def _cut_diversity_loss(
+        cut_feats: "torch.Tensor",
+        scores: "torch.Tensor",
+        top_k: int = 8,
+        margin: float = 0.5,
+        weight: float = 0.1,
+    ) -> "torch.Tensor":
+        """Pairwise cosine repulsion among the top-k scored cuts.
+
+        Penalises near-parallel cut directions so the selected pool covers
+        diverse constraint directions. No new parameters — uses cut_feats directly.
+
+        L_div = weight * mean(ReLU(|cos(c_i, c_j)| - margin)) over pairs i<j
+        """
+        import torch
+        import torch.nn.functional as F
+        if cut_feats.size(0) < 2:
+            return torch.tensor(0.0, device=cut_feats.device, requires_grad=True)
+        k = min(top_k, cut_feats.size(0))
+        _, top_idx = scores.detach().topk(k)
+        selected = cut_feats[top_idx]                            # [k, 6]
+        normed = F.normalize(selected, dim=-1)                   # [k, 6]
+        sim = normed @ normed.T                                  # [k, k]
+        # upper triangle, exclude diagonal
+        mask = torch.triu(torch.ones(k, k, dtype=torch.bool, device=sim.device), diagonal=1)
+        repulsion = torch.relu(sim.abs()[mask] - margin)
+        return weight * repulsion.mean()
+
     def train_cuts(self, train_loader, val_loader, epochs, lr=5e-4,
-                   pos_weight=None, patience=None):
+                   pos_weight=None, patience=None, div_weight: float = 0.1):
         """
         Train CuttingPlaneHead to imitate SCIP's cut selection.
 
@@ -957,9 +986,11 @@ class Trainer:
                             if cut_feats.size(0) == 0:
                                 continue
                             scores = self.model.cut_scores(cut_feats, z[b_idx])
-                            cut_losses.append(
-                                cutting_plane_loss(scores, cut_labels, pw)
+                            l_cls = cutting_plane_loss(scores, cut_labels, pw)
+                            l_div = self._cut_diversity_loss(
+                                cut_feats, scores, weight=div_weight,
                             )
+                            cut_losses.append(l_cls + l_div)
 
                         if not cut_losses:
                             continue
