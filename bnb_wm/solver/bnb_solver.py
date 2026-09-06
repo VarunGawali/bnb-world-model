@@ -80,6 +80,13 @@ class SolveResult:
     n_nodes: int
     solve_time: float
     optimality_gap: float
+    # Latent fidelity diagnostic (latent cut mode only).
+    # Each entry is ‖z' - z''‖ / ‖z''‖ for one physically committed cut:
+    #   z'  = dynamics-predicted post-cut latent state
+    #   z'' = GNN-encoded true post-cut state
+    # Mean near 0 → world model correctly predicts cut effects.
+    # Mean near 1+ → dynamics not learning cuts; re-encode and latent diverge.
+    cut_latent_errors: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +211,10 @@ class BnBSolver:
         self.cut_min_gain            = cut_min_gain
         self.cut_subtree_thresh      = cut_subtree_thresh
         self._cuts_added         = 0                   # per-solve cut counter
+        # Latent fidelity diagnostic: track ‖z' - z''‖ / ‖z''‖ across cut commits.
+        # z' = dynamics prediction; z'' = GNN re-encode after physical cut commit.
+        # Low ratio → world model accurately predicts the cut's effect on latent state.
+        self._cut_latent_errors: list[float] = []
         # Branching mode for the ablation: "rollout" (latent world-model
         # lookahead), "policy" (argmax policy, no rollout), "most_fractional".
         self.branch_mode         = "rollout"
@@ -254,6 +265,7 @@ class BnBSolver:
         # instance-specific and must not leak across solve() calls.
         self._gomory_pool = None
         self._cuts_added = 0
+        self._cut_latent_errors = []
         self._precompute_static_graph(A, b, c)
 
         # Root LP
@@ -381,9 +393,11 @@ class BnBSolver:
             bvec_br = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
 
             cut_gain = 0.0   # ΔLP from cut commit this node (for child propagation)
+            n_frac = int(frac_mask_np.sum())
 
             if self.cut_mode == "latent" and self._should_cut(
-                    z, h_vars, x_lp, node, leaf_prob, lp_obj, global_ub):
+                    z, h_vars, frac_mask_np, n_frac, frac_t, bvec_br,
+                    node, leaf_prob, lp_obj, global_ub):
 
                 # Build branch candidate set (same as _select_branch_var)
                 frac_indices = np.where(frac_mask_np)[0]
@@ -443,12 +457,20 @@ class BnBSolver:
                             # Without this, h_vars (pre-cut graph) and z_branch
                             # (latent post-cut) diverge — the GNN sees different
                             # constraint geometry than the dynamics expects.
+                            z_latent_pred = z_branch   # z' — latent prediction
                             h_vars, z_branch, h_cons = self._encode_node(
                                 A, b, c, x_lp, dual,
                                 node.var_lb, node.var_ub,
                                 node.inherited_cuts + new_cuts,
                             )
                             h_cons_summary = h_cons.mean(0, keepdim=True)
+                            # Latent fidelity: ‖z' - z''‖ / ‖z''‖
+                            # z' = dynamics-predicted post-cut state (z_latent_pred)
+                            # z'' = GNN-encoded true post-cut state (z_branch)
+                            with torch.no_grad():
+                                _err = (z_latent_pred - z_branch).norm().item()
+                                _ref = z_branch.norm().item() + 1e-8
+                                self._cut_latent_errors.append(_err / _ref)
                             # tok_branch from beam search is the closest history
                             # we have; keep it (the latent cut tokens condition
                             # the branch dynamics correctly).
@@ -617,6 +639,7 @@ class BnBSolver:
             n_nodes=n_nodes,
             solve_time=time.perf_counter() - t_start,
             optimality_gap=gap,
+            cut_latent_errors=list(self._cut_latent_errors),
         )
 
     # ------------------------------------------------------------------
@@ -1155,7 +1178,10 @@ class BnBSolver:
         self,
         z: torch.Tensor,
         h_vars: torch.Tensor,
-        x_lp: np.ndarray,
+        frac_mask_np: np.ndarray,
+        n_frac: int,
+        frac_t: torch.Tensor,
+        bvec: torch.Tensor,
         node: "Node",
         leaf_prob: float,
         lp_obj: float,
@@ -1181,9 +1207,7 @@ class BnBSolver:
         if leaf_prob >= self.cut_integrality_thresh:
             return False
 
-        # Level 2a: structural guards (zero neural cost)
-        frac_mask_np = (x_lp > 1e-4) & (x_lp < 1 - 1e-4)
-        n_frac = int(frac_mask_np.sum())
+        # Level 2a: structural guards — all inputs pre-computed by caller, zero cost here
         if n_frac < self.cut_min_nfrac:
             return False
         if node.depth > self.cut_depth_max:
@@ -1191,21 +1215,16 @@ class BnBSolver:
         if self._cuts_added >= self.cut_budget_cap:
             return False
 
-        # Level 2b: ΔLP stopping rule — if the last cut applied at this node's
-        # parent barely changed the LP bound, more cuts are unlikely to help.
-        if node.last_cut_gain < self.cut_min_gain and node.last_cut_gain >= 0:
-            # last_cut_gain == 0.0 means no prior cut (first cut attempt is free)
-            if node.last_cut_gain > 0:   # > 0 but below threshold → skip
-                return False
+        # Level 2b: ΔLP stopping rule — if the last cut barely moved LP, skip
+        if 0 < node.last_cut_gain < self.cut_min_gain:
+            return False
 
-        # Level 2c: LP gap check (cheap arithmetic)
+        # Level 2c: LP gap check (arithmetic only)
         lp_gap = (global_ub - lp_obj) / (abs(global_ub) + 1e-8)
         if lp_gap < self.gap_tolerance:
             return False
 
-        # Level 2d: subtree size gate (one cheap head forward — reuse if already computed)
-        bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
-        frac_t = torch.tensor(frac_mask_np, dtype=torch.bool, device=self.device)
+        # Level 2d: subtree size gate — uses caller-provided bvec and frac_t
         with torch.no_grad():
             s_val = self.model.subtree_size_pred(z, h_vars, bvec, frac_mask=frac_t).item()
         if s_val < self.cut_subtree_thresh:
