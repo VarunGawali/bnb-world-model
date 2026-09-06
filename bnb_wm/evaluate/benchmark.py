@@ -37,31 +37,27 @@ _LOOKAHEAD_K = 5
 _LOOKAHEAD_DEPTH = 3
 # Discount factor per lookahead step
 _LOOKAHEAD_GAMMA = 0.95
-# Weight on the predicted-subtree-size penalty in the rollout score.
-# Gated off (0.0): traces use SCIP's non-DFS node order, so subtree_size labels
-# are not derivable and the SubtreeSizeHead is untrained. Value rollout only.
-_SIZE_WEIGHT = 0.0
-# Weight on the predicted cost-to-go (remaining nodes) in the rollout score
-# (Gap 3). Trainable on the non-DFS traces; set 0 for the pure-value ablation.
-_CTG_WEIGHT = 1.0
-# Rollout branching factor (Gap 4): 1 = single greedy path, >1 = predicted tree.
+# Rollout scoring weights — composite: value_weight*V(z') - size_weight*S(z') - ctg_weight*C(z').
+# V is in [0,1]; S and C are in log1p space (~0–8). Weights account for scale difference.
+# Mirrors solver defaults. Set size_weight=0.0 if SubtreeSizeHead was not trained on
+# DFS-ordered traces (SCIP's non-DFS node order means subtree_size labels are unavailable).
+_VALUE_WEIGHT = 0.3  # LP-bound quality (ValueHead)
+_SIZE_WEIGHT  = 0.7  # predicted subtree-size penalty (SubtreeSizeHead, primary signal)
+_CTG_WEIGHT   = 0.0  # cost-to-go penalty — off until target is improved
+# Rollout branching factor: 1 = single greedy path, >1 = predicted tree.
 _BRANCH_FACTOR = 2
-# MuZero-style return (Fix 3): sum gamma^t r_t + gamma^k V(leaf). False = value
-# summed at every step (the ablation baseline).
+# MuZero-style return: sum gamma^t r_t + gamma^k V(leaf). False = value summed at every
+# step (ablation baseline).
 _USE_REWARD_RETURN = True
 # Integrality probability threshold above which lookahead is skipped
 _LEAF_PROB_SKIP = 0.8
-# Confidence gate: if softmax(policy)[top-1 candidate] >= this threshold,
-# trust the policy and skip the expensive rollout entirely. None = disabled.
-# Mirrors the skip_confident parameter in ablation.py.
+# Confidence gate: skip rollout when policy top-1 softmax >= threshold. None = disabled.
 _SKIP_CONFIDENT: float | None = None
-# Adaptive rollout depth + candidate count (items 10+11).
-# High-confidence decisions (p_top >= conf_high) use k=1, depth=1.
-# Medium-confidence (p_top >= conf_mid) use k=min(K,2), depth=min(D,2).
-# None = disabled (full budget always).
+# Adaptive rollout: shrink k and depth for high/medium-confidence decisions.
+# High (p_top >= conf_high): k=1, depth=1. Mid (p_top >= conf_mid): k≤2, depth≤2.
 _ADAPTIVE_CONF_HIGH: float | None = None
 _ADAPTIVE_CONF_MID:  float | None = None
-# Direction-spread uncertainty penalty (0.0 = disabled). See solver config.
+# Direction-spread uncertainty penalty (0.0 = disabled).
 _UNCERTAINTY_WEIGHT: float = 0.0
 
 
@@ -75,22 +71,24 @@ def apply_config(cfg: dict | None):
     """
     if not cfg:
         return
-    global _LOOKAHEAD_K, _LOOKAHEAD_DEPTH, _LOOKAHEAD_GAMMA, _SIZE_WEIGHT
-    global _CTG_WEIGHT, _BRANCH_FACTOR, _USE_REWARD_RETURN, _SKIP_CONFIDENT
+    global _LOOKAHEAD_K, _LOOKAHEAD_DEPTH, _LOOKAHEAD_GAMMA
+    global _VALUE_WEIGHT, _SIZE_WEIGHT, _CTG_WEIGHT
+    global _BRANCH_FACTOR, _USE_REWARD_RETURN, _SKIP_CONFIDENT
     global _ADAPTIVE_CONF_HIGH, _ADAPTIVE_CONF_MID, _UNCERTAINTY_WEIGHT
     b = {**cfg.get("solver", {}), **cfg.get("benchmark", {})}   # benchmark wins
     _LOOKAHEAD_K       = int(b.get("lookahead_k", _LOOKAHEAD_K))
     _LOOKAHEAD_DEPTH   = int(b.get("lookahead_depth", _LOOKAHEAD_DEPTH))
     _LOOKAHEAD_GAMMA   = float(b.get("lookahead_gamma", _LOOKAHEAD_GAMMA))
+    _VALUE_WEIGHT      = float(b.get("value_weight", _VALUE_WEIGHT))
     _SIZE_WEIGHT       = float(b.get("size_weight", _SIZE_WEIGHT))
     _CTG_WEIGHT        = float(b.get("ctg_weight", _CTG_WEIGHT))
     _BRANCH_FACTOR     = int(b.get("branch_factor", _BRANCH_FACTOR))
     _USE_REWARD_RETURN = bool(b.get("use_reward_return", _USE_REWARD_RETURN))
-    if "skip_confident" in b:
+    if "skip_confident" in b and b["skip_confident"] is not None:
         _SKIP_CONFIDENT = float(b["skip_confident"])
-    if "adaptive_conf_high" in b:
+    if "adaptive_conf_high" in b and b["adaptive_conf_high"] is not None:
         _ADAPTIVE_CONF_HIGH = float(b["adaptive_conf_high"])
-    if "adaptive_conf_mid" in b:
+    if "adaptive_conf_mid" in b and b["adaptive_conf_mid"] is not None:
         _ADAPTIVE_CONF_MID = float(b["adaptive_conf_mid"])
     _UNCERTAINTY_WEIGHT = float(b.get("uncertainty_weight", _UNCERTAINTY_WEIGHT))
 
@@ -232,6 +230,7 @@ def _gnn_pick_action(model, batch, action_set, device, past_tokens=None, depth=0
         gamma=_LOOKAHEAD_GAMMA,
         valid_mask=valid_mask,
         past_tokens=past_tokens,
+        value_weight=_VALUE_WEIGHT,
         size_weight=_SIZE_WEIGHT,
         ctg_weight=_CTG_WEIGHT,
         branch_factor=_BRANCH_FACTOR,
