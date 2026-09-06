@@ -395,14 +395,20 @@ class BnBSolver:
             cut_gain = 0.0   # ΔLP from cut commit this node (for child propagation)
             n_frac = int(frac_mask_np.sum())
 
+            # Node-level state cache: compute policy_logits once here;
+            # all consumers (_cut_gate, _generate_cg_cuts, _select_branch_var,
+            # rollout_cut_branch_beam) receive the pre-computed tensor directly,
+            # eliminating O(policy_head) redundant forward passes per node.
+            with torch.no_grad():
+                node_policy_logits = self.model.policy_scores(h_vars, z, bvec_br)
+
             if self.cut_mode == "latent" and self._should_cut(
                     z, h_vars, frac_mask_np, n_frac, frac_t, bvec_br,
                     node, leaf_prob, lp_obj, global_ub):
 
-                # Build branch candidate set (same as _select_branch_var)
+                # Build branch candidate set using cached policy logits
                 frac_indices = np.where(frac_mask_np)[0]
-                with torch.no_grad():
-                    scores_pre = self.model.policy_scores(h_vars, z, bvec_br)
+                scores_pre = node_policy_logits
                 masked = torch.full_like(scores_pre, -1e4)
                 masked[torch.tensor(frac_indices, dtype=torch.long, device=self.device)] = \
                     scores_pre[torch.tensor(frac_indices, dtype=torch.long, device=self.device)]
@@ -425,6 +431,7 @@ class BnBSolver:
                     self._run_cut_branch_beam(
                         z, h_vars, x_lp, A, b, node,
                         top_k, valid_mask_v, frac_t, rollout_kw,
+                        precomputed_policy_logits=node_policy_logits,
                     )
 
                 # Commit chosen cuts physically (one LP re-solve only if cuts chosen)
@@ -480,9 +487,15 @@ class BnBSolver:
 
             elif self.cut_mode != "none" and leaf_prob < 0.7:
                 # Legacy path: Gomory + Δ-adjust + separate branch rollout
-                fire, scores_precut = self._cut_gate(h_vars, z, x_lp, node)
+                fire, scores_precut = self._cut_gate(
+                    h_vars, z, x_lp, node,
+                    precomputed_policy_logits=node_policy_logits,
+                )
                 if fire:
-                    candidates = self._generate_cg_cuts(A, b, c, x_lp, node.inherited_cuts)
+                    candidates = self._generate_cg_cuts(
+                        A, b, c, x_lp, node.inherited_cuts,
+                        precomputed_policy_logits=node_policy_logits,
+                    )
                     if candidates:
                         cut_scores = self._score_cuts_gnn(candidates, h_vars, h_cons, x_lp, A, b)
                         order = np.argsort(-cut_scores)
@@ -521,7 +534,8 @@ class BnBSolver:
                 )
             else:
                 branch_var = self._select_branch_var(
-                    h_vars, z_branch, x_lp, node, policy_scores_override=None
+                    h_vars, z_branch, x_lp, node,
+                    policy_scores_override=node_policy_logits,
                 )
 
             # Cuts to propagate to children (branch-and-cut: inherited + new)
@@ -1074,6 +1088,7 @@ class BnBSolver:
         c: np.ndarray,
         x_lp: np.ndarray,
         existing_cuts: list,
+        precomputed_policy_logits: "torch.Tensor | None" = None,
     ) -> list:
         """
         Generate globally valid Gomory fractional cuts (see solver/gomory.py).
@@ -1242,6 +1257,7 @@ class BnBSolver:
         z: torch.Tensor,
         x_lp: np.ndarray,
         node: "Node",
+        precomputed_policy_logits: "torch.Tensor | None" = None,
     ) -> "tuple[bool, torch.Tensor | None]":
         """
         Three-part cut gate: depth cap, policy entropy, and CTG.
@@ -1267,20 +1283,23 @@ class BnBSolver:
         # don't waste an LP re-solve on instances the model predicts as trivial
         # (e.g. already-integral or single-node solves).
         frac_t = torch.tensor(frac_mask_np, dtype=torch.bool, device=self.device)
+        bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
+
+        # Use pre-computed logits from node cache if available
+        if precomputed_policy_logits is not None:
+            scores = precomputed_policy_logits
+        else:
+            with torch.no_grad():
+                scores = self.model.policy_scores(h_vars, z, bvec)
 
         if node.depth == 0 and self.force_root_cuts:
             with torch.no_grad():
-                bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
-                scores = self.model.policy_scores(h_vars, z, bvec)
-                ctg    = self.model.cost_to_go_pred(z, h_vars, bvec, frac_mask=frac_t).item()
+                ctg = self.model.cost_to_go_pred(z, h_vars, bvec, frac_mask=frac_t).item()
             if ctg < self.cut_ctg_thresh_root:
                 return False, scores
             return True, scores
 
         with torch.no_grad():
-            bvec   = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
-            scores = self.model.policy_scores(h_vars, z, bvec)
-
             probs   = torch.softmax(scores[frac_t], dim=0)
             entropy = float(-(probs * torch.log(probs + 1e-12)).sum())
 
@@ -1358,6 +1377,7 @@ class BnBSolver:
         valid_mask: torch.Tensor,
         frac_mask: torch.Tensor,
         rollout_kwargs: dict,
+        precomputed_policy_logits: "torch.Tensor | None" = None,
     ) -> tuple:
         """Generate CG cuts, evaluate in latent space, return branch scores.
 
@@ -1381,10 +1401,13 @@ class BnBSolver:
         attn = self.model.encoder.pool.forward_attn(h_vars, z)
         importance_a = importance_from_attn(attn, x_lp)
 
-        # Phase B importance: policy × fractionality
+        # Phase B importance: policy × fractionality (use cached logits if available)
         bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
-        with torch.no_grad():
-            policy_logits = self.model.policy_scores(h_vars, z, bvec)
+        if precomputed_policy_logits is not None:
+            policy_logits = precomputed_policy_logits
+        else:
+            with torch.no_grad():
+                policy_logits = self.model.policy_scores(h_vars, z, bvec)
         importance_b = importance_from_policy(policy_logits.cpu(), x_lp)
 
         # Blend: early rounds use structural (attn) signal; later rounds use
@@ -1420,6 +1443,7 @@ class BnBSolver:
                     cut_rounds=self.cut_rounds,
                     entropy_thresh=self.cut_entropy_thresh,
                     pre_filter_k=self.cut_beam,
+                    precomputed_policy_logits=precomputed_policy_logits,
                     **rollout_kwargs,
                 )
 

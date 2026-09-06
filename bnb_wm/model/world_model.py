@@ -1120,6 +1120,7 @@ class BnBWorldModel(nn.Module):
         cut_rounds: int = 2,
         entropy_thresh: float = 0.0,
         pre_filter_k: int = 0,
+        precomputed_policy_logits: torch.Tensor | None = None,
         **branch_kwargs,
     ) -> tuple:
         """Evaluate cut candidates in latent space, then branch from the best state.
@@ -1245,7 +1246,11 @@ class BnBWorldModel(nn.Module):
             for _round in range(cut_rounds):
                 if entropy_thresh > 0.0 and frac_mask is not None and frac_mask.any():
                     z_cur, _, _, _ = beams[0]
-                    logits = self.policy_scores(h_vars, z_cur, bvec_single)
+                    # Round 0: z_cur == z — reuse pre-computed logits if available
+                    if _round == 0 and precomputed_policy_logits is not None:
+                        logits = precomputed_policy_logits
+                    else:
+                        logits = self.policy_scores(h_vars, z_cur, bvec_single)
                     probs  = torch.softmax(logits[frac_mask], dim=0)
                     H_pi   = float(-(probs * (probs + 1e-12).log()).sum())
                     if H_pi < entropy_thresh:
