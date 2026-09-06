@@ -563,17 +563,21 @@ class BnBSolver:
                         h_cons_summary=h_cons_summary,
                     )
                     # Score the predicted child state. frac_mask=None (imagined state).
-                    # Compute only what each enabled feature needs.
+                    # multi_head_pred computes frac_mean once and fans out to all
+                    # requested heads — cheaper than calling each head separately.
                     need_s   = self.node_selection == "subtree_size" or self.neural_prune
                     need_v   = self.node_selection == "bound"        or self.neural_prune
                     need_ctg = self.node_selection == "cost_to_go"
 
-                    s_child   = self.model.subtree_size_pred(
-                        z_child, h_child, bvec, None).item() if need_s   else None
-                    v_child   = self.model.value_pred(
-                        z_child, h_child, bvec, None).item() if need_v   else None
-                    ctg_child = self.model.cost_to_go_pred(
-                        z_child, h_child, bvec, None).item() if need_ctg else None
+                    with torch.no_grad():
+                        child_heads = self.model.multi_head_pred(
+                            z_child, h_child, bvec,
+                            frac_mask=None,
+                            value=need_v, subtree_size=need_s, cost_to_go=need_ctg,
+                        )
+                    s_child   = child_heads["subtree_size"].item() if need_s   else None
+                    v_child   = child_heads["value"].item()        if need_v   else None
+                    ctg_child = child_heads["cost_to_go"].item()   if need_ctg else None
 
                     if self.node_selection == "cost_to_go":
                         # Smallest predicted remaining work explored first.
