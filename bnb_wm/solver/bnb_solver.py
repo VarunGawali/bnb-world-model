@@ -63,6 +63,8 @@ class Node:
     past_tokens: Optional[object] = None    # DynamicsTransformer token buffer
     # HiGHS basis from parent LP for warmstarting (col_status, row_status arrays)
     warm_basis: Optional[tuple] = None
+    # ΔLP from the last cut round applied at this node's parent (0 = no prior cut)
+    last_cut_gain: float = 0.0
 
     def __lt__(self, other):
         # Max-heap by priority (higher priority = processed first)
@@ -139,6 +141,11 @@ class BnBSolver:
         neural_prune_margin: float = 0.1,
         # Dive heuristic via IntegralityHead (feature 4)
         dive_bonus: float = 0.0,
+        # Hierarchical cut gate
+        cut_integrality_thresh: float = 0.7,   # IntegralityHead level-1 gate
+        cut_min_nfrac: int = 3,                # skip cuts when very few fractional vars
+        cut_min_gain: float = 1e-4,            # ΔLP stopping rule: skip if last gain tiny
+        cut_subtree_thresh: float = 1.0,       # S(z) gate: skip cuts on tiny subtrees
     ):
         self.model               = model
         self.device              = device
@@ -192,6 +199,10 @@ class BnBSolver:
         self.neural_prune_v_thresh   = neural_prune_v_thresh
         self.neural_prune_margin     = neural_prune_margin
         self.dive_bonus              = dive_bonus
+        self.cut_integrality_thresh  = cut_integrality_thresh
+        self.cut_min_nfrac           = cut_min_nfrac
+        self.cut_min_gain            = cut_min_gain
+        self.cut_subtree_thresh      = cut_subtree_thresh
         self._cuts_added         = 0                   # per-solve cut counter
         # Branching mode for the ablation: "rollout" (latent world-model
         # lookahead), "policy" (argmax policy, no rollout), "most_fractional".
@@ -369,10 +380,10 @@ class BnBSolver:
             frac_t = torch.tensor(frac_mask_np, dtype=torch.bool, device=self.device)
             bvec_br = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
 
-            if self.cut_mode == "latent" and leaf_prob < 0.7 \
-                    and node.depth <= self.cut_depth_max \
-                    and self._cuts_added < self.cut_budget_cap \
-                    and frac_mask_np.any():
+            cut_gain = 0.0   # ΔLP from cut commit this node (for child propagation)
+
+            if self.cut_mode == "latent" and self._should_cut(
+                    z, h_vars, x_lp, node, leaf_prob, lp_obj, global_ub):
 
                 # Build branch candidate set (same as _select_branch_var)
                 frac_indices = np.where(frac_mask_np)[0]
@@ -418,6 +429,7 @@ class BnBSolver:
                             warm_basis=node_basis,
                         )
                         if feas2 and lp_obj2 > lp_obj + 1e-8:
+                            cut_gain = lp_obj2 - lp_obj   # ΔLP — propagated to children
                             lp_obj, x_lp, dual, node_basis = lp_obj2, x_lp2, dual2, node_basis2
                             new_cuts = chosen_cuts
                             self._cuts_added += len(new_cuts)
@@ -582,7 +594,8 @@ class BnBSolver:
                     priority=child_priority,
                     inherited_cuts=child_cuts,
                     warm_basis=node_basis,   # child warmstarts from current node's basis
-                    past_tokens=child_tokens,   # P0.9: propagate updated history
+                    past_tokens=child_tokens,
+                    last_cut_gain=cut_gain,  # ΔLP stopping rule for child's cut gate
                 )
                 heapq.heappush(heap, child)
 
@@ -1138,12 +1151,74 @@ class BnBSolver:
     # Neural cut gate and zero-shot GNN scoring
     # ------------------------------------------------------------------
 
+    def _should_cut(
+        self,
+        z: torch.Tensor,
+        h_vars: torch.Tensor,
+        x_lp: np.ndarray,
+        node: "Node",
+        leaf_prob: float,
+        lp_obj: float,
+        global_ub: float,
+    ) -> bool:
+        """Hierarchical cut gate — two cheap levels before any expensive planning.
+
+        Level 1 — IntegralityHead (already computed externally):
+          leaf_prob >= cut_integrality_thresh → node is near-integral → branch directly.
+
+        Level 2 — cheap scalar signals (no additional neural forward passes):
+          • n_frac < cut_min_nfrac           : too few fractional vars to cut usefully
+          • depth  > cut_depth_max           : never cut deep in the tree
+          • _cuts_added >= cut_budget_cap    : global cut budget exhausted
+          • last_cut_gain < cut_min_gain     : previous cut at this node barely moved LP;
+                                               ΔLP ≈ 0 means more cuts are unlikely to help
+          • lp_gap < gap_tolerance           : node is already near-optimal, no point cutting
+          • S(z) < cut_subtree_thresh        : predicted subtree tiny — not worth LP re-solve
+
+        Returns True iff cut planning should proceed.
+        """
+        # Level 1: near-integral — skip cuts
+        if leaf_prob >= self.cut_integrality_thresh:
+            return False
+
+        # Level 2a: structural guards (zero neural cost)
+        frac_mask_np = (x_lp > 1e-4) & (x_lp < 1 - 1e-4)
+        n_frac = int(frac_mask_np.sum())
+        if n_frac < self.cut_min_nfrac:
+            return False
+        if node.depth > self.cut_depth_max:
+            return False
+        if self._cuts_added >= self.cut_budget_cap:
+            return False
+
+        # Level 2b: ΔLP stopping rule — if the last cut applied at this node's
+        # parent barely changed the LP bound, more cuts are unlikely to help.
+        if node.last_cut_gain < self.cut_min_gain and node.last_cut_gain >= 0:
+            # last_cut_gain == 0.0 means no prior cut (first cut attempt is free)
+            if node.last_cut_gain > 0:   # > 0 but below threshold → skip
+                return False
+
+        # Level 2c: LP gap check (cheap arithmetic)
+        lp_gap = (global_ub - lp_obj) / (abs(global_ub) + 1e-8)
+        if lp_gap < self.gap_tolerance:
+            return False
+
+        # Level 2d: subtree size gate (one cheap head forward — reuse if already computed)
+        bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
+        frac_t = torch.tensor(frac_mask_np, dtype=torch.bool, device=self.device)
+        with torch.no_grad():
+            s_val = self.model.subtree_size_pred(z, h_vars, bvec, frac_mask=frac_t).item()
+        if s_val < self.cut_subtree_thresh:
+            return False
+
+        return True
+
     def _cut_gate(
         self,
         h_vars: torch.Tensor,
         z: torch.Tensor,
         x_lp: np.ndarray,
-        node: Node,
+        node: "Node",
     ) -> "tuple[bool, torch.Tensor | None]":
         """
         Three-part cut gate: depth cap, policy entropy, and CTG.
