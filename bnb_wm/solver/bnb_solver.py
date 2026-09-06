@@ -128,6 +128,17 @@ class BnBSolver:
         cut_budget_cap: int = 10,
         cut_beam: int = 3,
         cut_rounds: int = 2,
+        # Confidence-gated rollout (feature 5)
+        skip_confident: Optional[float] = None,
+        adaptive_conf_high: Optional[float] = None,
+        adaptive_conf_mid: Optional[float] = None,
+        # Neural pruning gate (feature 3)
+        neural_prune: bool = False,
+        neural_prune_s_thresh: float = 5.0,
+        neural_prune_v_thresh: float = 0.1,
+        neural_prune_margin: float = 0.1,
+        # Dive heuristic via IntegralityHead (feature 4)
+        dive_bonus: float = 0.0,
     ):
         self.model               = model
         self.device              = device
@@ -143,7 +154,7 @@ class BnBSolver:
         self.size_weight         = size_weight       # predicted-subtree-size penalty
         self.ctg_weight          = ctg_weight        # cost-to-go penalty (Gap 3)
         self.branch_factor       = branch_factor      # rollout tree width (Gap 4)
-        self.node_selection      = node_selection     # "bound" | "cost_to_go" (Gap 5)
+        self.node_selection      = node_selection     # "bound" | "cost_to_go" | "subtree_size"
         self.use_reward_return   = use_reward_return   # MuZero-style return (Fix 3)
         self.uncertainty_weight  = uncertainty_weight  # direction-spread penalty (0=off)
         # Cut-selection mode for the ablation: "learned" (CuttingPlaneHead),
@@ -173,6 +184,14 @@ class BnBSolver:
         self.cut_budget_cap          = cut_budget_cap
         self.cut_beam                = cut_beam
         self.cut_rounds              = cut_rounds
+        self.skip_confident          = skip_confident
+        self.adaptive_conf_high      = adaptive_conf_high
+        self.adaptive_conf_mid       = adaptive_conf_mid
+        self.neural_prune            = neural_prune
+        self.neural_prune_s_thresh   = neural_prune_s_thresh
+        self.neural_prune_v_thresh   = neural_prune_v_thresh
+        self.neural_prune_margin     = neural_prune_margin
+        self.dive_bonus              = dive_bonus
         self._cuts_added         = 0                   # per-solve cut counter
         # Branching mode for the ablation: "rollout" (latent world-model
         # lookahead), "policy" (argmax policy, no rollout), "most_fractional".
@@ -490,29 +509,50 @@ class BnBSolver:
                         z_branch, a_emb, h_vars, tok_branch, direction,
                         h_cons_summary=h_cons_summary,
                     )
-                    # P1.6/P1.1: both selection modes score the PREDICTED child
-                    # state (z_child/h_child), which differs per child via the
-                    # branch direction — not the shared parent state. The child's
-                    # fractional set is unknown (imagined), so frac_mask=None
-                    # rather than the stale parent mask.
+                    # Score the predicted child state. frac_mask=None (imagined state).
+                    # Compute only what each enabled feature needs.
+                    need_s   = self.node_selection == "subtree_size" or self.neural_prune
+                    need_v   = self.node_selection == "bound"        or self.neural_prune
+                    need_ctg = self.node_selection == "cost_to_go"
+
+                    s_child   = self.model.subtree_size_pred(
+                        z_child, h_child, bvec, None).item() if need_s   else None
+                    v_child   = self.model.value_pred(
+                        z_child, h_child, bvec, None).item() if need_v   else None
+                    ctg_child = self.model.cost_to_go_pred(
+                        z_child, h_child, bvec, None).item() if need_ctg else None
+
                     if self.node_selection == "cost_to_go":
-                        # Gap 5: learned best-first search. Order the frontier by
-                        # this child's predicted cost-to-go. Node order never
-                        # affects correctness, only efficiency, so exactness holds.
-                        ctg = self.model.cost_to_go_pred(
-                            z_child, h_child, bvec, None
-                        ).item()
-                        # Node.__lt__ is a MAX-heap on priority (higher popped
-                        # first), so negate: the SMALLEST predicted remaining
-                        # work gets the highest priority and is explored first.
-                        child_priority = -ctg
+                        # Smallest predicted remaining work explored first.
+                        child_priority = -ctg_child
+                    elif self.node_selection == "subtree_size":
+                        # Directly minimise B&B objective: smallest predicted subtree.
+                        child_priority = -s_child
                     else:
-                        # Best-bound (default): both children inherit this node's
-                        # LP bound, so the value head on the predicted child state
-                        # is what distinguishes the up vs down child here.
-                        v_score = self.model.value_pred(
-                            z_child, h_child, bvec, None).item()
-                        child_priority = -lp_obj + 0.01 * v_score
+                        # Best-bound: LP objective + value-head tie-break.
+                        child_priority = -lp_obj + 0.01 * v_child
+
+                    # Dive bonus: boost priority for children predicted near-integral.
+                    # Finds good incumbents early → tighter global_ub → more pruning.
+                    if self.dive_bonus != 0.0:
+                        depth_child_t = torch.tensor(
+                            [node.depth + 1], dtype=torch.float32, device=self.device
+                        )
+                        leaf_prob_child = torch.sigmoid(
+                            self.model.integrality_logit(z_child, depth_child_t, nfrac_t)
+                        ).item()
+                        child_priority += self.dive_bonus * leaf_prob_child
+
+                # Neural pruning gate: skip children that are near the incumbent
+                # bound AND look expensive (large S) AND look LP-poor (small V).
+                # LP-sound: only fires when lp_obj is already close to global_ub,
+                # meaning the LP bound alone nearly prunes this node anyway.
+                if (self.neural_prune
+                        and s_child is not None and v_child is not None
+                        and lp_obj >= global_ub * (1.0 - self.neural_prune_margin) - 1e-6
+                        and s_child > self.neural_prune_s_thresh
+                        and v_child < self.neural_prune_v_thresh):
+                    continue   # prune: don't push to heap
 
                 child = Node(
                     lb=lp_obj,
@@ -911,7 +951,23 @@ class BnBSolver:
             masked[frac_t] = scores[frac_t]
 
             k     = min(self.lookahead_k, len(frac_indices))
-            top_k = masked.topk(k).indices   # [k] LongTensor
+
+            # Confidence gate: measure policy certainty over fractional candidates.
+            # High certainty → rollout adds little; skip or shrink it.
+            p_top = float(torch.softmax(masked[frac_t], dim=0).max())
+            if self.skip_confident is not None and p_top >= self.skip_confident:
+                # Policy is near-certain — skip rollout entirely.
+                return int(masked.argmax())
+
+            eff_k     = k
+            eff_depth = self.lookahead_depth
+            if self.adaptive_conf_high is not None and p_top >= self.adaptive_conf_high:
+                eff_k, eff_depth = 1, 1
+            elif self.adaptive_conf_mid is not None and p_top >= self.adaptive_conf_mid:
+                eff_k     = min(k, 2)
+                eff_depth = min(self.lookahead_depth, 2)
+
+            top_k = masked.topk(eff_k).indices   # [k_eff] LongTensor
 
             # Evaluate all k candidates in one batched rollout pass.
             # rollout_top_k_batched amortises the shared dynamics prefix
@@ -919,7 +975,7 @@ class BnBSolver:
             # for branch_factor > 1 or depth > 1.
             cand_scores = self.model.rollout_top_k_batched(
                 z, h_vars, top_k,
-                depth=self.lookahead_depth,
+                depth=eff_depth,
                 gamma=self.lookahead_gamma,
                 valid_mask=valid_mask,
                 past_tokens=node.past_tokens,

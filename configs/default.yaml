@@ -110,7 +110,7 @@ solver:
   # Node selection (Gap 5). "bound" = best-bound (default, LP-bound priority);
   # "cost_to_go" = learned best-first, ordering the frontier by the child's
   # predicted remaining nodes. Order never affects correctness, only speed.
-  node_selection: cost_to_go
+  node_selection: subtree_size    # "bound" | "cost_to_go" | "subtree_size" (default: directly minimise B&B objective)
   # MuZero-style rollout return (Fix 3). true = sum gamma^t r_t + gamma^k V(leaf)
   # using the predicted per-step reward + one leaf value bootstrap; false = sum
   # the value at every step (double-counts; kept as the ablation baseline).
@@ -120,6 +120,23 @@ solver:
   # 0.0 = disabled (default). Suggested starting value: 0.1-0.5.
   # Free at runtime — spread uses root-level scores already computed.
   uncertainty_weight: 0.0
+  # Confidence-gated rollout. skip_confident: skip rollout when policy top-1 >= threshold.
+  # adaptive_conf_high/mid: shrink k and depth for medium/high confidence decisions.
+  # null = disabled. Suggested: skip_confident: 0.9, high: 0.70, mid: 0.40
+  skip_confident: null
+  adaptive_conf_high: null
+  adaptive_conf_mid: null
+  # Neural pruning gate. Only fires near incumbent bound (lp_obj >= ub*(1-margin)).
+  # AND gate: both S(z) > s_thresh AND V(z) < v_thresh required to prune.
+  # false by default — enable after SubtreeSizeHead and ValueHead are well-trained.
+  neural_prune: false
+  neural_prune_s_thresh: 5.0    # log1p subtree size threshold (~148 nodes)
+  neural_prune_v_thresh: 0.1    # value head threshold (LP quality very poor)
+  neural_prune_margin: 0.1      # only prune when lp_obj within 10% of global_ub
+  # Dive bonus: add leaf_prob_child * dive_bonus to child priority.
+  # 0.0 = disabled. ~0.5 gives meaningful incumbent-finding bias without
+  # overriding the primary node selection signal.
+  dive_bonus: 0.5
   # Global search-state context (Gap 1). Injects scalar frontier/bound features
   # into z. GATED OFF: the projection is zero-initialised and the frozen traces
   # lack per-node frontier signals to train it, so it is a no-op until a future
