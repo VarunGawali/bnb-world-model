@@ -472,31 +472,24 @@ class BnBWorldModel(nn.Module):
         score_front = []
 
         if use_reward_return:
-            score_front.append(
-                g * self.dynamics_reward_pred(z_front)
-            )
+            score_front.append(g * self.dynamics_reward_pred(z_front))
         else:
-            score_front.append(
-                g * self.value_pred(
-                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-                )
-            )
-
-        if ctg_weight != 0.0:
-            score_front[-1] = score_front[-1] - (
-                ctg_weight * g *
-                self.cost_to_go_pred(
-                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-                )
-            )
+            # V always; S+C only at the leaf (depth==1) to avoid double-counting.
+            sv = g * self.value_pred(
+                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+            ) if value_weight != 0.0 else z_front.new_zeros(z_front.size(0))
+            score_front.append(value_weight * sv if value_weight != 0.0 else sv)
+            if depth == 1:
+                if size_weight != 0.0:
+                    score_front[-1] = score_front[-1] - size_weight * g * self.subtree_size_pred(
+                        z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+                    )
+                if ctg_weight != 0.0:
+                    score_front[-1] = score_front[-1] - ctg_weight * g * self.cost_to_go_pred(
+                        z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+                    )
 
         total_score = torch.stack(score_front).sum()
-
-        if size_weight != 0.0:
-            size_root = self.subtree_size_pred(
-                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-            )
-            total_score = total_score - size_weight * size_root.sum()
 
         # At depth 1, there are no continuations.
         if depth == 1:
@@ -504,7 +497,6 @@ class BnBWorldModel(nn.Module):
                 leaf_value = self.value_pred(
                     z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
                 )
-                # frontier_weights are all 1.0 here (root directions, no K averaging)
                 total_score = total_score + g * leaf_value.sum()
             return total_score
 
@@ -661,17 +653,10 @@ class BnBWorldModel(nn.Module):
             if use_reward_return:
                 step_score = self.dynamics_reward_pred(z_next)
             else:
+                # Intermediate steps: V only. S+C deferred to leaf frontier.
                 step_score = z_next.new_zeros(z_next.size(0))
                 if value_weight != 0.0:
                     step_score = step_score + value_weight * self.value_pred(
-                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
-                    )
-                if size_weight != 0.0:
-                    step_score = step_score - size_weight * self.subtree_size_pred(
-                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
-                    )
-                if ctg_weight != 0.0:
-                    step_score = step_score - ctg_weight * self.cost_to_go_pred(
                         z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
                     )
 
@@ -694,19 +679,32 @@ class BnBWorldModel(nn.Module):
             frontier_masks = fm_child
             frontier_weights = w_step
 
-        # For reward-return mode, the final frontier gets a single value
-        # bootstrap, matching sum(rewards) + gamma^k V(leaf).
-        if use_reward_return and frontier_z.size(0) > 0:
+        # Final frontier: apply S+C once (leaf scoring, avoids double-counting).
+        if frontier_z.size(0) > 0:
             N_leaf = frontier_z.size(0)
             h_leaf_flat = frontier_h.reshape(N_leaf * V, -1)
             bvec_leaf = torch.arange(N_leaf, device=device).repeat_interleave(V)
             fm_leaf_flat = frontier_masks.reshape(-1) if frontier_masks is not None else None
-            leaf_value = self.value_pred(
-                frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat,
-            )
-            total_score = total_score + continuation_discount * (
-                frontier_weights * leaf_value
-            ).sum()
+            if use_reward_return:
+                leaf_value = self.value_pred(
+                    frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat,
+                )
+                total_score = total_score + continuation_discount * (
+                    frontier_weights * leaf_value
+                ).sum()
+            else:
+                leaf_score = frontier_z.new_zeros(N_leaf)
+                if size_weight != 0.0:
+                    leaf_score = leaf_score - size_weight * self.subtree_size_pred(
+                        frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat,
+                    )
+                if ctg_weight != 0.0:
+                    leaf_score = leaf_score - ctg_weight * self.cost_to_go_pred(
+                        frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat,
+                    )
+                total_score = total_score + continuation_discount * (
+                    frontier_weights * leaf_score
+                ).sum()
 
         return total_score
 
@@ -837,9 +835,19 @@ class BnBWorldModel(nn.Module):
         if use_reward_return:
             score_root = self.dynamics_reward_pred(z_front)  # [F]
         else:
-            # Build composite score from all active heads at root children.
-            # SubtreeSizeHead is the primary signal (minimise predicted tree cost);
-            # ValueHead adds complementary LP-quality information.
+            # Scoring rule differs by depth to avoid double-counting.
+            #
+            # depth == 1 (single-step): z_front IS the leaf — apply the full
+            #   composite: V (LP quality) + S (total remaining tree cost).
+            #   S is counted once here and we return immediately.
+            #
+            # depth > 1 (multi-step): z_front is an intermediate state.
+            #   Apply V only at intermediate steps — V(z^t) measures LP bound
+            #   improvement at each step and is genuinely additive across depth.
+            #   S is NOT applied here because S(z^t) predicts all remaining work
+            #   from z^t including the work at z^{t+1},...,z^{leaf}. Applying S
+            #   at every depth level double-counts that future cost. S is instead
+            #   applied once to the final leaf frontier at the end of the loop.
             score_root = z_front.new_zeros(z_front.size(0))  # [F]
 
             if value_weight != 0.0:
@@ -848,17 +856,16 @@ class BnBWorldModel(nn.Module):
                 )  # [F]  — higher is better (tighter bound)
                 score_root = score_root + value_weight * v_root
 
-            if size_weight != 0.0:
-                size_root = self.subtree_size_pred(
-                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-                )  # [F]  — log1p scale; lower is better → negate
-                score_root = score_root - size_weight * size_root
-
-            if ctg_weight != 0.0:
-                ctg_root = self.cost_to_go_pred(
-                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-                )  # [F]  — log1p scale; lower is better → negate
-                score_root = score_root - ctg_weight * ctg_root
+            if depth == 1:
+                # Leaf: apply S and C here (single imagined state, no future levels).
+                if size_weight != 0.0:
+                    score_root = score_root - size_weight * self.subtree_size_pred(
+                        z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+                    )
+                if ctg_weight != 0.0:
+                    score_root = score_root - ctg_weight * self.cost_to_go_pred(
+                        z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+                    )
 
         # per_cand [K]: scatter-add scores to the owning candidate.
         per_cand = torch.zeros(K, dtype=z.dtype, device=device)
@@ -987,17 +994,11 @@ class BnBWorldModel(nn.Module):
             if use_reward_return:
                 step_score = self.dynamics_reward_pred(z_next)
             else:
+                # Intermediate step: V only. S is deferred to the final leaf
+                # so the remaining-tree-cost penalty is counted exactly once.
                 step_score = z_next.new_zeros(z_next.size(0))
                 if value_weight != 0.0:
                     step_score = step_score + value_weight * self.value_pred(
-                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat
-                    )
-                if size_weight != 0.0:
-                    step_score = step_score - size_weight * self.subtree_size_pred(
-                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat
-                    )
-                if ctg_weight != 0.0:
-                    step_score = step_score - ctg_weight * self.cost_to_go_pred(
                         z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat
                     )
 
@@ -1026,17 +1027,36 @@ class BnBWorldModel(nn.Module):
             frontier_weights = w_step
             frontier_cand_id = id_step
 
-        if use_reward_return and frontier_z.size(0) > 0:
+        # Final leaf frontier: apply S and C once here for multi-step rollouts.
+        # V is also applied as a bootstrap if use_reward_return is set.
+        # S counts the total remaining tree cost at the imagined leaf — applying
+        # it only here (not at intermediate steps) avoids double-counting.
+        if frontier_z.size(0) > 0:
             N_leaf = frontier_z.size(0)
             h_leaf_flat = frontier_h.reshape(N_leaf * V, -1)
             bvec_leaf = torch.arange(N_leaf, device=device).repeat_interleave(V)
             fm_leaf_flat = frontier_masks.reshape(-1) if frontier_masks is not None else None
-            leaf_value = self.value_pred(
-                frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat
-            )
+
+            leaf_score = frontier_z.new_zeros(N_leaf)
+
+            if use_reward_return:
+                leaf_score = leaf_score + self.value_pred(
+                    frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat
+                )
+
+            if size_weight != 0.0 and not use_reward_return:
+                leaf_score = leaf_score - size_weight * self.subtree_size_pred(
+                    frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat
+                )
+
+            if ctg_weight != 0.0 and not use_reward_return:
+                leaf_score = leaf_score - ctg_weight * self.cost_to_go_pred(
+                    frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat
+                )
+
             per_cand.scatter_add_(
                 0, frontier_cand_id,
-                continuation_discount * frontier_weights * leaf_value,
+                continuation_discount * frontier_weights * leaf_score,
             )
 
         if spread is not None:
