@@ -60,8 +60,8 @@ def generate_cg_cuts(
     importance: np.ndarray,
     h_vars: torch.Tensor,
     n_cuts: int = 6,
-    top_rows: int = 30,
-    max_subset_size: int = 4,
+    top_rows: int = 15,
+    max_subset_size: int = 2,
 ) -> list:
     """Generate GNN-guided Chvátal-Gomory cuts for binary set cover.
 
@@ -103,9 +103,10 @@ def generate_cg_cuts(
     for size in range(1, max_subset_size + 1):
         if len(cuts) >= n_cuts:
             break
-        # Limit combinations to avoid exponential blowup
-        row_pool = selected_rows[:max(size * 4, 12)]
-        for subset in itertools.combinations(row_pool, size):
+        # Limit combinations: single rows + pairs only (covers most useful CG cuts).
+        # C(15,1)=15, C(15,2)=105 — fast numpy arithmetic throughout.
+        row_pool = selected_rows[:top_rows]
+        for subset in itertools.islice(itertools.combinations(row_pool, size), 200):
             if len(cuts) >= n_cuts:
                 break
 
