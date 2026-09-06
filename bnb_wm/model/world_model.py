@@ -22,6 +22,7 @@ Phase 4 : joint fine-tune (all components end-to-end)
 Phase 5 : cut selection   (encoder frozen, cut imitation from SCIP)
 """
 
+import contextlib
 import torch
 import torch.nn as nn
 from .encoder import BipartiteGNN
@@ -1168,38 +1169,57 @@ class BnBWorldModel(nn.Module):
             C = cut_embeds.size(0)
 
         # ----------------------------------------------------------------
-        # Phase A: cut beam search in latent space.
-        # Each beam state = (z [1,H], past_tokens [1,T,H], score float,
-        #                    cut_idx_list list[int])
+        # Phase A (cut beam) + speculative Phase B (branch rollout from
+        # pre-cut z) run concurrently on separate CUDA streams.
+        #
+        # If NO-CUT wins the beam the speculative branch scores are reused
+        # at zero extra cost.  If a cut is chosen, branch rollout re-runs
+        # from z_best (speculative result discarded).  On CPU the streams
+        # degrade gracefully to sequential execution.
         # ----------------------------------------------------------------
-        beams = [(z, past_tokens, baseline_score, [])]   # start: NO-CUT state
-        best_cut_indices = []                             # indices of chosen cuts
+        use_streams = device.type == "cuda"
+        stream_cut    = torch.cuda.Stream(device=device) if use_streams else None
+        stream_branch = torch.cuda.Stream(device=device) if use_streams else None
 
-        with torch.no_grad():
+        beams = [(z, past_tokens, baseline_score, [])]
+        best_cut_indices = []
+        speculative_scores: torch.Tensor | None = None
+
+        # --- Speculative branch rollout (stream_branch) ------------------
+        # Launched before the cut beam so both can overlap on the GPU.
+        if use_streams:
+            with torch.cuda.stream(stream_branch):
+                with torch.no_grad():
+                    speculative_scores = self.rollout_top_k_batched(
+                        z, h_vars, cand_indices,
+                        past_tokens=past_tokens,
+                        **branch_kwargs,
+                    )
+        # (CPU path: speculative_scores stays None; rollout runs serially later)
+
+        # --- Cut beam (stream_cut or default stream) ----------------------
+        cut_ctx = torch.cuda.stream(stream_cut) if use_streams else contextlib.nullcontext()
+        with cut_ctx, torch.no_grad():
             for _round in range(cut_rounds):
-                # Early stop: check policy entropy on the current best beam state
                 if entropy_thresh > 0.0 and frac_mask is not None and frac_mask.any():
                     z_cur, _, _, _ = beams[0]
                     logits = self.policy_scores(h_vars, z_cur, bvec_single)
                     probs  = torch.softmax(logits[frac_mask], dim=0)
                     H_pi   = float(-(probs * (probs + 1e-12).log()).sum())
                     if H_pi < entropy_thresh:
-                        break   # policy confident enough — stop cutting
+                        break
 
-                candidates = []   # (z', tok', score, cut_indices_so_far)
+                candidates = []
                 for z_s, tok_s, _score_s, idx_list in beams:
-                    # Expand: simulate each cut from this beam state
-                    z_exp  = z_s.expand(C, -1)        # [C, H]
-                    h_exp  = h_vars.unsqueeze(0).expand(C, -1, -1)  # [C, V, H]
-                    tok_exp = (tok_s.expand(C, -1, -1)
-                               if tok_s is not None else None)
-                    d_cut  = torch.zeros(C, dtype=z.dtype, device=device)  # d=0 for cuts
+                    z_exp   = z_s.expand(C, -1)
+                    h_exp   = h_vars.unsqueeze(0).expand(C, -1, -1)
+                    tok_exp = (tok_s.expand(C, -1, -1) if tok_s is not None else None)
+                    d_cut   = torch.zeros(C, dtype=z.dtype, device=device)
 
                     z_next, h_next, tok_next = self.dynamics_step_full_batched(
                         z_exp, cut_embeds, h_exp, tok_exp, d_cut
-                    )   # z_next [C,H], tok_next [C,T+1,H]
+                    )
 
-                    # Score each post-cut state with ValueHead
                     h_next_flat = h_next.reshape(C * h_vars.size(0), H)
                     bvec_c = torch.arange(C, device=device).repeat_interleave(h_vars.size(0))
                     fm_c   = (frac_mask.unsqueeze(0).expand(C, -1).reshape(-1)
@@ -1208,37 +1228,41 @@ class BnBWorldModel(nn.Module):
 
                     for ci in range(C):
                         candidates.append((
-                            z_next[ci:ci+1],             # [1, H]
-                            tok_next[ci:ci+1],           # [1, T+1, H]
+                            z_next[ci:ci+1],
+                            tok_next[ci:ci+1],
                             float(scores_c[ci].item()),
                             idx_list + [ci],
                         ))
 
-                # Also keep NO-CUT continuation (don't discard baseline beam)
                 candidates.extend(beams)
-
-                # Prune to top cut_beam states by value score (higher = better)
                 candidates.sort(key=lambda x: -x[2])
                 beams = candidates[:cut_beam]
 
-            # Best beam after all rounds
             z_best, tok_best, best_score, best_cut_indices = beams[0]
 
-            # If the best state is the NO-CUT baseline, return empty cut list.
             if best_score <= baseline_score + 1e-6 and not best_cut_indices:
                 z_best, tok_best = z, past_tokens
                 best_cut_indices = []
 
+        # Sync both streams before deciding which branch scores to use.
+        if use_streams:
+            torch.cuda.synchronize(device=device)
+
         # ----------------------------------------------------------------
-        # Phase B: branch rollout from z_best, conditioned on cut tokens.
-        # The causal Transformer sees [cut_tok, ..., branch_tok, ...] as
-        # one unified sequence — cuts condition all branch predictions.
+        # Phase B: branch rollout from z_best.
+        # Reuse speculative scores when NO-CUT won (z_best == z and
+        # tok_best == past_tokens) — avoids a redundant GPU kernel.
         # ----------------------------------------------------------------
-        branch_scores = self.rollout_top_k_batched(
-            z_best, h_vars, cand_indices,
-            past_tokens=tok_best,
-            **branch_kwargs,
-        )
+        no_cut_won = (not best_cut_indices)
+        if no_cut_won and speculative_scores is not None:
+            branch_scores = speculative_scores   # free reuse
+        else:
+            with torch.no_grad():
+                branch_scores = self.rollout_top_k_batched(
+                    z_best, h_vars, cand_indices,
+                    past_tokens=tok_best,
+                    **branch_kwargs,
+                )
 
         return best_cut_indices, branch_scores, z_best, tok_best
 
