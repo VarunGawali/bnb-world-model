@@ -370,6 +370,27 @@ class BnBSolver:
                     self.model.integrality_logit(z, depth_t, nfrac_t)
                 ).item()
 
+            # ---- Current-node neural pruning ------------------------------------
+            # After LP+GNN encode we already have z; skip all remaining work
+            # (rollout, cuts, child push) if the node looks clearly bad.
+            # Gate: near incumbent bound AND GNN predicts large costly subtree
+            # AND poor LP quality.  leaf_prob already computed above (free).
+            # This saves rollout + cut + child-dynamics cost for pruned nodes.
+            if self.neural_prune and global_ub < 1e29:
+                with torch.no_grad():
+                    cur_heads = self.model.multi_head_pred(
+                        z, h_vars, bvec_br, frac_mask=frac_t,
+                        value=True, subtree_size=True,
+                    )
+                _s_cur = cur_heads["subtree_size"].item()
+                _v_cur = cur_heads["value"].item()
+                _near_ub = lp_obj >= global_ub * (1.0 - self.neural_prune_margin) - 1e-6
+                if (_near_ub
+                        and _s_cur > self.neural_prune_s_thresh
+                        and _v_cur < self.neural_prune_v_thresh):
+                    n_nodes += 1
+                    continue   # prune: skip rollout + child generation entirely
+
             # ---- Cut selection + branch decision --------------------------------
             # Two paths depending on cut_mode:
             #
@@ -614,16 +635,20 @@ class BnBSolver:
                         ).item()
                         child_priority += self.dive_bonus * leaf_prob_child
 
-                # Neural pruning gate: skip children that are near the incumbent
-                # bound AND look expensive (large S) AND look LP-poor (small V).
-                # LP-sound: only fires when lp_obj is already close to global_ub,
-                # meaning the LP bound alone nearly prunes this node anyway.
+                # Neural pruning gate: skip children predicted to be unpromising.
+                # Two tiers:
+                #   Tier 1 (near-bound): close to incumbent AND large S AND poor V
+                #   Tier 2 (extreme S): subtree predicted 4× threshold regardless
+                #     of bound — a subtree of ~10k nodes is very unlikely to be worth
+                #     exploring when we already have a good incumbent.
                 if (self.neural_prune
-                        and s_child is not None and v_child is not None
-                        and lp_obj >= global_ub * (1.0 - self.neural_prune_margin) - 1e-6
-                        and s_child > self.neural_prune_s_thresh
-                        and v_child < self.neural_prune_v_thresh):
-                    continue   # prune: don't push to heap
+                        and s_child is not None and v_child is not None):
+                    near_ub = (global_ub < 1e29
+                               and lp_obj >= global_ub * (1.0 - self.neural_prune_margin) - 1e-6)
+                    tier1 = near_ub and s_child > self.neural_prune_s_thresh and v_child < self.neural_prune_v_thresh
+                    tier2 = s_child > self.neural_prune_s_thresh * 4.0 and v_child < self.neural_prune_v_thresh
+                    if tier1 or tier2:
+                        continue   # prune: don't push to heap
 
                 child = Node(
                     lb=lp_obj,

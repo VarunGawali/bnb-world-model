@@ -126,13 +126,15 @@ solver:
   skip_confident: null
   adaptive_conf_high: null
   adaptive_conf_mid: null
-  # Neural pruning gate. Only fires near incumbent bound (lp_obj >= ub*(1-margin)).
-  # AND gate: both S(z) > s_thresh AND V(z) < v_thresh required to prune.
-  # false by default — enable after SubtreeSizeHead and ValueHead are well-trained.
-  neural_prune: false
-  neural_prune_s_thresh: 5.0    # log1p subtree size threshold (~148 nodes)
-  neural_prune_v_thresh: 0.1    # value head threshold (LP quality very poor)
-  neural_prune_margin: 0.1      # only prune when lp_obj within 10% of global_ub
+  # Neural pruning gate. Two-tier: Tier 1 fires near incumbent bound (within
+  # margin) when S>s_thresh AND V<v_thresh. Tier 2 fires unconditionally when
+  # S > 4*s_thresh AND V<v_thresh (extreme subtree prediction overrides bound check).
+  # Current-node pruning also fires after GNN encode, before rollout, saving
+  # rollout + child-dynamics cost for clearly bad nodes.
+  neural_prune: true
+  neural_prune_s_thresh: 4.0    # log1p subtree size threshold (~53 nodes); tier2=16.0
+  neural_prune_v_thresh: 0.15   # value head threshold (LP quality poor)
+  neural_prune_margin: 0.15     # prune when lp_obj within 15% of global_ub (tier 1)
   # Dive bonus: add leaf_prob_child * dive_bonus to child priority.
   # 0.0 = disabled. ~0.5 gives meaningful incumbent-finding bias without
   # overriding the primary node selection signal.
