@@ -3,7 +3,6 @@ from .heads import (
     PolicyHead,
     ValueHead,
     IntegralityHead,
-    CuttingPlaneHead,
     SubtreeSizeHead,
     CostToGoHead,
 )
@@ -15,7 +14,6 @@ __all__ = [
     "PolicyHead",
     "ValueHead",
     "IntegralityHead",
-    "CuttingPlaneHead",
     "SubtreeSizeHead",
     "CostToGoHead",
     "DynamicsTransformer",
