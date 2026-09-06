@@ -197,16 +197,18 @@ class BnBSolver:
         # lookahead), "policy" (argmax policy, no rollout), "most_fractional".
         self.branch_mode         = "rollout"
 
-        # Main LP solves use the proven scipy path. highspy (if present) is used
-        # ONLY for basis extraction in Gomory cut generation, via the stable
-        # passModel API — the incremental highspy build API (addVars/
-        # changeColsCostByRange) varies across versions and is avoided here.
         try:
             import highspy
             self._highs = highspy
         except ImportError:
             self._highs = None
-        self._use_highs_direct = False
+        # Use HiGHS directly when available: enables LP warm-starting from parent
+        # basis so each child node pays only incremental pivot cost instead of a
+        # full cold-start solve.  The stable passModel / addVars / setBasis API
+        # is used throughout; changeColsCostByRange is avoided.
+        self._use_highs_direct = self._highs is not None
+        # Cache for static per-instance graph structure (set in _precompute_static_graph).
+        self._static_graph: Optional[dict] = None
 
         # P2.1: cut generation needs HiGHS (for the LP basis). If cuts are
         # requested but HiGHS is missing, fail loud rather than silently solving
@@ -237,12 +239,11 @@ class BnBSolver:
         n = len(c)
         m = len(b)
 
-        # Reset the per-instance Gomory cut pool: cuts are derived from THIS
-        # instance's (A, b, c) and are invalid for any other instance, so the
-        # cache must not leak across solve() calls (the benchmark reuses one
-        # solver object over many instances).
+        # Reset per-instance caches. Gomory cuts and static graph structure are
+        # instance-specific and must not leak across solve() calls.
         self._gomory_pool = None
         self._cuts_added = 0
+        self._precompute_static_graph(A, b, c)
 
         # Root LP
         root_lb_arr = np.zeros(n, dtype=np.float64)
@@ -260,8 +261,13 @@ class BnBSolver:
             A, b, c, x_lp, dual, root_lb_arr, root_ub_arr, []
         )
 
-        # Generate and apply cuts at root (legacy path — uses _select_cuts_neural)
-        root_cuts = self._select_cuts_neural(A, b, x_lp, c, z, [])
+        # Generate and apply cuts at root. Skip for "latent" mode: the main loop
+        # handles all cut planning via rollout_cut_branch_beam so root cuts here
+        # would use an inconsistent (legacy) selection mechanism.
+        root_cuts = (
+            [] if self.cut_mode == "latent"
+            else self._select_cuts_neural(A, b, x_lp, c, z, h_vars, [])
+        )
         if root_cuts:
             lp_obj2, x_lp2, dual2, feas2, root_basis2 = self._solve_lp(
                 A, b, c, root_lb_arr, root_ub_arr, root_cuts, warm_basis=root_basis
@@ -421,6 +427,19 @@ class BnBSolver:
                                     best_sol  = np.round(x_lp)
                                     status    = "feasible"
                                 continue
+                            # Re-encode from the true LP state after cut commit.
+                            # Without this, h_vars (pre-cut graph) and z_branch
+                            # (latent post-cut) diverge — the GNN sees different
+                            # constraint geometry than the dynamics expects.
+                            h_vars, z_branch, h_cons = self._encode_node(
+                                A, b, c, x_lp, dual,
+                                node.var_lb, node.var_ub,
+                                node.inherited_cuts + new_cuts,
+                            )
+                            h_cons_summary = h_cons.mean(0, keepdim=True)
+                            # tok_branch from beam search is the closest history
+                            # we have; keep it (the latent cut tokens condition
+                            # the branch dynamics correctly).
 
                 # Use the branch scores from the post-cut latent rollout directly
                 branch_var = int(top_k[cand_scores.argmax()].item())
@@ -740,6 +759,52 @@ class BnBSolver:
         return None, None, None, False, None
 
     # ------------------------------------------------------------------
+    # Static graph cache
+    # ------------------------------------------------------------------
+
+    def _precompute_static_graph(
+        self, A: np.ndarray, b: np.ndarray, c: np.ndarray
+    ) -> None:
+        """Cache the per-instance graph structure that never changes between nodes.
+
+        Edge topology (edge_index) and edge features (A coefficients, RHS
+        normalisation, signs) are fully determined by A and b, which are fixed
+        for the whole solve call.  Precomputing them once saves O(nnz) NumPy
+        work and a device transfer at every B&B node.
+        """
+        m, n  = A.shape
+        c_max = float(np.abs(c).max()) + 1e-8
+        b_max = float(np.abs(b).max()) + 1e-8
+
+        con_idx, var_idx = np.where(A > 1e-9)
+        if len(con_idx) == 0:
+            con_idx = np.array([0], dtype=np.int64)
+            var_idx = np.array([0], dtype=np.int64)
+
+        coeff      = A[con_idx, var_idx].astype(np.float32)
+        rhs_src    = b[con_idx].astype(np.float32)
+        norm_coeff = coeff / (np.abs(rhs_src) + 1e-8)
+        sign_coeff = np.sign(coeff)
+        edge_attr  = np.stack([coeff, norm_coeff, sign_coeff], axis=1)  # [E, 3]
+
+        con_to_var = np.vstack([con_idx + n, var_idx]).astype(np.int64)
+        var_to_con = np.vstack([var_idx, con_idx + n]).astype(np.int64)
+        edge_index = np.hstack([con_to_var, var_to_con])
+        edge_attr  = np.concatenate([edge_attr, edge_attr], axis=0)
+
+        node_type = np.array([0] * n + [1] * m, dtype=np.int64)
+        batch_vec = np.zeros(n + m, dtype=np.int64)
+
+        self._static_graph = dict(
+            ei=torch.tensor(edge_index, dtype=torch.long,    device=self.device),
+            ea=torch.tensor(edge_attr,  dtype=torch.float32, device=self.device),
+            nt=torch.tensor(node_type,  dtype=torch.long,    device=self.device),
+            bv=torch.tensor(batch_vec,  dtype=torch.long,    device=self.device),
+            n=n, m=m, c_max=c_max, b_max=b_max,
+            c_norm=torch.tensor(c / c_max, dtype=torch.float32, device=self.device),
+        )
+
+    # ------------------------------------------------------------------
     # Node encoding
     # ------------------------------------------------------------------
 
@@ -794,16 +859,16 @@ class BnBSolver:
             1  : A_{ij} / (|b_i| + 1e-8)
             2  : sign(A_{ij})
         """
-        m, n = A.shape
-        c_max = float(np.abs(c).max()) + 1e-8
-        b_max = float(np.abs(b).max()) + 1e-8
+        sg = self._static_graph   # precomputed per-instance static structure
+        n, m = sg["n"], sg["m"]
+        c_max, b_max = sg["c_max"], sg["b_max"]
 
-        # --- Variable features (Ecole-aligned) ---
-        at_lb = np.abs(x_lp - var_lb) < 1e-6
-        at_ub = np.abs(x_lp - var_ub) < 1e-6
+        # --- Variable features (Ecole-aligned, 19-dim) ---
+        at_lb    = np.abs(x_lp - var_lb) < 1e-6
+        at_ub    = np.abs(x_lp - var_ub) < 1e-6
         is_basic = (~at_lb) & (~at_ub)
 
-        rc = (c - A.T @ dual) if dual is not None else np.zeros(n)
+        rc     = (c - A.T @ dual) if dual is not None else np.zeros(n)
         rc_max = float(np.abs(rc).max()) + 1e-8
 
         cut_counts = np.zeros(n, dtype=np.float32)
@@ -811,75 +876,42 @@ class BnBSolver:
             cut_counts += (cut.lhs > 0.5).astype(np.float32)
 
         vf = np.zeros((n, 19), dtype=np.float32)
-        vf[:, 0]  = c / c_max                                        # obj_coef
-        vf[:, 1]  = 1.0                                               # is_type_binary
-        # 2,3,4: integer type flags — 0 (binary is handled via bounds)
-        vf[:, 5]  = (var_lb > -1e9).astype(np.float32)               # has_lower_bound
-        vf[:, 6]  = (var_ub <  1e9).astype(np.float32)               # has_upper_bound
-        vf[:, 7]  = np.clip(var_lb, 0, 1)                            # lower_bound
-        vf[:, 8]  = np.clip(var_ub, 0, 1)                            # upper_bound
-        vf[:, 9]  = at_lb.astype(np.float32)                          # basis_lower
-        vf[:, 10] = is_basic.astype(np.float32)                       # basis_basic
-        vf[:, 11] = at_ub.astype(np.float32)                          # basis_upper
-        # 12: basis_zero_free — 0
-        vf[:, 13] = np.clip(x_lp, 0.0, 1.0)                          # sol_val
-        vf[:, 14] = np.abs(x_lp - np.round(np.clip(x_lp, 0.0, 1.0))) # sol_frac
-        vf[:, 15] = at_lb.astype(np.float32)                          # sol_at_lb
-        vf[:, 16] = at_ub.astype(np.float32)                          # sol_at_ub
-        vf[:, 17] = rc / rc_max                                        # reduced_cost
-        vf[:, 18] = np.log1p(cut_counts)                              # age proxy
+        vf[:, 0]  = c / c_max
+        vf[:, 1]  = 1.0
+        vf[:, 5]  = (var_lb > -1e9).astype(np.float32)
+        vf[:, 6]  = (var_ub <  1e9).astype(np.float32)
+        vf[:, 7]  = np.clip(var_lb, 0, 1)
+        vf[:, 8]  = np.clip(var_ub, 0, 1)
+        vf[:, 9]  = at_lb.astype(np.float32)
+        vf[:, 10] = is_basic.astype(np.float32)
+        vf[:, 11] = at_ub.astype(np.float32)
+        vf[:, 13] = np.clip(x_lp, 0.0, 1.0)
+        vf[:, 14] = np.abs(x_lp - np.round(np.clip(x_lp, 0.0, 1.0)))
+        vf[:, 15] = at_lb.astype(np.float32)
+        vf[:, 16] = at_ub.astype(np.float32)
+        vf[:, 17] = rc / rc_max
+        vf[:, 18] = np.log1p(cut_counts)
 
-        # --- Constraint features (Ecole-aligned, 5-dim) ---
+        # --- Constraint features (Ecole-aligned, 5-dim, padded to 19) ---
         activity = A @ x_lp
-        cf = np.zeros((m, 5), dtype=np.float32)
-        # cf[:, 0] = obj_cosine_similarity — skip (0)
-        cf[:, 1] = b / b_max                                          # bias / normalised RHS
-        cf[:, 2] = (np.abs(activity - b) < 1e-6).astype(np.float32)  # is_tight
+        cf_pad   = np.zeros((m, 19), dtype=np.float32)
+        cf_pad[:, 1] = b / b_max
+        cf_pad[:, 2] = (np.abs(activity - b) < 1e-6).astype(np.float32)
         if dual is not None:
             dual_max = float(np.abs(dual).max()) + 1e-8
-            cf[:, 3] = dual / dual_max                                 # dual_solution_value
-        # cf[:, 4] = age — 0
+            cf_pad[:, 3] = dual / dual_max
 
-        # --- Edges: all non-zero entries of A ---
-        con_idx, var_idx = np.where(A > 1e-9)    # [E], [E]
-        if len(con_idx) == 0:
-            con_idx = np.array([0], dtype=np.int64)
-            var_idx = np.array([0], dtype=np.int64)
+        x_nodes = np.vstack([vf, cf_pad])   # [n+m, 19]
 
-        coeff     = A[con_idx, var_idx].astype(np.float32)
-        rhs_src   = b[con_idx].astype(np.float32)
-        norm_coeff = coeff / (np.abs(rhs_src) + 1e-8)
-        sign_coeff = np.sign(coeff)
-        edge_attr  = np.stack([coeff, norm_coeff, sign_coeff], axis=1)  # [E, 3]
-
-        # Node ordering: variables first [0..n-1], constraints after [n..n+m-1]
-        # P0.2: bidirectional edges (must match build_pyg_data / _format_obs).
-        # Without the variable->constraint direction the encoder's v2c pass sees
-        # no edges. Duplicate edge_attr for the reverse edges.
-        con_to_var = np.vstack([con_idx + n, var_idx]).astype(np.int64)   # [2, E]
-        var_to_con = np.vstack([var_idx, con_idx + n]).astype(np.int64)   # [2, E]
-        edge_index = np.hstack([con_to_var, var_to_con])                 # [2, 2E]
-        edge_attr  = np.concatenate([edge_attr, edge_attr], axis=0)      # [2E, 3]
-
-        # --- Padding constraints to 19-dim (pad with zeros after 5 features) ---
-        cf_pad = np.zeros((m, 19), dtype=np.float32)
-        cf_pad[:, :5] = cf
-
-        x_nodes = np.vstack([vf, cf_pad])  # [n+m, 19]
-        node_type = np.array(
-            [0] * n + [1] * m, dtype=np.int64
-        )
-        batch_vec = np.zeros(n + m, dtype=np.int64)
-
-        # --- Build PyG batch ---
+        # --- Build PyG batch — reuse cached static edge structure ---
         data = Data(
-            x          = torch.tensor(x_nodes,    dtype=torch.float32),
-            edge_index = torch.tensor(edge_index, dtype=torch.long),
-            edge_attr  = torch.tensor(edge_attr,  dtype=torch.float32),
-            node_type  = torch.tensor(node_type,  dtype=torch.long),
-            batch      = torch.tensor(batch_vec,  dtype=torch.long),
+            x          = torch.tensor(x_nodes, dtype=torch.float32, device=self.device),
+            edge_index = sg["ei"],
+            edge_attr  = sg["ea"],
+            node_type  = sg["nt"],
+            batch      = sg["bv"],
         )
-        pyg_batch = Batch.from_data_list([data]).to(self.device)
+        pyg_batch = Batch.from_data_list([data])
 
         with torch.no_grad():
             h_vars, z, h_cons = self.model.encode_with_cons(pyg_batch)
@@ -1191,22 +1223,26 @@ class BnBSolver:
         if not candidates:
             return np.array([], dtype=np.float32)
 
-        H   = h_vars.size(1)
-        loose = np.maximum(0.0, b - A @ x_lp).astype(np.float32)  # [m]
-        loose_t = torch.tensor(loose, dtype=torch.float32, device=self.device)
+        H     = h_vars.size(1)
+        loose = np.maximum(0.0, b - A @ x_lp).astype(np.float32)
+        loose_t = torch.tensor(loose, device=self.device)   # [m]
 
-        scores = []
+        lhs_np  = np.stack([cut.lhs for cut in candidates]).astype(np.float32)  # [C, n]
+        viol_np = np.array(
+            [max(0.0, float(cut.rhs - float(cut.lhs @ x_lp))) for cut in candidates],
+            dtype=np.float32,
+        )  # [C]
+
         with torch.no_grad():
-            for cut in candidates:
-                lhs_t = torch.tensor(cut.lhs, dtype=torch.float32, device=self.device)
-                h_cut = F.normalize((lhs_t @ h_vars).unsqueeze(0), dim=1).squeeze(0)
-                # Cross-attention: h_cut queries h_cons [m, H]
-                attn  = torch.softmax(h_cons @ h_cut / (H ** 0.5), dim=0)  # [m]
-                geom  = float((attn * loose_t).sum())
-                viol  = float(max(0.0, cut.rhs - float(cut.lhs @ x_lp)))
-                scores.append(geom + viol)
+            lhs_t   = torch.tensor(lhs_np, device=self.device)           # [C, n]
+            h_cut   = F.normalize(lhs_t @ h_vars, dim=1)                 # [C, H]
+            # Batched cross-attention: each cut queries all constraints
+            attn    = torch.softmax(h_cut @ h_cons.T / (H ** 0.5), dim=1)  # [C, m]
+            geom    = (attn * loose_t.unsqueeze(0)).sum(dim=1)           # [C]
+            viol_t  = torch.tensor(viol_np, device=self.device)
+            scores  = (geom + viol_t).cpu().numpy()
 
-        return np.array(scores, dtype=np.float32)
+        return scores.astype(np.float32)
 
     # ------------------------------------------------------------------
     # Cut-branch beam search via latent dynamics
@@ -1302,6 +1338,7 @@ class BnBSolver:
         x_lp: np.ndarray,
         c: np.ndarray,
         z: torch.Tensor,
+        h_vars: torch.Tensor,
         existing_cuts: list,
     ) -> list:
         """
