@@ -91,15 +91,19 @@ solver:
   lookahead_k: 3             # candidates evaluated with dynamics lookahead
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
-  # Predicted-subtree-size penalty. GATED OFF (0.0): the collected traces use
-  # SCIP's default (non-DFS) node order, so exact subtree_size labels cannot be
-  # derived from `depths` (see bnb_wm/data/labels.py) and the SubtreeSizeHead is
-  # untrained. Set >0 only with DFS-ordered collection or explicit tree ids.
-  size_weight: 0.0
-  # Cost-to-go penalty (Gap 3). Predicted remaining nodes (n_steps - t), lower
-  # is better. Trainable on the non-DFS traces. Set >0 to branch by cost-to-go;
-  # 0 recovers the pure dual-bound-value rollout (the ablation axis).
-  ctg_weight: 1.0
+  # Rollout scoring: score = value_weight*V(z') - size_weight*S(z') - ctg_weight*C(z')
+  # SubtreeSizeHead (S) is the primary signal — directly predicts remaining tree cost.
+  # ValueHead (V) adds LP-quality context (complementary, not redundant).
+  # CostToGoHead (C) has a linear-countdown target problem (n_steps - t along expert
+  # trajectory) — keep ctg_weight 0 until retrained with richer targets.
+  # Scale: V is in [0,1], S and C are in log1p space (~0-8) — weights already account
+  # for this difference (size_weight 0.7 vs value_weight 0.3 reflects actual scale).
+  # SubtreeSizeHead requires subtree_size labels in the dataset. If the head is
+  # untrained (non-DFS traces without tree-id tracking), set size_weight: 0.0 and
+  # value_weight: 1.0 to fall back to pure value scoring.
+  value_weight: 0.3          # LP-bound quality weight
+  size_weight: 0.7           # predicted-subtree-size penalty (primary signal)
+  ctg_weight: 0.0            # cost-to-go penalty — off until target is improved
   # Rollout branching factor (Gap 4). 1 = single greedy path; >1 expands a
   # predicted branching tree of that width and averages child continuations.
   branch_factor: 2
@@ -129,8 +133,9 @@ benchmark:
   lookahead_k: 5             # candidates for dynamics lookahead in benchmark
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
-  size_weight: 0.0           # gated off: non-DFS traces (see solver.size_weight)
-  ctg_weight: 1.0            # cost-to-go penalty in rollout score (Gap 3)
+  value_weight: 0.3          # LP-bound quality (mirrors solver.value_weight)
+  size_weight: 0.7           # subtree-size penalty (primary signal)
+  ctg_weight: 0.0            # cost-to-go — off until target is improved
   branch_factor: 2           # rollout tree width (Gap 4); 1 = single path
   use_reward_return: true    # MuZero-style return (mirrors solver.use_reward_return)
   # Confidence gate: skip rollout entirely when softmax top-1 mass >= threshold.

@@ -111,7 +111,8 @@ class BnBSolver:
         lookahead_k: int = 3,
         lookahead_depth: int = 3,
         lookahead_gamma: float = 0.95,
-        size_weight: float = 1.0,
+        value_weight: float = 0.3,
+        size_weight: float = 0.7,
         ctg_weight: float = 0.0,
         branch_factor: int = 1,
         node_selection: str = "bound",
@@ -138,8 +139,9 @@ class BnBSolver:
         self.lookahead_k         = lookahead_k
         self.lookahead_depth     = lookahead_depth   # steps of latent rollout
         self.lookahead_gamma     = lookahead_gamma   # discount per step
+        self.value_weight        = value_weight      # LP-bound quality weight
         self.size_weight         = size_weight       # predicted-subtree-size penalty
-        self.ctg_weight          = ctg_weight         # cost-to-go penalty (Gap 3)
+        self.ctg_weight          = ctg_weight        # cost-to-go penalty (Gap 3)
         self.branch_factor       = branch_factor      # rollout tree width (Gap 4)
         self.node_selection      = node_selection     # "bound" | "cost_to_go" (Gap 5)
         self.use_reward_return   = use_reward_return   # MuZero-style return (Fix 3)
@@ -362,8 +364,9 @@ class BnBSolver:
 
                 rollout_kw = dict(
                     depth=self.lookahead_depth, gamma=self.lookahead_gamma,
-                    valid_mask=valid_mask_v, size_weight=self.size_weight,
-                    ctg_weight=self.ctg_weight, branch_factor=self.branch_factor,
+                    valid_mask=valid_mask_v, value_weight=self.value_weight,
+                    size_weight=self.size_weight, ctg_weight=self.ctg_weight,
+                    branch_factor=self.branch_factor,
                     use_reward_return=self.use_reward_return,
                     uncertainty_weight=self.uncertainty_weight,
                 )
@@ -920,6 +923,7 @@ class BnBSolver:
                 gamma=self.lookahead_gamma,
                 valid_mask=valid_mask,
                 past_tokens=node.past_tokens,
+                value_weight=self.value_weight,
                 size_weight=self.size_weight,
                 ctg_weight=self.ctg_weight,
                 branch_factor=self.branch_factor,

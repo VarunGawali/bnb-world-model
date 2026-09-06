@@ -381,7 +381,8 @@ class BnBWorldModel(nn.Module):
         gamma: float,
         valid_mask: torch.Tensor | None = None,
         past_tokens: torch.Tensor | None = None,
-        size_weight: float = 1.0,
+        value_weight: float = 0.3,
+        size_weight: float = 0.7,
         ctg_weight: float = 0.0,
         branch_factor: int = 1,
         use_reward_return: bool = False,
@@ -660,15 +661,19 @@ class BnBWorldModel(nn.Module):
             if use_reward_return:
                 step_score = self.dynamics_reward_pred(z_next)
             else:
-                step_score = self.value_pred(
-                    z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
-                )
-
-            if ctg_weight != 0.0:
-                ctg = self.cost_to_go_pred(
-                    z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
-                )
-                step_score = step_score - ctg_weight * ctg
+                step_score = z_next.new_zeros(z_next.size(0))
+                if value_weight != 0.0:
+                    step_score = step_score + value_weight * self.value_pred(
+                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
+                    )
+                if size_weight != 0.0:
+                    step_score = step_score - size_weight * self.subtree_size_pred(
+                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
+                    )
+                if ctg_weight != 0.0:
+                    step_score = step_score - ctg_weight * self.cost_to_go_pred(
+                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
+                    )
 
             # Weights for step children: divide by K (averaging over K actions)
             # and replicate for n_dirs (directions are summed, not averaged).
@@ -714,7 +719,8 @@ class BnBWorldModel(nn.Module):
         gamma: float,
         valid_mask: torch.Tensor | None = None,
         past_tokens: torch.Tensor | None = None,
-        size_weight: float = 1.0,
+        value_weight: float = 0.3,
+        size_weight: float = 0.7,
         ctg_weight: float = 0.0,
         branch_factor: int = 1,
         use_reward_return: bool = False,
@@ -729,8 +735,29 @@ class BnBWorldModel(nn.Module):
         together; each candidate's subtree is tracked via a cand_id index so
         scores are scatter-added to the correct per-candidate accumulator.
 
+        Scoring at each imagined state:
+            score = value_weight * value_pred(z')
+                  - size_weight  * subtree_size_pred(z')   [log1p scale]
+                  - ctg_weight   * cost_to_go_pred(z')     [log1p scale]
+
+        SubtreeSizeHead is the primary signal: it directly predicts the tree
+        cost rooted at each imagined state. ValueHead is complementary (LP
+        quality). CostToGoHead has a within-node-constancy problem when trained
+        on expert-only linear-countdown targets — keep ctg_weight low or 0.
+
+        Scale note: value is in [0,1], subtree_size and ctg are in log1p space
+        (typically 0–8). The weights already account for this difference.
+
         Args:
             cand_indices      : LongTensor [K] of root candidate variable indices.
+            value_weight      : weight on value_pred (LP quality). Default 0.3.
+            size_weight       : weight on -subtree_size_pred (tree cost). Default 0.7.
+                                Requires SubtreeSizeHead to be trained (needs
+                                subtree_size labels in the dataset; non-DFS traces
+                                with tree-id tracking can produce them). Set to 0.0
+                                if the head is untrained.
+            ctg_weight        : weight on -cost_to_go_pred. Default 0 (off) due to
+                                the linear-countdown target problem.
             uncertainty_weight: penalise candidates whose +1/-1 child scores
                                 diverge (high spread = high dynamics uncertainty).
                                 0.0 disables the penalty (default, no extra cost).
@@ -810,15 +837,28 @@ class BnBWorldModel(nn.Module):
         if use_reward_return:
             score_root = self.dynamics_reward_pred(z_front)  # [F]
         else:
-            score_root = self.value_pred(
-                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-            )  # [F]
+            # Build composite score from all active heads at root children.
+            # SubtreeSizeHead is the primary signal (minimise predicted tree cost);
+            # ValueHead adds complementary LP-quality information.
+            score_root = z_front.new_zeros(z_front.size(0))  # [F]
 
-        if ctg_weight != 0.0:
-            ctg_root = self.cost_to_go_pred(
-                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-            )
-            score_root = score_root - ctg_weight * ctg_root
+            if value_weight != 0.0:
+                v_root = self.value_pred(
+                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+                )  # [F]  — higher is better (tighter bound)
+                score_root = score_root + value_weight * v_root
+
+            if size_weight != 0.0:
+                size_root = self.subtree_size_pred(
+                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+                )  # [F]  — log1p scale; lower is better → negate
+                score_root = score_root - size_weight * size_root
+
+            if ctg_weight != 0.0:
+                ctg_root = self.cost_to_go_pred(
+                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
+                )  # [F]  — log1p scale; lower is better → negate
+                score_root = score_root - ctg_weight * ctg_root
 
         # per_cand [K]: scatter-add scores to the owning candidate.
         per_cand = torch.zeros(K, dtype=z.dtype, device=device)
@@ -834,14 +874,6 @@ class BnBWorldModel(nn.Module):
             spread = dir_scores.max(dim=1).values - dir_scores.min(dim=1).values
         else:
             spread = None
-
-        if size_weight != 0.0:
-            size_root = self.subtree_size_pred(
-                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-            )
-            per_cand.scatter_add_(
-                0, cand_id, -size_weight * size_root
-            )
 
         # frontier_weights [F]: cumulative averaging weights (starts at 1).
         frontier_weights = torch.ones(F_root, dtype=z.dtype, device=device)
@@ -955,12 +987,19 @@ class BnBWorldModel(nn.Module):
             if use_reward_return:
                 step_score = self.dynamics_reward_pred(z_next)
             else:
-                step_score = self.value_pred(z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat)
-
-            if ctg_weight != 0.0:
-                step_score = step_score - ctg_weight * self.cost_to_go_pred(
-                    z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat
-                )
+                step_score = z_next.new_zeros(z_next.size(0))
+                if value_weight != 0.0:
+                    step_score = step_score + value_weight * self.value_pred(
+                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat
+                    )
+                if size_weight != 0.0:
+                    step_score = step_score - size_weight * self.subtree_size_pred(
+                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat
+                    )
+                if ctg_weight != 0.0:
+                    step_score = step_score - ctg_weight * self.cost_to_go_pred(
+                        z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat
+                    )
 
             # Weights: divide by K_act (averaging) × n_dirs (summed per direction).
             # Each expandable parent's weight is divided by K_act, then replicated
