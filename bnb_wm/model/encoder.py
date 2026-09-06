@@ -52,6 +52,7 @@ class CrossAttentionPool(nn.Module):
         h_vars: torch.Tensor,
         batch_vec: torch.Tensor,
         return_entropy: bool = False,
+        num_graphs: int | None = None,
     ):
         """
         Args:
@@ -59,11 +60,13 @@ class CrossAttentionPool(nn.Module):
             batch_vec     : [total_vars] batch assignment
             return_entropy: if True, also return per-graph effective V_eff
                             (exp of attention entropy) for diagnostics.
+            num_graphs    : batch size; pass batch.num_graphs to avoid a
+                            GPU-CPU sync from batch_vec.max().item().
         Returns:
             z             : [batch_size, H]
             (optional) v_eff : [batch_size] effective number of attended variables
         """
-        batch_size = int(batch_vec.max().item()) + 1
+        batch_size = num_graphs if num_graphs is not None else int(batch_vec.max().item()) + 1
         keys   = self.W_k(h_vars)   # [total_vars, H]
         values = self.W_v(h_vars)   # [total_vars, H]
 
@@ -209,6 +212,7 @@ class BipartiteGNN(nn.Module):
         batch_vec: torch.Tensor,
         edge_attr: torch.Tensor | None = None,
         return_pool_entropy: bool = False,
+        num_graphs: int | None = None,
     ):
         """
         Args:
@@ -218,6 +222,8 @@ class BipartiteGNN(nn.Module):
             batch_vec          : [N]      batch assignment
             edge_attr          : [E, 3]   per-edge features (optional; zeros if None)
             return_pool_entropy: if True, also return V_eff per graph (diagnostic)
+            num_graphs         : batch size; pass batch.num_graphs to avoid a
+                                 GPU-CPU sync inside CrossAttentionPool.
 
         Returns:
             h_vars  : [num_vars, hidden_dim]
@@ -286,8 +292,9 @@ class BipartiteGNN(nn.Module):
         h_vars = self.final_norm(h[var_mask])
 
         if return_pool_entropy:
-            z, v_eff = self.pool(h_vars, batch_vec[var_mask], return_entropy=True)
+            z, v_eff = self.pool(h_vars, batch_vec[var_mask],
+                                 return_entropy=True, num_graphs=num_graphs)
             return h_vars, z, h_cons_out, v_eff
 
-        z = self.pool(h_vars, batch_vec[var_mask])
+        z = self.pool(h_vars, batch_vec[var_mask], num_graphs=num_graphs)
         return h_vars, z, h_cons_out
