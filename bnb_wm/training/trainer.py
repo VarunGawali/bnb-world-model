@@ -956,6 +956,9 @@ class Trainer:
         self.cf_contrastive_weight  = cf_weight
         self.free_run_consist_weight = free_run_weight
 
+        # Enable gradient checkpointing on GNN encoder to save activation memory.
+        self.model.encoder.use_grad_checkpoint = also_train_encoder
+
         # Determine trainable set.
         _always = {"dynamics", "dyn_bound", "dyn_reward", "cut_action_embed"}
         if also_train_encoder:

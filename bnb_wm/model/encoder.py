@@ -22,6 +22,7 @@ Architecture changes vs. original:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 from torch_geometric.nn import GATv2Conv
 from torch_geometric.utils import softmax as segment_softmax
 from torch_geometric.utils import scatter
@@ -161,6 +162,7 @@ class BipartiteGNN(nn.Module):
 
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
+        self.use_grad_checkpoint = False  # enabled externally when training encoder
 
         # Fixed per-feature input standardisation ("prenorm"). Buffers hold the
         # training-set mean/std; set once via set_feature_stats before training
@@ -309,8 +311,13 @@ class BipartiteGNN(nn.Module):
         for i in range(self.n_layers):
             last = i == self.n_layers - 1
             # Constraints -> variables (pre-norm: LN before activation)
-            upd_v = self.conv_c2v[i](h, edge_c2v, edge_attr=attr_c2v)[var_mask]
-            upd_v = F.relu(self.norm_var[i](upd_v)).to(h.dtype)
+            _conv_c2v = self.conv_c2v[i]
+            _norm_var  = self.norm_var[i]
+            if self.use_grad_checkpoint and self.training:
+                upd_v = grad_ckpt(lambda h_: _conv_c2v(h_, edge_c2v, edge_attr=attr_c2v), h, use_reentrant=False)[var_mask]
+            else:
+                upd_v = _conv_c2v(h, edge_c2v, edge_attr=attr_c2v)[var_mask]
+            upd_v = F.relu(_norm_var(upd_v)).to(h.dtype)
 
             # Variables -> constraints. The LAST layer's constraint update is
             # dead — only h_vars is pooled afterwards, so updated constraint rows
@@ -321,8 +328,13 @@ class BipartiteGNN(nn.Module):
             # which is the fully-updated constraint embedding that h_vars[L] was
             # built from. This exposes h_cons without running an extra GATv2 pass.
             if not last:
-                upd_c = self.conv_v2c[i](h, edge_v2c, edge_attr=attr_v2c)[con_mask]
-                upd_c = F.relu(self.norm_con[i](upd_c)).to(h.dtype)
+                _conv_v2c = self.conv_v2c[i]
+                _norm_con  = self.norm_con[i]
+                if self.use_grad_checkpoint and self.training:
+                    upd_c = grad_ckpt(lambda h_: _conv_v2c(h_, edge_v2c, edge_attr=attr_v2c), h, use_reentrant=False)[con_mask]
+                else:
+                    upd_c = _conv_v2c(h, edge_v2c, edge_attr=attr_v2c)[con_mask]
+                upd_c = F.relu(_norm_con(upd_c)).to(h.dtype)
 
             # Residual update — in-place scatter to avoid h.clone()
             h = h.index_put((var_mask.nonzero(as_tuple=True)[0],),
