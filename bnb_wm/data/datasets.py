@@ -905,6 +905,128 @@ def _root_to_leaf_paths(node_ids, parent_ids, max_path_len):
     return paths
 
 
+class RawSequenceDataset(Dataset):
+    """
+    Like SequenceDataset but stores NO latents — returns raw PyG Data objects
+    and enough metadata to reconstruct the encoded sequence inside the training
+    loop.  Use this when the encoder is jointly trained in Phase 3 so that
+    z_seq / z_next_seq are always produced by the CURRENT encoder weights
+    rather than a stale cached snapshot.
+
+    One item is one root->leaf path.  The collate function (make_raw_collate)
+    batches the per-step PyG Data into a single large PyG Batch and records
+    segment boundaries so the trainer can reconstruct per-step tensors.
+
+    Item keys:
+        graphs        list[Data]   one PyG Data per path node (len = P)
+        branch_vars   [P]   int    chosen branching variable (global idx)
+        bound_seq     [P]   float  normalised dual bound at each node
+        dir_seq       [P]   float  branch direction (+1/-1/0)
+        instance_weight  float     1 / n_paths_for_this_file
+    """
+
+    def __init__(self, files, max_vars_recon=64, max_path_len=64, seed=0,
+                 allow_visitation_fallback=False):
+        self.files   = list(files)
+        self.max_vars_recon = max_vars_recon
+        self.max_path_len   = max_path_len
+        self.seed    = seed
+        self.allow_visitation_fallback = allow_visitation_fallback
+
+        self.index = []   # (file_idx, path_list, instance_weight)
+        for fi, f in enumerate(self.files):
+            with np.load(f, allow_pickle=True) as d:
+                T = int(d["n_steps"])
+                if "node_ids" in d and "parent_ids" in d:
+                    paths = _root_to_leaf_paths(
+                        np.asarray(d["node_ids"]), np.asarray(d["parent_ids"]),
+                        max_path_len)
+                elif allow_visitation_fallback:
+                    paths = [list(range(T))] if T >= 2 else []
+                else:
+                    raise ValueError(
+                        f"{f} has no node_ids/parent_ids. "
+                        "Pass allow_visitation_fallback=True for legacy data.")
+            w = 1.0 / max(len(paths), 1)
+            for p in paths:
+                self.index.append((fi, p, w))
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, i):
+        fi, path, w = self.index[i]
+        d = np.load(self.files[fi], allow_pickle=True)
+        T = int(d["n_steps"])
+
+        graphs      = [build_pyg_data(
+                            d["var_features"][t], d["con_features"][t],
+                            d["edge_indices"][t],  d["edge_values"][t])
+                       for t in path]
+        branch      = np.asarray(d["branching_vars"], dtype=np.int64)
+        ndb_all     = gap_to_primal_norm(d)
+
+        if "branch_dirs" in d:
+            bdir = np.asarray(d["branch_dirs"], dtype=np.float32)
+        else:
+            bdir = np.zeros(T, dtype=np.float32)
+
+        return {
+            "graphs":          graphs,
+            "branch_vars":     torch.as_tensor(branch[path], dtype=torch.long),
+            "bound_seq":       torch.as_tensor(ndb_all[path],  dtype=torch.float32),
+            "dir_seq":         torch.as_tensor(bdir[path],     dtype=torch.float32),
+            "instance_weight": torch.tensor(w,                 dtype=torch.float32),
+        }
+
+
+def make_raw_collate():
+    """
+    Collate for RawSequenceDataset.  Flattens all per-step PyG Data objects
+    into a single Batch and records cumulative segment lengths so the trainer
+    can split encoded tensors back into per-path, per-step blocks.
+
+    Batch keys:
+        batch_graphs    Batch    all steps from all paths concatenated
+        batch_sizes     [B]      number of steps per path (before padding)
+        branch_vars     [sum_P]  branching variable per step, concatenated
+        bound_seq       [B, Tmax]
+        dir_seq         [B, Tmax]
+        time_mask       [B, Tmax] bool
+        instance_weight [B]
+    """
+    def _collate(items):
+        sizes   = torch.tensor([len(it["graphs"]) for it in items], dtype=torch.long)
+        Tmax    = int(sizes.max().item())
+        B       = len(items)
+
+        all_graphs  = [g for it in items for g in it["graphs"]]
+        batch_graphs = Batch.from_data_list(all_graphs)
+
+        branch_vars = torch.cat([it["branch_vars"] for it in items])
+        iw          = torch.stack([it["instance_weight"] for it in items])
+
+        bound  = torch.zeros(B, Tmax)
+        dseq   = torch.zeros(B, Tmax)
+        tmask  = torch.zeros(B, Tmax, dtype=torch.bool)
+        for i, it in enumerate(items):
+            P = int(sizes[i])
+            bound[i, :P] = it["bound_seq"]
+            dseq[i,  :P] = it["dir_seq"]
+            tmask[i, :P] = True
+
+        return {
+            "batch_graphs":   batch_graphs,
+            "batch_sizes":    sizes,
+            "branch_vars":    branch_vars,
+            "bound_seq":      bound,
+            "dir_seq":        dseq,
+            "time_mask":      tmask,
+            "instance_weight": iw,
+        }
+    return _collate
+
+
 def make_sequence_collate(include_vars=True):
     """
     Build a collate that pads trajectories to the batch's max length and

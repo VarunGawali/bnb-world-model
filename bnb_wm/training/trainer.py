@@ -520,7 +520,78 @@ class Trainer:
             print(f"  saved -> {save_path}")
         return out
 
-    def _dynamics_batch_loss(self, batch):
+    def _online_encode_raw_batch(self, raw):
+        """
+        Convert a RawSequenceDataset batch (batch_graphs + branch_vars) into
+        the standard dict form that _dynamics_batch_loss expects.
+
+        Called only when also_train_encoder=True.  Runs WITH gradients so that
+        encoder parameters receive gradients through z_seq / z_next_seq.
+        """
+        from torch_geometric.data import Batch as _Batch
+        gb      = raw["batch_graphs"].to(self.device)
+        sizes   = raw["batch_sizes"]               # [B] number of steps per path
+        bvars   = raw["branch_vars"].to(self.device)  # [sum_P] global var idx
+        bound   = raw["bound_seq"].to(self.device)
+        dseq    = raw["dir_seq"].to(self.device)
+        tmask   = raw["time_mask"].to(self.device)
+        iw      = raw.get("instance_weight")
+
+        # Encode ALL steps in one batched call.
+        h_vars_all, z_all = self.model.encode(gb)  # [sum_P_vars, H], [sum_P, H]
+
+        # Split z_all and h_vars_all back into per-path, per-step segments.
+        B    = len(sizes)
+        H    = self.model.hidden_dim
+        Tmax = int(tmask.size(1))
+
+        # node_type==0 -> variable nodes; gb.batch maps nodes to "step" index
+        var_mask_all = gb.node_type == 0
+        var_step_batch = gb.batch[var_mask_all]   # which step each var belongs to
+
+        z_seq      = torch.zeros(B, Tmax, H, device=self.device)
+        a_seq      = torch.zeros(B, Tmax, H, device=self.device)
+        z_next_seq = torch.zeros(B, Tmax, H, device=self.device)
+
+        step_offset = 0
+        var_offset  = 0
+        for i, P in enumerate(sizes.tolist()):
+            P = int(P)
+            if P < 2:
+                step_offset += P
+                # advance var_offset
+                for s in range(P):
+                    n_v = int((var_step_batch == (step_offset - P + s)).sum())
+                    var_offset += n_v
+                continue
+            for s in range(P):
+                global_step = step_offset + s
+                z_seq[i, s] = z_all[global_step]
+                # action = h_vars of chosen branching variable at step s
+                n_v = int((var_step_batch == global_step).sum())
+                hs  = h_vars_all[var_offset : var_offset + n_v]
+                bv  = int(bvars[step_offset + s].item())
+                bv  = bv if 0 <= bv < n_v else 0
+                a_seq[i, s] = hs[bv]
+                var_offset += n_v
+            # z_next: shift by 1 (child steps)
+            for s in range(P - 1):
+                z_next_seq[i, s] = z_all[step_offset + s + 1]
+            step_offset += P
+
+        out = {
+            "z_seq":          z_seq,
+            "a_seq":          a_seq,
+            "z_next_seq":     z_next_seq,
+            "bound_next_seq": bound,
+            "dir_seq":        dseq,
+            "time_mask":      tmask,
+        }
+        if iw is not None:
+            out["instance_weight"] = iw.to(self.device)
+        return out
+
+    def _dynamics_batch_loss(self, batch, return_components=False):
         """
         Compute the Phase-3 dynamics loss for one batch.
 
@@ -584,15 +655,20 @@ class Trainer:
             # Same as forward_with_vars but reusing the z_pred computed above.
             hv_pred = self.model.dynamics.var_dynamics(hv_seq, z_pred, a_seq)
 
-        loss = self._transition_loss(z_pred, z_next_seq, logvar, tmask)
+        comps: dict[str, float] = {}
+
+        L_trans = self._transition_loss(z_pred, z_next_seq, logvar, tmask)
+        comps["transition"] = L_trans.item()
+        loss = L_trans
 
         if has_vars:
-            # var_mask already spans only valid time positions.
-            loss = loss + _var_recon_loss(
+            L_var = _var_recon_loss(
                 hv_pred,
                 d["hv_next_seq"].to(self.device),
                 d["var_mask"].to(self.device),
             )
+            comps["var_recon"] = L_var.item()
+            loss = loss + L_var
 
         # Multi-anchor latent overshooting (+ rollout grounding). Unroll the
         # dynamics autoregressively — feeding its own predictions back in — from
@@ -605,20 +681,24 @@ class Trainer:
         bound_tgt = d.get("bound_next_seq")
         if bound_tgt is not None:
             bound_tgt = bound_tgt.to(self.device)
-        loss = loss + self._overshoot_and_ground(
+        L_over = self._overshoot_and_ground(
             z_seq, a_seq, d_seq, z_next_seq, tmask, bound_tgt)
+        comps["overshoot"] = L_over.item()
+        loss = loss + L_over
 
         # Gap 2: ground the predicted latent against the next real dual bound.
         if d.get("bound_next_seq") is not None:
             bound_pred = self.model.dynamics_bound_pred(z_pred)   # [B, T]
             bound_tgt  = d["bound_next_seq"].to(self.device)
             if tmask is None:
-                loss = loss + 0.5 * F.huber_loss(bound_pred, bound_tgt, delta=1.0)
+                L_bnd = 0.5 * F.huber_loss(bound_pred, bound_tgt, delta=1.0)
             else:
                 per = F.huber_loss(bound_pred, bound_tgt, delta=1.0,
                                    reduction="none")
-                loss = loss + 0.5 * (per * tmask.float()).sum() / \
+                L_bnd = 0.5 * (per * tmask.float()).sum() / \
                     tmask.float().sum().clamp_min(1.0)
+            comps["bound"] = L_bnd.item()
+            loss = loss + L_bnd
 
         # Fix 3: train the reward head to predict the per-step dual-bound
         # improvement, so the MuZero-style rollout return is grounded.
@@ -626,11 +706,13 @@ class Trainer:
             r_pred = self.model.dynamics_reward_pred(z_pred)      # [B, T]
             r_tgt  = d["reward_seq"].to(self.device)
             if tmask is None:
-                loss = loss + 0.5 * F.huber_loss(r_pred, r_tgt, delta=1.0)
+                L_rew = 0.5 * F.huber_loss(r_pred, r_tgt, delta=1.0)
             else:
                 per = F.huber_loss(r_pred, r_tgt, delta=1.0, reduction="none")
-                loss = loss + 0.5 * (per * tmask.float()).sum() / \
+                L_rew = 0.5 * (per * tmask.float()).sum() / \
                     tmask.float().sum().clamp_min(1.0)
+            comps["reward"] = L_rew.item()
+            loss = loss + L_rew
 
         # Candidate ranking loss — the missing counterfactual objective.
         #
@@ -693,12 +775,14 @@ class Trainer:
                     _cand_rank_loss(scalars[i], sb_bt[i]) for i in range(N)
                 ]
                 cand_rank_w = getattr(self, "cand_rank_weight", 0.5)
-                loss = loss + cand_rank_w * torch.stack(rank_losses).mean()
+                L_rank = cand_rank_w * torch.stack(rank_losses).mean()
+                comps["ranking"] = L_rank.item()
+                loss = loss + L_rank
 
         # Value consistency in Phase 3: predicted latents should decode through
         # the (frozen) value head to match the target latent's value. Prevents
         # dynamics from drifting into a region the value head cannot decode.
-        # Weight is small (0.1) so it anchors without overwhelming the MSE loss.
+        # The value head is used in no_grad (teacher) — it stays frozen here.
         v_consist_w = getattr(self, "v_consist_weight", 0.1)
         if v_consist_w > 0.0:
             with torch.no_grad():
@@ -716,11 +800,13 @@ class Trainer:
             ).reshape(B_s, T_s)
 
             if tmask is not None:
-                per = F.mse_loss(v_pred, v_tgt, reduction="none")
-                loss = loss + v_consist_w * (per * tmask.float()).sum() / \
+                per = F.huber_loss(v_pred, v_tgt, reduction="none")
+                L_vc = v_consist_w * (per * tmask.float()).sum() / \
                     tmask.float().sum().clamp_min(1.0)
             else:
-                loss = loss + v_consist_w * F.mse_loss(v_pred, v_tgt)
+                L_vc = v_consist_w * F.huber_loss(v_pred, v_tgt)
+            comps["value_consist"] = L_vc.item()
+            loss = loss + L_vc
 
         # Fix C: self-supervised consistency on free-running predictions.
         # The free-running rollout from anchor 0 produces z_hat_1..T.  These
@@ -734,115 +820,120 @@ class Trainer:
             B_c, T_c, H_c = z_seq.shape
             if T_c >= 2:
                 with torch.no_grad():
-                    # Free-run the full trajectory from step 0.
                     free_preds = self.model.dynamics.rollout(
-                        z_seq[:, 0], a_seq,
-                        d_seq=d_seq,
-                    )  # [B, T, H] — predictions for steps 1..T
-                # Supervise against real next latents.
+                        z_seq[:, 0], a_seq, d_seq=d_seq,
+                    )  # [B, T, H]
                 if tmask is not None:
                     m = tmask.unsqueeze(-1).float()
                     per = ((free_preds - z_next_seq) ** 2 * m).sum()
-                    loss = loss + consist_w * per / (
-                        m.sum().clamp_min(1.0) * H_c)
+                    L_cons = consist_w * per / (m.sum().clamp_min(1.0) * H_c)
                 else:
-                    loss = loss + consist_w * F.mse_loss(free_preds, z_next_seq)
+                    L_cons = consist_w * F.mse_loss(free_preds, z_next_seq)
+                comps["free_run"] = L_cons.item()
+                loss = loss + L_cons
 
-        # Fix F: cut transition MSE loss.
-        # The cut batch carries raw graph features (graph_before, graph_after,
-        # cut_feats) rather than stale cached latents.  We encode them using
-        # the CURRENT encoder so that z_before and z_after are always on the
-        # same manifold as the evolving Phase-3 encoder, then train:
-        #   Dynamics(z_before, cut_action_embed(cut_feats), d=0) ≈ z_after
-        # Weight 0.1 — warm-start safe (cut_action_embed starts at zero so
-        # L_cut ≈ 0 initially and grows as the embedding learns).
+        # Fix F: cut transition MSE loss (raw graph → encode on-the-fly →
+        # Dynamics(z_before, cut_action_embed(cut_feats), d=0) ≈ z_after).
         if d.get("graph_before") is not None:
             gb  = d["graph_before"].to(self.device)
             ga  = d["graph_after"].to(self.device)
             cut_phi = d["cut_feats"].to(self.device)        # [N, cut_feat_dim]
-            # Encode with current (possibly updating) encoder.
-            # grad flows through cut_action_embed and dynamics.step only —
-            # z_before/z_after are detached to avoid coupling the encoder
-            # update to the cut transition loss in Phase 3.
             with torch.no_grad():
                 _, z_before_all, _ = self.model.encode_with_cons(gb)
                 _, z_after_all, _  = self.model.encode_with_cons(ga)
-            # encoder returns (h_vars, z, h_cons); z is [B, H]
             cut_zb = z_before_all.detach()
             cut_za = z_after_all.detach()
             a_cut  = self.model.cut_action_embed(cut_phi)   # [N, H]
-            # d=0.0 discriminates cut actions from branch (+1/-1).
             z_cut_pred, _, _ = self.model.dynamics.step(
                 cut_zb, a_cut, d_t=0.0)                     # [N, H]
             cut_w = getattr(self, "cut_transition_weight", 0.1)
-            loss = loss + cut_w * F.mse_loss(z_cut_pred, cut_za)
+            L_cut = cut_w * F.mse_loss(z_cut_pred, cut_za)
+            comps["cut"] = L_cut.item()
+            loss = loss + L_cut
 
         # Fix D: counterfactual contrastive loss.
-        # Dynamics(z_t, a_cf) should predict the expert next state z_{t+1}
-        # WORSE than Dynamics(z_t, a_expert) does.  We train it with a margin
-        # loss: MSE(z_pred_cf, z_next) >= MSE(z_pred, z_next) + margin.
-        # This teaches the model that the action embedding actually matters —
-        # preventing the "ignore action" collapse on expert-only data.
         if d.get("a_cf_seq") is not None:
             a_cf = d["a_cf_seq"].to(self.device)          # [B, T, H]
-            z_pred_cf = self.model.dynamics_forward(z_seq, a_cf, d_seq)  # [B,T,H]
-            # Per-step squared errors for expert vs counterfactual.
-            err_expert = ((z_pred      - z_next_seq) ** 2).mean(-1)  # [B, T]
-            err_cf     = ((z_pred_cf   - z_next_seq) ** 2).mean(-1)  # [B, T]
+            z_pred_cf = self.model.dynamics_forward(z_seq, a_cf, d_seq)
+            err_expert = ((z_pred    - z_next_seq) ** 2).mean(-1)
+            err_cf     = ((z_pred_cf - z_next_seq) ** 2).mean(-1)
             margin = 0.1
-            # Hinge: penalise when cf error <= expert error + margin.
-            hinge = F.relu(margin + err_expert - err_cf)              # [B, T]
-            cf_w = getattr(self, "cf_contrastive_weight", 0.3)
+            hinge = F.relu(margin + err_expert - err_cf)
+            cf_w  = getattr(self, "cf_contrastive_weight", 0.3)
             if tmask is not None:
-                loss = loss + cf_w * (hinge * tmask.float()).sum() / \
+                L_cf = cf_w * (hinge * tmask.float()).sum() / \
                     tmask.float().sum().clamp_min(1.0)
             else:
-                loss = loss + cf_w * hinge.mean()
+                L_cf = cf_w * hinge.mean()
+            comps["cf_contrast"] = L_cf.item()
+            loss = loss + L_cf
 
+        if return_components:
+            return loss, comps
         return loss
 
     def train_dynamics(self, train_loader, val_loader, epochs, lr=5e-4,
                        overshoot_depth=0, patience=None,
                        cand_rank_weight: float = 0.5,
-                       also_train: tuple[str, ...] = ()):
+                       also_train: tuple[str, ...] = (),
+                       also_train_encoder: bool = False,
+                       encoder_lr_scale: float = 0.1):
         """
-        Train DynamicsTransformer on pre-computed trajectory sequences.
+        Train DynamicsTransformer (+ optionally the encoder) on trajectory seqs.
 
-        The encoder is frozen. Each batch yields:
-            z_seq      : [B, T, H]  encoder outputs along trajectory
-            a_seq      : [B, T, H]  action embeddings (branching var h_vars)
-            z_next_seq : [B, T, H]  true next encoder outputs (targets)
+        When also_train_encoder=True the loader MUST yield raw PyG graphs
+        (RawSequenceDataset / make_raw_collate) rather than pre-encoded
+        latents.  The encoder is then run at every training step so that
+        z_seq / z_next_seq always reflect the CURRENT encoder weights.  The
+        encoder is trained at encoder_lr_scale * lr to avoid destroying the
+        Phase-1/2 representations.
 
-        The SequenceDataset is responsible for pre-computing z and a
-        values using the frozen encoder from Phase 1/2.
+        When also_train_encoder=False (default) the loader provides pre-
+        encoded latents (SequenceDataset / make_sequence_collate) and the
+        encoder is frozen — identical to the original Phase-3 behaviour.
 
-        If the loader also yields per-variable embedding sequences, the
-        dynamics model's per-variable head is supervised jointly. This is
-        what keeps predicted future h_vars on the real-encoder manifold, so
-        the policy can be re-run on predicted states during the latent
-        rollout without distribution drift. Loader batch forms supported:
-
-            (z_seq, a_seq, z_next_seq)
-            (z_seq, a_seq, z_next_seq, hv_seq, hv_next_seq, var_mask)
+        Loss components logged each epoch (both modes):
+            transition, var_recon, overshoot, bound, reward, ranking,
+            value_consist, cut   (each weighted as configured)
         """
-        self.overshoot_depth = overshoot_depth
+        self.overshoot_depth  = overshoot_depth
         self.cand_rank_weight = cand_rank_weight
-        # Train the dynamics transformer AND its two prediction heads. dyn_bound
-        # (Gap 2) and dyn_reward (Fix 3) are top-level modules whose parameter
-        # names do NOT contain "dynamics", so they must be named explicitly or
-        # they would stay frozen and never learn.
+        self._also_train_encoder = also_train_encoder
+
+        # Determine trainable set.
         _always = {"dynamics", "dyn_bound", "dyn_reward", "cut_action_embed"}
-        _extra  = set(also_train)
+        if also_train_encoder:
+            _always.add("encoder")
+        _extra = set(also_train)
         _all_prefixes = _always | _extra
         for name, p in self.model.named_parameters():
             p.requires_grad = any(tok in name for tok in _all_prefixes)
 
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
-        extra_str = f" + {sorted(_extra)}" if _extra else ""
-        print(f"Trainable params (Phase 3{extra_str}): {sum(p.numel() for p in trainable):,}"
-              f" | overshoot_depth={overshoot_depth}")
+        # Separate param groups: encoder gets a lower LR to avoid destroying
+        # Phase-1/2 representations.
+        if also_train_encoder:
+            enc_params  = [p for n, p in self.model.named_parameters()
+                           if p.requires_grad and "encoder" in n]
+            dyn_params  = [p for n, p in self.model.named_parameters()
+                           if p.requires_grad and "encoder" not in n]
+            param_groups = [
+                {"params": dyn_params, "lr": lr},
+                {"params": enc_params, "lr": lr * encoder_lr_scale},
+            ]
+            n_enc = sum(p.numel() for p in enc_params)
+            n_dyn = sum(p.numel() for p in dyn_params)
+            print(f"Trainable (Phase 3 + encoder): "
+                  f"dynamics={n_dyn:,}  encoder={n_enc:,} "
+                  f"(lr×{encoder_lr_scale}) | overshoot_depth={overshoot_depth}")
+        else:
+            trainable = [p for p in self.model.parameters() if p.requires_grad]
+            param_groups = trainable
+            extra_str = f" + {sorted(_extra)}" if _extra else ""
+            print(f"Trainable params (Phase 3{extra_str}): "
+                  f"{sum(p.numel() for p in trainable):,}"
+                  f" | overshoot_depth={overshoot_depth}")
 
-        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=epochs, eta_min=1e-5
         )
@@ -876,7 +967,8 @@ class Trainer:
                 self._p_free_run = 0.0
 
             self.model.train()
-            total_loss = n = oom_count = 0
+            total_loss = n = oom_count = oom_samples = 0
+            comp_sums = defaultdict(float)  # per-component loss sums
 
             for batch in tqdm(
                 train_loader,
@@ -886,44 +978,105 @@ class Trainer:
             ):
                 optimizer.zero_grad(set_to_none=True)
                 try:
+                    # Online encoding: when also_train_encoder=True the batch
+                    # carries raw PyG graphs (RawSequenceDataset); encode them
+                    # here with the CURRENT encoder so z_seq/z_next_seq are never
+                    # stale.  The standard SequenceDataset path (pre-encoded
+                    # latents) is unchanged.
+                    if also_train_encoder and "batch_graphs" in batch:
+                        batch = self._online_encode_raw_batch(batch)
+
                     with autocast("cuda", enabled=self.amp):
-                        loss = self._dynamics_batch_loss(batch)
+                        loss, comps = self._dynamics_batch_loss(
+                            batch, return_components=True)
 
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                    all_trainable = [p for p in self.model.parameters()
+                                     if p.requires_grad]
+                    torch.nn.utils.clip_grad_norm_(all_trainable, 1.0)
                     self.scaler.step(optimizer)
                     self.scaler.update()
 
                     total_loss += loss.item()
+                    for k_c, v_c in comps.items():
+                        comp_sums[k_c] += v_c
                     n += 1
                 except RuntimeError as e:
                     if _is_oom(e):
                         _recover_oom(optimizer)
                         oom_count += 1
+                        # Estimate skipped samples from batch structure.
+                        try:
+                            oom_samples += int(
+                                batch.get("time_mask", batch.get("z_seq")).shape[0])
+                        except Exception:
+                            oom_samples += 1
                         continue
                     raise
 
             if oom_count:
                 import warnings
                 warnings.warn(
-                    f"[Phase3] Epoch {epoch}: {oom_count} OOM batches skipped "
-                    f"({oom_count}/{n + oom_count} = "
-                    f"{100*oom_count/(n+oom_count):.1f}%). "
+                    f"[Phase3] Epoch {epoch}: {oom_count} OOM batches / "
+                    f"~{oom_samples} samples skipped "
+                    f"({100*oom_count/(n+oom_count):.1f}% of batches). "
                     "Consider reducing batch size or sequence length.",
                     RuntimeWarning, stacklevel=2,
                 )
 
-            # Validation — instance-weighted so large-tree files don't dominate.
+            # Validation — instance-weighted, tracked per k-horizon and per
+            # loss component so large trees don't dominate and per-horizon
+            # curves stay comparable across epochs.
             self.model.eval()
-            val_loss_sum = val_w_sum = val_n = 0
+            val_loss_sum  = val_w_sum = 0
+            val_comp_sums = defaultdict(float)
+            # Per-horizon latent MSE: always evaluate at k=1 and the final
+            # horizon so we can track improvement independently of curriculum.
+            horizons = sorted({1, max(1, self._overshoot_k)})
+            val_horizon_se  = {h: 0.0 for h in horizons}
+            val_horizon_cnt = {h: 0   for h in horizons}
+
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc="Dyn Val", leave=False):
-                    w = batch.get("instance_weight") if isinstance(batch, dict) else None
+                    if also_train_encoder and "batch_graphs" in batch:
+                        batch = self._online_encode_raw_batch(batch)
+                    w = batch.get("instance_weight") if isinstance(batch, dict) \
+                        else None
                     batch_w = float(w.sum()) if w is not None else 1.0
-                    val_loss_sum += self._dynamics_batch_loss(batch).item() * batch_w
-                    val_w_sum += batch_w
-                    val_n += 1
+                    vl, vcomps = self._dynamics_batch_loss(
+                        batch, return_components=True)
+                    val_loss_sum += vl.item() * batch_w
+                    val_w_sum    += batch_w
+                    for k_c, v_c in vcomps.items():
+                        val_comp_sums[k_c] += v_c * batch_w
+
+                    # Per-horizon latent MSE (start from t=0 and t=T//3).
+                    z_seq = batch.get("z_seq")
+                    z_nxt = batch.get("z_next_seq")
+                    a_seq = batch.get("a_seq")
+                    d_seq = batch.get("dir_seq")
+                    tmask = batch.get("time_mask")
+                    if z_seq is not None and a_seq is not None:
+                        z_seq = z_seq.to(self.device)
+                        a_seq = a_seq.to(self.device)
+                        z_nxt = z_nxt.to(self.device) if z_nxt is not None else None
+                        d_seq = d_seq.to(self.device) if d_seq is not None else None
+                        tmask_dev = tmask.to(self.device) if tmask is not None else None
+                        for h in horizons:
+                            preds = self.model.dynamics.rollout(
+                                z_seq[:, 0], a_seq[:, :h],
+                                d_seq=d_seq[:, :h] if d_seq is not None else None)
+                            if z_nxt is not None and preds.size(1) > 0:
+                                j = min(h - 1, z_nxt.size(1) - 1)
+                                m = (tmask_dev[:, j].float()
+                                     if tmask_dev is not None
+                                     else torch.ones(z_seq.size(0),
+                                                     device=self.device))
+                                se = ((preds[:, -1] - z_nxt[:, j]) ** 2
+                                      ).mean(-1)
+                                val_horizon_se[h]  += float((se * m).sum().item())
+                                val_horizon_cnt[h] += float(m.sum().item())
 
             train_loss = total_loss / n if n else float("inf")
             val_loss   = val_loss_sum / val_w_sum if val_w_sum > 0 else float("inf")
@@ -932,9 +1085,18 @@ class Trainer:
             self.history["p3_train_loss"].append(train_loss)
             self.history["p3_val_loss"].append(val_loss)
 
+            # Per-component log line.
+            comp_str = "  ".join(
+                f"{k}={v/n:.4f}" for k, v in sorted(comp_sums.items()) if n > 0)
+            horizon_str = "  ".join(
+                f"mse@{h}={val_horizon_se[h]/val_horizon_cnt[h]:.4f}"
+                for h in horizons if val_horizon_cnt[h] > 0)
+
             print(
                 f"[Phase3] Epoch {epoch:02d} | "
                 f"TrainLoss={train_loss:.4f} | ValLoss={val_loss:.4f}"
+                + (f"\n  train: {comp_str}" if comp_str else "")
+                + (f"\n  val:   {horizon_str}" if horizon_str else "")
             )
 
             if val_loss < best_val_loss:
