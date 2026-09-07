@@ -318,9 +318,10 @@ def process_file(fpath, out_dir, resume=False):
     if not np.all(np.isfinite(x_lp)):
         return False
 
-    # If x_lp is all zeros (Ecole col 13 not populated), try to recover from
-    # an LP solve on the reconstructed matrices — cheap at the root.
-    if np.all(x_lp == 0):
+    # For the reconstruction path, Ecole's sol_val (col 13) is not reliably
+    # populated — always re-solve the LP so x_lp matches the reconstructed
+    # A/b matrices and the cut violation check is meaningful.
+    if use_precomputed_cuts or np.all(x_lp == 0):
         _, x_lp_solved = _solve_lp(A, b, c)
         if x_lp_solved is None:
             return False
