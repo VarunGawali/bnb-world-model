@@ -615,7 +615,12 @@ class SequenceDataset(Dataset):
         # Build a flat index of (file_idx, path) so each __getitem__ returns one
         # root->leaf path. Path reconstruction reads only node_ids/parent_ids —
         # no GNN forward — so this pass is cheap.
-        self.index = []            # list of (file_idx, path) ; path = list[int]
+        # index: list of (file_idx, path, instance_weight)
+        # instance_weight = 1 / n_paths_per_file so every problem instance
+        # contributes equally to the loss regardless of how many root→leaf
+        # paths it produced.  A tree with 200 paths is not 200× more important
+        # than a tree with 1 path (Issue 9/11).
+        self.index = []            # list of (file_idx, path, instance_weight)
         for fi, f in enumerate(self.files):
             with np.load(f, allow_pickle=True) as d:
                 T = int(d["n_steps"])
@@ -633,8 +638,9 @@ class SequenceDataset(Dataset):
                         "the dynamics on WRONG transitions (P0.3). Recollect with "
                         "the current collector, or pass "
                         "allow_visitation_fallback=True to knowingly accept it.")
+            w = 1.0 / max(len(paths), 1)
             for p in paths:
-                self.index.append((fi, p))
+                self.index.append((fi, p, w))
 
         # In-memory bundle cache for the most recently encoded file, so the
         # several paths of one file reuse a single encoder forward when the
@@ -675,9 +681,11 @@ class SequenceDataset(Dataset):
 
     @torch.no_grad()
     def __getitem__(self, i):
-        fi, path = self.index[i]
+        fi, path, w = self.index[i]
         bundle = self._get_bundle(fi)
-        return self._slice_path(bundle, path)
+        item = self._slice_path(bundle, path)
+        item["instance_weight"] = torch.tensor(w, dtype=torch.float32)
+        return item
 
     def _get_bundle(self, fi):
         """Return the per-file encoded bundle, using memory then disk cache."""

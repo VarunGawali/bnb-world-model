@@ -395,12 +395,35 @@ class Trainer:
         anchors = [a for a in raw if a < T - 1]
         if not anchors:
             return z_seq.new_zeros(())
+        # Scheduled sampling (Issue 6): mix real and model-generated anchor states.
+        # p_free_run ramps 0→1 over training (set by train_dynamics each epoch).
+        # At p=0: pure teacher forcing (real anchors, standard overshoot).
+        # At p=1: fully free-running — the anchor is itself a model prediction
+        # from the PREVIOUS step, training the model on its own distribution.
+        p_free = float(getattr(self, "_p_free_run", 0.0))
         total = z_seq.new_zeros(())
         for a0 in anchors:
             kk = min(k_max, T - a0)
             d_slice = d_seq[:, a0:a0 + kk] if d_seq is not None else None
+
+            # Choose start state: real encoder output or last model prediction.
+            if p_free > 0.0 and a0 > 0:
+                import random
+                if random.random() < p_free:
+                    # Free-run start: roll from a0-1 using the model's own output.
+                    with torch.no_grad():
+                        d_prev = d_seq[:, a0 - 1] if d_seq is not None else None
+                        z_free, _, _ = self.model.dynamics.step(
+                            z_seq[:, a0 - 1], a_seq[:, a0 - 1],
+                            past_tokens=None, d_t=d_prev)
+                    z_start = z_free.detach()
+                else:
+                    z_start = z_seq[:, a0]
+            else:
+                z_start = z_seq[:, a0]
+
             preds = self.model.dynamics.rollout(
-                z_seq[:, a0], a_seq[:, a0:a0 + kk], d_seq=d_slice)   # [B, kk, H]
+                z_start, a_seq[:, a0:a0 + kk], d_seq=d_slice)        # [B, kk, H]
             tgt = z_next_seq[:, a0:a0 + kk]
             if tmask is not None:
                 om = tmask[:, a0:a0 + kk].unsqueeze(-1).float()
@@ -796,7 +819,7 @@ class Trainer:
         # (Gap 2) and dyn_reward (Fix 3) are top-level modules whose parameter
         # names do NOT contain "dynamics", so they must be named explicitly or
         # they would stay frozen and never learn.
-        _always = {"dynamics", "dyn_bound", "dyn_reward"}
+        _always = {"dynamics", "dyn_bound", "dyn_reward", "cut_action_embed"}
         _extra  = set(also_train)
         _all_prefixes = _always | _extra
         for name, p in self.model.named_parameters():
@@ -827,37 +850,71 @@ class Trainer:
             else:
                 self._overshoot_k = 0
 
+            # Scheduled sampling curriculum: ramp p_free_run from 0 to 0.5 over
+            # the second half of training (after the 1-step model is reasonable).
+            # 0.5 means "half the overshoot anchors use model-predicted starts"
+            # rather than real encoder states — the same regime as inference.
+            free_start_epoch = max(1, int(0.5 * epochs))
+            if epoch > free_start_epoch and epochs > free_start_epoch:
+                self._p_free_run = min(
+                    0.5,
+                    0.5 * (epoch - free_start_epoch) / (epochs - free_start_epoch),
+                )
+            else:
+                self._p_free_run = 0.0
+
             self.model.train()
-            total_loss = n = 0
+            total_loss = n = oom_count = 0
 
             for batch in tqdm(
                 train_loader,
-                desc=f"Dyn Train Epoch {epoch} (k={self._overshoot_k})",
+                desc=f"Dyn Train Epoch {epoch} (k={self._overshoot_k},"
+                     f" pfree={self._p_free_run:.2f})",
                 leave=False,
             ):
                 optimizer.zero_grad(set_to_none=True)
-                with autocast("cuda", enabled=self.amp):
-                    loss = self._dynamics_batch_loss(batch)
+                try:
+                    with autocast("cuda", enabled=self.amp):
+                        loss = self._dynamics_batch_loss(batch)
 
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
 
-                total_loss += loss.item()
-                n += 1
+                    total_loss += loss.item()
+                    n += 1
+                except RuntimeError as e:
+                    if _is_oom(e):
+                        _recover_oom(optimizer)
+                        oom_count += 1
+                        continue
+                    raise
 
-            # Validation
+            if oom_count:
+                import warnings
+                warnings.warn(
+                    f"[Phase3] Epoch {epoch}: {oom_count} OOM batches skipped "
+                    f"({oom_count}/{n + oom_count} = "
+                    f"{100*oom_count/(n+oom_count):.1f}%). "
+                    "Consider reducing batch size or sequence length.",
+                    RuntimeWarning, stacklevel=2,
+                )
+
+            # Validation — instance-weighted so large-tree files don't dominate.
             self.model.eval()
-            val_loss_sum = val_n = 0
+            val_loss_sum = val_w_sum = val_n = 0
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc="Dyn Val", leave=False):
-                    val_loss_sum += self._dynamics_batch_loss(batch).item()
+                    w = batch.get("instance_weight") if isinstance(batch, dict) else None
+                    batch_w = float(w.sum()) if w is not None else 1.0
+                    val_loss_sum += self._dynamics_batch_loss(batch).item() * batch_w
+                    val_w_sum += batch_w
                     val_n += 1
 
             train_loss = total_loss / n if n else float("inf")
-            val_loss   = val_loss_sum / val_n if val_n > 0 else float("inf")
+            val_loss   = val_loss_sum / val_w_sum if val_w_sum > 0 else float("inf")
             scheduler.step()
 
             self.history["p3_train_loss"].append(train_loss)
@@ -921,6 +978,13 @@ class Trainer:
         pw = pos_weight.to(self.device) if pos_weight is not None else None
         best_val_acc = 0.0
         no_improve = 0
+
+        # Adaptive loss scale: calibrated once from first batch so each term
+        # starts at ~1.0 in relative magnitude. Stored per-term so the
+        # scales can be inspected in logs. Raw weights are still applied on
+        # top (0.5 v_loss, etc.) — calibration just removes the order-of-
+        # magnitude mismatch between terms at initialisation.
+        _p4_scales: dict[str, float] | None = None  # filled after first batch
 
         for epoch in range(1, epochs + 1):
             self.model.train()
@@ -1029,9 +1093,30 @@ class Trainer:
                     else:
                         c_loss = torch.zeros((), device=self.device)
 
+                    # Adaptive calibration: estimate scales once from the
+                    # first batch (no-grad), then hold fixed for the run.
+                    if _p4_scales is None:
+                        with torch.no_grad():
+                            _p4_scales = {
+                                "p":  max(p_loss.item(),  1e-6),
+                                "v":  max(v_loss.item(),  1e-6),
+                                "i":  max(i_loss.item(),  1e-6),
+                                "vc": max(v_consist.item(), 1e-6),
+                                "s":  max(s_loss.item(),  1e-6),
+                                "c":  max(c_loss.item(),  1e-6),
+                            }
+
+                    sp, sv, si, svc, ss, sc = (
+                        _p4_scales["p"], _p4_scales["v"], _p4_scales["i"],
+                        _p4_scales["vc"], _p4_scales["s"], _p4_scales["c"],
+                    )
                     loss = (
-                        p_loss + 0.5 * v_loss + 0.1 * i_loss
-                        + 0.1 * v_consist + 0.3 * s_loss + 0.5 * c_loss
+                        p_loss / sp
+                        + 0.5 * v_loss / sv
+                        + 0.1 * i_loss / si
+                        + 0.1 * v_consist / svc
+                        + 0.3 * s_loss / ss
+                        + 0.5 * c_loss / sc
                     )
 
                 self.scaler.scale(loss).backward()
