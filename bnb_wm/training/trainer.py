@@ -373,17 +373,17 @@ class Trainer:
         positions and supervises the free-running predictions (and their
         predicted bound) against the real future. Returns a scalar loss (0 if
         overshooting is disabled).
+
+        Vectorised over anchors: instead of A separate rollout() calls (each
+        over B items), we do one call over B*A items so the Transformer sees a
+        single large batch — MUCH better GPU utilisation when A >= 3.
         """
         k_max = int(getattr(self, "_overshoot_k", 0) or 0)
         if k_max <= 0:
             return z_seq.new_zeros(())
-        T, H = z_seq.size(1), z_seq.size(-1)
+        B, T, H = z_seq.shape
 
-        # Fix E: randomise anchors each call instead of fixed thirds.
-        # Always include 0 (root anchor — mandatory for free-run training).
-        # Add n_random_anchors randomly sampled from (0, T-1) so the model
-        # learns to roll forward from any point in the trajectory, including
-        # states it would reach via its own off-path predictions at inference.
+        # Build anchor list (Fix E: randomised each call, always includes 0).
         n_random = int(getattr(self, "_overshoot_n_random_anchors", 2))
         fixed_set = {0, T // 3, (2 * T) // 3}
         if n_random > 0 and T > 2:
@@ -395,46 +395,65 @@ class Trainer:
         anchors = [a for a in raw if a < T - 1]
         if not anchors:
             return z_seq.new_zeros(())
-        # Scheduled sampling (Issue 6): mix real and model-generated anchor states.
-        # p_free_run ramps 0→1 over training (set by train_dynamics each epoch).
-        # At p=0: pure teacher forcing (real anchors, standard overshoot).
-        # At p=1: fully free-running — the anchor is itself a model prediction
-        # from the PREVIOUS step, training the model on its own distribution.
-        p_free = float(getattr(self, "_p_free_run", 0.0))
-        total = z_seq.new_zeros(())
-        for a0 in anchors:
-            kk = min(k_max, T - a0)
-            d_slice = d_seq[:, a0:a0 + kk] if d_seq is not None else None
+        A = len(anchors)
 
-            # Choose start state: real encoder output or last model prediction.
-            if p_free > 0.0 and a0 > 0:
-                import random
-                if random.random() < p_free:
-                    # Free-run start: roll from a0-1 using the model's own output.
+        # Scheduled sampling (Issue 6): p_free_run ramps 0→0.5 over Phase 3.
+        p_free = float(getattr(self, "_p_free_run", 0.0))
+
+        # --- build start states [B, A, H] ---
+        # Default: real encoder states at each anchor.
+        anc_t = torch.tensor(anchors, dtype=torch.long, device=self.device)
+        z_starts = z_seq[:, anc_t]                               # [B, A, H]
+
+        # Scheduled sampling: for anchor a0 > 0 stochastically replace with
+        # model's own one-step prediction from the previous state.
+        if p_free > 0.0:
+            import random
+            for ai, a0 in enumerate(anchors):
+                if a0 > 0 and random.random() < p_free:
                     with torch.no_grad():
                         d_prev = d_seq[:, a0 - 1] if d_seq is not None else None
                         z_free, _, _ = self.model.dynamics.step(
                             z_seq[:, a0 - 1], a_seq[:, a0 - 1],
                             past_tokens=None, d_t=d_prev)
-                    z_start = z_free.detach()
-                else:
-                    z_start = z_seq[:, a0]
-            else:
-                z_start = z_seq[:, a0]
+                    z_starts[:, ai] = z_free.detach()
 
-            preds = self.model.dynamics.rollout(
-                z_start, a_seq[:, a0:a0 + kk], d_seq=d_slice)        # [B, kk, H]
-            tgt = z_next_seq[:, a0:a0 + kk]
+        # --- build action/direction buffers [B, A, k_max, …] (zero-padded) ---
+        a_buf = torch.zeros(B, A, k_max, H, device=self.device)
+        d_buf = (torch.zeros(B, A, k_max, device=self.device)
+                 if d_seq is not None else None)
+        kk_list = []
+        for ai, a0 in enumerate(anchors):
+            kk = min(k_max, T - a0)
+            kk_list.append(kk)
+            a_buf[:, ai, :kk] = a_seq[:, a0:a0 + kk]
+            if d_seq is not None:
+                d_buf[:, ai, :kk] = d_seq[:, a0:a0 + kk]
+
+        # Reshape [B, A, k_max, H] → [B*A, k_max, H] for one batched rollout.
+        z_starts_flat = z_starts.permute(1, 0, 2).reshape(B * A, H)
+        a_buf_flat    = a_buf.permute(1, 0, 2, 3).reshape(B * A, k_max, H)
+        d_buf_flat    = (d_buf.permute(1, 0, 2).reshape(B * A, k_max)
+                         if d_buf is not None else None)
+
+        preds_flat = self.model.dynamics.rollout(
+            z_starts_flat, a_buf_flat, d_seq=d_buf_flat)         # [B*A, k_max, H]
+        # Restore to [B, A, k_max, H]
+        preds = preds_flat.reshape(A, B, k_max, H).permute(1, 0, 2, 3)
+
+        # --- accumulate loss per anchor (slice to each anchor's kk) ---
+        total = z_seq.new_zeros(())
+        for ai, (a0, kk) in enumerate(zip(anchors, kk_list)):
+            p_ai = preds[:, ai, :kk]                             # [B, kk, H]
+            tgt  = z_next_seq[:, a0:a0 + kk]                    # [B, kk, H]
             if tmask is not None:
                 om = tmask[:, a0:a0 + kk].unsqueeze(-1).float()
-                total = total + ((preds - tgt) ** 2 * om).sum() / \
+                total = total + ((p_ai - tgt) ** 2 * om).sum() / \
                     (om.sum().clamp_min(1.0) * H)
             else:
-                total = total + F.mse_loss(preds, tgt)
-            # Grounding: the rolled-out latents must still decode to the right
-            # dual bound (keeps compounding predictions on the manifold).
+                total = total + F.mse_loss(p_ai, tgt)
             if bound_tgt is not None:
-                bp = self.model.dynamics_bound_pred(preds)          # [B, kk]
+                bp = self.model.dynamics_bound_pred(p_ai)        # [B, kk]
                 bt = bound_tgt[:, a0:a0 + kk]
                 if tmask is not None:
                     om2 = tmask[:, a0:a0 + kk].float()
@@ -443,7 +462,8 @@ class Trainer:
                         om2.sum().clamp_min(1.0)
                 else:
                     total = total + 0.5 * F.huber_loss(bp, bt, delta=1.0)
-        return total / len(anchors)
+
+        return total / A
 
     @torch.no_grad()
     def dynamics_rollout_diagnostic(self, loader, max_depth=8, save_path=None):
@@ -527,57 +547,75 @@ class Trainer:
 
         Called only when also_train_encoder=True.  Runs WITH gradients so that
         encoder parameters receive gradients through z_seq / z_next_seq.
+
+        Fully vectorised: no Python loops over sequences or timesteps —
+        uses cumulative offsets + fancy indexing to scatter z_all / h_vars_all
+        into [B, Tmax, H] tensors in O(1) kernel calls.
         """
-        from torch_geometric.data import Batch as _Batch
         gb      = raw["batch_graphs"].to(self.device)
-        sizes   = raw["batch_sizes"]               # [B] number of steps per path
-        bvars   = raw["branch_vars"].to(self.device)  # [sum_P] global var idx
+        sizes   = raw["batch_sizes"].to(self.device)   # [B] steps per path
+        bvars   = raw["branch_vars"].to(self.device)   # [sum_P] local var idx
         bound   = raw["bound_seq"].to(self.device)
         dseq    = raw["dir_seq"].to(self.device)
         tmask   = raw["time_mask"].to(self.device)
         iw      = raw.get("instance_weight")
 
         # Encode ALL steps in one batched call.
-        h_vars_all, z_all = self.model.encode(gb)  # [sum_P_vars, H], [sum_P, H]
+        h_vars_all, z_all = self.model.encode(gb)     # [sum_P_vars,H],[sum_P,H]
 
-        # Split z_all and h_vars_all back into per-path, per-step segments.
-        B    = len(sizes)
-        H    = self.model.hidden_dim
-        Tmax = int(tmask.size(1))
+        B     = sizes.size(0)
+        H     = z_all.size(-1)
+        Tmax  = int(tmask.size(1))
+        total_steps = int(sizes.sum().item())
 
-        # node_type==0 -> variable nodes; gb.batch maps nodes to "step" index
-        var_mask_all = gb.node_type == 0
-        var_step_batch = gb.batch[var_mask_all]   # which step each var belongs to
+        # ---- step-index tensor [B, Tmax] --------------------------------
+        # For path i, step s, the global step index is: step_offsets[i] + s.
+        sizes_cpu    = sizes.cpu().to(torch.long)
+        step_offsets = torch.cat([
+            torch.zeros(1, dtype=torch.long),
+            sizes_cpu.cumsum(0)[:-1],
+        ]).to(self.device)                             # [B]
 
-        z_seq      = torch.zeros(B, Tmax, H, device=self.device)
-        a_seq      = torch.zeros(B, Tmax, H, device=self.device)
-        z_next_seq = torch.zeros(B, Tmax, H, device=self.device)
+        t_range      = torch.arange(Tmax, device=self.device)          # [Tmax]
+        step_idx     = step_offsets.unsqueeze(1) + t_range.unsqueeze(0)  # [B,Tmax]
+        valid_mask   = t_range.unsqueeze(0) < sizes.unsqueeze(1)          # [B,Tmax]
+        step_idx_cl  = step_idx.clamp(0, total_steps - 1)
 
-        step_offset = 0
-        var_offset  = 0
-        for i, P in enumerate(sizes.tolist()):
-            P = int(P)
-            if P < 2:
-                step_offset += P
-                # advance var_offset
-                for s in range(P):
-                    n_v = int((var_step_batch == (step_offset - P + s)).sum())
-                    var_offset += n_v
-                continue
-            for s in range(P):
-                global_step = step_offset + s
-                z_seq[i, s] = z_all[global_step]
-                # action = h_vars of chosen branching variable at step s
-                n_v = int((var_step_batch == global_step).sum())
-                hs  = h_vars_all[var_offset : var_offset + n_v]
-                bv  = int(bvars[step_offset + s].item())
-                bv  = bv if 0 <= bv < n_v else 0
-                a_seq[i, s] = hs[bv]
-                var_offset += n_v
-            # z_next: shift by 1 (child steps)
-            for s in range(P - 1):
-                z_next_seq[i, s] = z_all[step_offset + s + 1]
-            step_offset += P
+        # ---- z_seq and z_next_seq via fancy indexing --------------------
+        z_seq      = z_all[step_idx_cl]               # [B, Tmax, H]
+        z_seq[~valid_mask] = 0.0
+
+        next_idx_cl = (step_idx + 1).clamp(0, total_steps - 1)
+        z_next_seq  = z_all[next_idx_cl]              # [B, Tmax, H]
+        # Zero out both the padding positions AND the last real step (no next).
+        # "last valid step for path i" is s = sizes[i]-1, which maps to the
+        # same z_all entry as s (because we clamped), so mask it explicitly.
+        valid_next  = valid_mask & (t_range.unsqueeze(0) < (sizes - 1).unsqueeze(1))
+        z_next_seq[~valid_next] = 0.0
+
+        # ---- a_seq: h_vars of the chosen branch variable ----------------
+        # variable nodes have node_type==0; gb.batch says which step each belongs to.
+        var_mask_all   = gb.node_type == 0
+        var_step_batch = gb.batch[var_mask_all]        # [sum_P_vars]
+
+        # Number of variable nodes per step, and cumulative start indices.
+        n_vars_per_step = torch.bincount(
+            var_step_batch, minlength=total_steps)     # [total_steps]
+        var_starts = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=self.device),
+            n_vars_per_step.cumsum(0)[:-1],
+        ])                                             # [total_steps]
+
+        # Global index of the chosen variable for every step.
+        # bvars is [total_steps] with LOCAL indices within each step's vars.
+        # Clamp so an out-of-range bvars entry doesn't crash (uses first var).
+        bvars_clamped   = bvars.clamp(0, n_vars_per_step.clamp_min(1) - 1)
+        chosen_var_glob = var_starts + bvars_clamped  # [total_steps]
+        a_all           = h_vars_all[chosen_var_glob] # [total_steps, H]
+
+        # Scatter a_all into [B, Tmax, H] using the same step_idx_cl.
+        a_seq      = a_all[step_idx_cl]               # [B, Tmax, H]
+        a_seq[~valid_mask] = 0.0
 
         out = {
             "z_seq":          z_seq,
@@ -877,7 +915,12 @@ class Trainer:
                        cand_rank_weight: float = 0.5,
                        also_train: tuple[str, ...] = (),
                        also_train_encoder: bool = False,
-                       encoder_lr_scale: float = 0.1):
+                       encoder_lr_scale: float = 0.1,
+                       cut_loader=None,
+                       v_consist_weight: float = 0.1,
+                       cut_weight: float = 0.1,
+                       cf_weight: float = 0.3,
+                       free_run_weight: float = 0.3):
         """
         Train DynamicsTransformer (+ optionally the encoder) on trajectory seqs.
 
@@ -896,9 +939,13 @@ class Trainer:
             transition, var_recon, overshoot, bound, reward, ranking,
             value_consist, cut   (each weighted as configured)
         """
-        self.overshoot_depth  = overshoot_depth
-        self.cand_rank_weight = cand_rank_weight
-        self._also_train_encoder = also_train_encoder
+        self.overshoot_depth        = overshoot_depth
+        self.cand_rank_weight       = cand_rank_weight
+        self._also_train_encoder    = also_train_encoder
+        self.v_consist_weight       = v_consist_weight
+        self.cut_transition_weight  = cut_weight
+        self.cf_contrastive_weight  = cf_weight
+        self.free_run_consist_weight = free_run_weight
 
         # Determine trainable set.
         _always = {"dynamics", "dyn_bound", "dyn_reward", "cut_action_embed"}
@@ -970,6 +1017,11 @@ class Trainer:
             total_loss = n = oom_count = oom_samples = 0
             comp_sums = defaultdict(float)  # per-component loss sums
 
+            # Interleave cut-transition batches with sequence batches when
+            # cut_loader is provided.  We cycle through cut batches so every
+            # sequence batch has a paired cut batch regardless of relative size.
+            cut_iter = iter(cut_loader) if cut_loader is not None else None
+
             for batch in tqdm(
                 train_loader,
                 desc=f"Dyn Train Epoch {epoch} (k={self._overshoot_k},"
@@ -985,6 +1037,19 @@ class Trainer:
                     # latents) is unchanged.
                     if also_train_encoder and "batch_graphs" in batch:
                         batch = self._online_encode_raw_batch(batch)
+
+                    # Inject cut-transition fields into the batch dict so
+                    # _dynamics_batch_loss computes the cut MSE loss.
+                    if cut_iter is not None:
+                        try:
+                            cut_batch = next(cut_iter)
+                        except StopIteration:
+                            cut_iter = iter(cut_loader)
+                            cut_batch = next(cut_iter)
+                        if isinstance(batch, dict):
+                            batch["graph_before"] = cut_batch["graph_before"]
+                            batch["graph_after"]  = cut_batch["graph_after"]
+                            batch["cut_feats"]    = cut_batch["cut_feats"]
 
                     with autocast("cuda", enabled=self.amp):
                         loss, comps = self._dynamics_batch_loss(
