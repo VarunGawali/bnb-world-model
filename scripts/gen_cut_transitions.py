@@ -89,14 +89,38 @@ def _solve_lp(A, b, c):
     h.silent()
 
     inf = highspy.kHighsInf
-    h.addVars(n, np.zeros(n), np.full(n, inf))
-    h.changeColsCostByRange(0, n - 1, c.astype(np.float64))
+    c64 = c.astype(np.float64)
+    lb  = np.zeros(n, dtype=np.float64)
+    ub  = np.full(n, inf, dtype=np.float64)
 
-    for i in range(m):
-        row = A[i]
-        nz  = row.nonzero()[0]
-        h.addRow(-inf, float(b[i]), len(nz),
-                 nz.astype(np.int32), row[nz].astype(np.float64))
+    # API differs across highspy versions: try new passLp first, fall back to
+    # addVars/addRow for older builds.
+    try:
+        from scipy.sparse import csr_matrix
+        A_sp = csr_matrix(A)
+        h.passLp(
+            m, n, A_sp.nnz,
+            1,          # a_format: row-wise
+            1,          # sense: minimise
+            0.0,        # offset
+            c64,
+            np.full(m, -inf), b.astype(np.float64),
+            lb, ub,
+            A_sp.indptr.astype(np.int32),
+            A_sp.indices.astype(np.int32),
+            A_sp.data.astype(np.float64),
+        )
+    except Exception:
+        # Fallback: column-by-column / row-by-row via addVar/addRow.
+        for j in range(n):
+            h.addVar(0.0, inf)
+        for j in range(n):
+            h.changeColCost(j, c64[j])
+        for i in range(m):
+            row = A[i]
+            nz  = row.nonzero()[0]
+            h.addRow(-inf, float(b[i]), len(nz),
+                     nz.astype(np.int32), row[nz].astype(np.float64))
 
     h.run()
     info = h.getInfoValue("primal_solution_status")[1]
