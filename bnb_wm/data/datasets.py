@@ -647,11 +647,12 @@ class SequenceDataset(Dataset):
             for p in paths:
                 self.index.append((fi, p, w))
 
-        # In-memory bundle cache for the most recently encoded file, so the
-        # several paths of one file reuse a single encoder forward when the
-        # loader draws them consecutively.
-        self._bundle_fi = None
-        self._bundle = None
+        # Small LRU bundle cache so multiple paths from the same file reuse
+        # one encoder forward / one disk load.  With num_workers > 0 each
+        # worker holds its own copy (no shared-memory contention).
+        # 16 slots covers a full batch worth of files with room to spare.
+        self._bundle_cache: dict = {}   # fi -> bundle (OrderedDict order = LRU)
+        self._bundle_cache_size = 16
 
         # Encode-once disk cache of the per-file bundle. In Phase 3 the encoder
         # is frozen, so the bundle is identical every epoch and re-encoding
@@ -693,20 +694,25 @@ class SequenceDataset(Dataset):
         return item
 
     def _get_bundle(self, fi):
-        """Return the per-file encoded bundle, using memory then disk cache."""
-        if fi == self._bundle_fi:
-            return self._bundle
+        """Return the per-file encoded bundle, using LRU memory cache then disk."""
+        if fi in self._bundle_cache:
+            # Move to end (most-recently-used).
+            bundle = self._bundle_cache.pop(fi)
+            self._bundle_cache[fi] = bundle
+            return bundle
         bundle = None
         if self.cache_dir is not None:
             cp = self._cache_path(fi)
             if cp.exists():
-                bundle = torch.load(cp, map_location="cpu")
+                bundle = torch.load(cp, map_location="cpu", weights_only=False)
         if bundle is None:
             bundle = self._encode_file(fi)
             if self.cache_dir is not None:
                 torch.save(bundle, self._cache_path(fi))
-        self._bundle_fi = fi
-        self._bundle = bundle
+        # Evict LRU entry when cache is full.
+        if len(self._bundle_cache) >= self._bundle_cache_size:
+            self._bundle_cache.pop(next(iter(self._bundle_cache)))
+        self._bundle_cache[fi] = bundle
         return bundle
 
     @torch.no_grad()

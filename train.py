@@ -336,8 +336,14 @@ def main():
             def sequence_loader(file_list, shuffle):
                 ds = SequenceDataset(file_list, model, device, include_vars=True,
                                      cache_dir=seq_cache)
+                # num_workers > 0: workers handle torch.load (disk I/O) in
+                # parallel with GPU compute.  The model is NOT called in workers
+                # (cache-hit path only calls torch.load), so forking is safe.
+                # persistent_workers avoids re-importing on every epoch.
+                seq_nw = min(4, max(1, args.num_workers or 4))
                 return DataLoader(ds, batch_size=seq_bs, shuffle=shuffle,
-                                  collate_fn=seq_collate, num_workers=0)
+                                  collate_fn=seq_collate, num_workers=seq_nw,
+                                  persistent_workers=True, prefetch_factor=2)
 
         # Optional cut-transition MSE loss.
         # Split cut files by trajectory stem to avoid train/val contamination:
