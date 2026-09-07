@@ -54,17 +54,41 @@ print(f"TIME TO GET FIRST BATCH: {t_batch:.2f}s")
 # ── time for dynamics forward + loss ─────────────────────────────────────────
 print("\nTiming dynamics forward + loss...")
 from bnb_wm.training.trainer import Trainer
-trainer = Trainer(model, DEVICE)
+import tempfile
+trainer = Trainer(model, DEVICE, ckpt_dir=tempfile.mkdtemp())
 
+# Time each loss component separately
 model.train()
+
+# 1. Just the encode step
+t0 = time.perf_counter()
+try:
+    # simulate what _dynamics_batch_loss does: encode the batch
+    from bnb_wm.data.datasets import build_pyg_data
+    from torch_geometric.data import Batch as PygBatch
+    if "batch_graphs" in batch:
+        gb = batch["batch_graphs"].to(DEVICE)
+        with torch.no_grad():
+            h_vars_all, z_all = model.encode(gb)
+        t_enc = time.perf_counter() - t0
+        print(f"TIME TO ENCODE BATCH: {t_enc:.2f}s")
+    else:
+        print("batch has no batch_graphs; keys:", list(batch.keys()))
+        t_enc = 0
+except Exception as e:
+    print(f"Encode timing failed: {e}")
+    t_enc = 0
+
+# 2. Full dynamics loss
 t0 = time.perf_counter()
 try:
     loss, comps = trainer._dynamics_batch_loss(batch, return_components=True)
     t_loss = time.perf_counter() - t0
-    print(f"TIME FOR DYNAMICS LOSS: {t_loss:.2f}s")
+    print(f"TIME FOR DYNAMICS LOSS (full): {t_loss:.2f}s")
     print(f"  components: { {k: f'{v:.4f}' for k,v in comps.items()} }")
 except Exception as e:
-    print(f"Loss timing failed: {e}")
+    t_loss = time.perf_counter() - t0
+    print(f"Loss timing failed after {t_loss:.2f}s: {e}")
 
 print("\n=== VERDICT ===")
 print(f"  data loading:    {t_batch:.1f}s")
