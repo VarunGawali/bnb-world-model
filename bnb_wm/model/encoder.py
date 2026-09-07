@@ -46,6 +46,11 @@ class CrossAttentionPool(nn.Module):
         self.W_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.W_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.scale = hidden_dim ** -0.5
+        # Depth/n_frac query conditioning (Gap 3).
+        # Projects [depth_norm, n_frac_norm] → H and adds to query before scoring.
+        # Zero-init → no-op at load; query gradually learns to shift by tree state.
+        self.query_cond = nn.Linear(2, hidden_dim, bias=False)
+        nn.init.zeros_(self.query_cond.weight)
 
     def forward(
         self,
@@ -53,6 +58,7 @@ class CrossAttentionPool(nn.Module):
         batch_vec: torch.Tensor,
         return_entropy: bool = False,
         num_graphs: int | None = None,
+        query_cond: torch.Tensor | None = None,
     ):
         """
         Args:
@@ -62,6 +68,9 @@ class CrossAttentionPool(nn.Module):
                             (exp of attention entropy) for diagnostics.
             num_graphs    : batch size; pass batch.num_graphs to avoid a
                             GPU-CPU sync from batch_vec.max().item().
+            query_cond    : [B, H] optional per-graph query offset (Gap 3).
+                            Pass self.query_cond([depth_norm, n_frac_norm])
+                            from BipartiteGNN to condition on tree-depth state.
         Returns:
             z             : [batch_size, H]
             (optional) v_eff : [batch_size] effective number of attended variables
@@ -70,7 +79,14 @@ class CrossAttentionPool(nn.Module):
         keys   = self.W_k(h_vars)   # [total_vars, H]
         values = self.W_v(h_vars)   # [total_vars, H]
 
-        logits = (keys * self.query).sum(dim=-1) * self.scale       # [total_vars]
+        # Query: shared global + optional per-graph conditioning offset.
+        if query_cond is not None:
+            # query_cond: [B, H] — index to per-variable to compute per-var logits
+            q = self.query + query_cond[batch_vec]     # [total_vars, H]
+            logits = (keys * q).sum(dim=-1) * self.scale
+        else:
+            logits = (keys * self.query).sum(dim=-1) * self.scale   # [total_vars]
+
         attn   = segment_softmax(logits, batch_vec, num_nodes=batch_size)  # [total_vars]
         weighted = values * attn.unsqueeze(-1)                      # [total_vars, H]
         z = scatter(weighted, batch_vec, dim=0,
@@ -192,6 +208,19 @@ class BipartiteGNN(nn.Module):
         # Graph-level readout
         self.pool = CrossAttentionPool(hidden_dim)
 
+        # Gap 6: variable type embedding (at_lb=0 / basic=1 / at_ub=2 / fractional=3)
+        # Zero-init → no-op at load; encoder learns type distinction on retraining.
+        self.var_type_emb = nn.Embedding(4, hidden_dim)
+        nn.init.zeros_(self.var_type_emb.weight)
+
+        # Gap 3: depth/n_frac query conditioning offset fed to CrossAttentionPool.
+        self.depth_proj = nn.Linear(2, hidden_dim, bias=False)
+        nn.init.zeros_(self.depth_proj.weight)
+
+        # Gap 2: constraint summary injected into z after pooling.
+        self.con_to_z = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.con_to_z.weight)
+
     @torch.no_grad()
     def set_feature_stats(self, var_mean, var_std, con_mean, con_std):
         """Populate the input-standardisation buffers from arrays (numpy or
@@ -213,6 +242,8 @@ class BipartiteGNN(nn.Module):
         edge_attr: torch.Tensor | None = None,
         return_pool_entropy: bool = False,
         num_graphs: int | None = None,
+        depth: torch.Tensor | None = None,    # [B] tree depth per graph (Gap 3)
+        n_frac: torch.Tensor | None = None,   # [B] fractional var count per graph (Gap 3)
     ):
         """
         Args:
@@ -241,7 +272,19 @@ class BipartiteGNN(nn.Module):
         xv = ((x[var_mask] - self.var_mean) / self.var_std).clamp(-10.0, 10.0)
         xc = ((x[con_mask][:, :self.con_dim] - self.con_mean)
               / self.con_std).clamp(-10.0, 10.0)
-        h_v = F.relu(self.var_proj(xv))
+
+        # Gap 6: derive variable type index from LP solution features.
+        # Columns: 9=at_lb (basis_lower), 10=basic, 11=at_ub, 14=sol_frac.
+        sol_frac = xv[:, 14]
+        is_frac  = sol_frac > 0.05
+        is_atub  = (xv[:, 11] > 0.5) & ~is_frac
+        is_atlb  = (xv[:, 9]  > 0.5) & ~is_frac & ~is_atub
+        var_type = torch.where(is_frac, torch.full_like(is_frac, 3, dtype=torch.long),
+                   torch.where(is_atub, torch.full_like(is_atub, 2, dtype=torch.long),
+                   torch.where(is_atlb, torch.full_like(is_atlb, 0, dtype=torch.long),
+                               torch.ones(xv.size(0), dtype=torch.long, device=x.device))))
+
+        h_v = F.relu(self.var_proj(xv)) + self.var_type_emb(var_type)
         h_c = F.relu(self.con_proj(xc))
 
         h = torch.zeros(x.size(0), self.hidden_dim, device=x.device, dtype=h_v.dtype)
@@ -291,10 +334,32 @@ class BipartiteGNN(nn.Module):
 
         h_vars = self.final_norm(h[var_mask])
 
+        # Gap 3: compute per-graph query conditioning from depth / n_frac.
+        batch_size = num_graphs if num_graphs is not None else int(batch_vec.max().item()) + 1
+        query_cond = None
+        if depth is not None or n_frac is not None:
+            d = (depth.float() / 20.0).clamp(0.0, 1.0) if depth is not None \
+                else torch.zeros(batch_size, device=x.device, dtype=h_vars.dtype)
+            f = (n_frac.float() / 100.0).clamp(0.0, 1.0) if n_frac is not None \
+                else torch.zeros(batch_size, device=x.device, dtype=h_vars.dtype)
+            query_cond = self.depth_proj(torch.stack([d, f], dim=-1))  # [B, H]
+
+        var_batch = batch_vec[var_mask]
+        con_batch = batch_vec[con_mask]
+
         if return_pool_entropy:
-            z, v_eff = self.pool(h_vars, batch_vec[var_mask],
-                                 return_entropy=True, num_graphs=num_graphs)
+            z, v_eff = self.pool(h_vars, var_batch,
+                                 return_entropy=True, num_graphs=num_graphs,
+                                 query_cond=query_cond)
+            # Gap 2: blend constraint summary into z.
+            con_summary = scatter(h_cons_out, con_batch, dim=0,
+                                  dim_size=batch_size, reduce="mean")
+            z = z + self.con_to_z(con_summary)
             return h_vars, z, h_cons_out, v_eff
 
-        z = self.pool(h_vars, batch_vec[var_mask], num_graphs=num_graphs)
+        z = self.pool(h_vars, var_batch, num_graphs=num_graphs, query_cond=query_cond)
+        # Gap 2: blend constraint summary into z.
+        con_summary = scatter(h_cons_out, con_batch, dim=0,
+                              dim_size=batch_size, reduce="mean")
+        z = z + self.con_to_z(con_summary)
         return h_vars, z, h_cons_out
