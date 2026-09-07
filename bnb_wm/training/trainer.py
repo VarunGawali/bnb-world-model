@@ -922,6 +922,7 @@ class Trainer:
                        also_train: tuple[str, ...] = (),
                        also_train_encoder: bool = False,
                        encoder_lr_scale: float = 0.1,
+                       encoder_warmup_epochs: int = 0,
                        encode_cache_refresh_every: int = 0,
                        cut_loader=None,
                        cut_val_loader=None,
@@ -1051,6 +1052,22 @@ class Trainer:
                 )
             else:
                 self._p_free_run = 0.0
+
+            # ---- Encoder LR warmup ----------------------------------------
+            # Keep encoder frozen (lr=0) for the first encoder_warmup_epochs,
+            # then ramp linearly to the target encoder lr over the next
+            # encoder_warmup_epochs epochs. Dynamics stabilise first, then the
+            # encoder starts moving — prevents early gradient interference.
+            if also_train_encoder and encoder_warmup_epochs > 0:
+                if epoch <= encoder_warmup_epochs:
+                    eff_enc_lr = 0.0
+                elif epoch <= 2 * encoder_warmup_epochs:
+                    # linear ramp from 0 to target over the second warmup window
+                    ramp = (epoch - encoder_warmup_epochs) / encoder_warmup_epochs
+                    eff_enc_lr = lr * encoder_lr_scale * ramp
+                else:
+                    eff_enc_lr = lr * encoder_lr_scale
+                optimizer.param_groups[1]["lr"] = eff_enc_lr
 
             # ---- Cache refresh (encoder-training path only) ---------------
             use_cache = (also_train_encoder
