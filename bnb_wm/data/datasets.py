@@ -734,16 +734,7 @@ class SequenceDataset(Dataset):
                            d["edge_indices"][t], d["edge_values"][t])
             for t in range(T)
         ]
-        # In DataLoader workers (fork context) CUDA cannot be re-initialized.
-        # Use CPU for encoding; bundles are CPU tensors anyway so this is safe.
-        # In the main process, use self.device (GPU) for speed.
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None:
-            enc_device = torch.device("cpu")
-            self.model.cpu()   # worker has its own copy of the model (forked)
-        else:
-            enc_device = self.device
-        batch = Batch.from_data_list(datas).to(enc_device)
+        batch = Batch.from_data_list(datas).to(self.device)
         h_vars, z = self.model.encode(batch)          # h_vars [sumV,H], z [T,H]
         z = z.cpu()
 
