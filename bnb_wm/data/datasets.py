@@ -145,7 +145,10 @@ def compute_label_stats(files, with_cuts=False):
     cut_pos = cut_tot = 0
     for f in files:
         d = np.load(f, allow_pickle=True)
-        nil = np.asarray(d["next_is_leaf"], dtype=np.float32)
+        key = "true_next_is_leaf" if "true_next_is_leaf" in d else "next_is_leaf"
+        if key not in d:
+            continue
+        nil = np.asarray(d[key], dtype=np.float32)
         leaf_pos += int((nil > 0.5).sum())
         leaf_tot += int(nil.size)
         # Cut fields are absent in lean/DAgger files; treat those as zero-cut so
