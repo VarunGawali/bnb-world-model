@@ -922,6 +922,7 @@ class Trainer:
                        also_train: tuple[str, ...] = (),
                        also_train_encoder: bool = False,
                        encoder_lr_scale: float = 0.1,
+                       encode_cache_refresh_every: int = 0,
                        cut_loader=None,
                        cut_val_loader=None,
                        v_consist_weight: float = 0.1,
@@ -994,6 +995,37 @@ class Trainer:
         best_val_loss = float("inf")
         no_improve = 0
 
+        # ---- Periodic latent-cache for the encoder-training path ----------
+        # When also_train_encoder=True, encoding every batch is the dominant
+        # cost. With encode_cache_refresh_every=K we encode the full dataset
+        # ONCE per K epochs and serve cached latent dicts for the other K-1
+        # epochs. The encoder only sees ~1/K as many encoding calls, giving
+        # ~K× throughput, at the cost of K-1 epochs training on slightly stale
+        # latents (acceptable: the encoder changes slowly at encoder_lr_scale).
+        #
+        # K=0 (default) → always encode on-the-fly (original behaviour).
+        # K=3 is a good balance: fast, low staleness, encoder still improves.
+        _lat_cache_tr  = None   # list of encoded-batch dicts (train)
+        _lat_cache_va  = None   # list of encoded-batch dicts (val)
+        _cache_epoch   = -1     # epoch of last cache build
+
+        def _build_latent_cache(loader):
+            """Encode every batch and return list of latent dicts (no grad)."""
+            cache = []
+            self.model.eval()
+            with torch.no_grad():
+                for raw in tqdm(loader, desc="  [cache] encoding", leave=False):
+                    if "batch_graphs" in raw:
+                        enc = self._online_encode_raw_batch(raw)
+                        # Move to CPU to save GPU VRAM between epochs.
+                        enc_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                                   for k, v in enc.items()}
+                        cache.append(enc_cpu)
+                    else:
+                        cache.append(raw)   # already encoded (frozen path)
+            self.model.train()
+            return cache
+
         # Overshoot curriculum: ramp the rollout horizon 1 -> overshoot_depth
         # over the first ~60% of epochs, so long-horizon free-running is trained
         # only once the one-step model is reasonable (stable, standard practice).
@@ -1020,6 +1052,20 @@ class Trainer:
             else:
                 self._p_free_run = 0.0
 
+            # ---- Cache refresh (encoder-training path only) ---------------
+            use_cache = (also_train_encoder
+                         and encode_cache_refresh_every > 0
+                         and epoch % encode_cache_refresh_every == 1)
+            if also_train_encoder and encode_cache_refresh_every > 0:
+                if _lat_cache_tr is None or use_cache:
+                    print(f"  [cache] refreshing latent cache (epoch {epoch})…")
+                    _lat_cache_tr = _build_latent_cache(train_loader)
+                    _lat_cache_va = _build_latent_cache(val_loader)
+                    _cache_epoch  = epoch
+                _train_iter = iter(_lat_cache_tr)
+            else:
+                _train_iter = iter(train_loader)
+
             self.model.train()
             total_loss = n = oom_count = oom_samples = 0
             comp_sums = defaultdict(float)  # per-component loss sums
@@ -1030,7 +1076,7 @@ class Trainer:
             cut_iter = iter(cut_loader) if cut_loader is not None else None
 
             for batch in tqdm(
-                train_loader,
+                _train_iter,
                 desc=f"Dyn Train Epoch {epoch} (k={self._overshoot_k},"
                      f" pfree={self._p_free_run:.2f})",
                 leave=False,
@@ -1040,10 +1086,15 @@ class Trainer:
                     # Online encoding: when also_train_encoder=True the batch
                     # carries raw PyG graphs (RawSequenceDataset); encode them
                     # here with the CURRENT encoder so z_seq/z_next_seq are never
-                    # stale.  The standard SequenceDataset path (pre-encoded
-                    # latents) is unchanged.
-                    if also_train_encoder and "batch_graphs" in batch:
+                    # stale.  The cache path (encode_cache_refresh_every > 0)
+                    # skips this because batches are already encoded dicts.
+                    if also_train_encoder and encode_cache_refresh_every == 0 \
+                            and "batch_graphs" in batch:
                         batch = self._online_encode_raw_batch(batch)
+                    # Move cached CPU tensors to device.
+                    if isinstance(batch, dict) and encode_cache_refresh_every > 0:
+                        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor)
+                                 else v for k, v in batch.items()}
 
                     # Inject cut-transition fields into the batch dict so
                     # _dynamics_batch_loss computes the cut MSE loss.
@@ -1109,10 +1160,18 @@ class Trainer:
             val_horizon_se  = {h: 0.0 for h in horizons}
             val_horizon_cnt = {h: 0   for h in horizons}
 
+            _val_iter = (iter(_lat_cache_va)
+                         if (_lat_cache_va is not None
+                             and encode_cache_refresh_every > 0)
+                         else iter(val_loader))
             with torch.no_grad():
-                for batch in tqdm(val_loader, desc="Dyn Val", leave=False):
-                    if also_train_encoder and "batch_graphs" in batch:
+                for batch in tqdm(_val_iter, desc="Dyn Val", leave=False):
+                    if also_train_encoder and encode_cache_refresh_every == 0 \
+                            and "batch_graphs" in batch:
                         batch = self._online_encode_raw_batch(batch)
+                    if isinstance(batch, dict) and encode_cache_refresh_every > 0:
+                        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor)
+                                 else v for k, v in batch.items()}
                     w = batch.get("instance_weight") if isinstance(batch, dict) \
                         else None
                     batch_w = float(w.sum()) if w is not None else 1.0

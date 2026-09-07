@@ -157,6 +157,11 @@ def main():
     ap.add_argument("--encoder_lr_scale", type=float, default=0.1,
                     help="encoder LR = lr_phase3 * encoder_lr_scale when "
                          "--phase3_train_encoder is set (default 0.1).")
+    ap.add_argument("--encode_cache_refresh_every", type=int, default=3,
+                    help="re-encode full dataset every N epochs when "
+                         "--phase3_train_encoder is set; 0=always encode "
+                         "on-the-fly (slow). Default 3 gives ~3x speedup "
+                         "with low latent staleness.")
     ap.add_argument("--cut_transitions_dir", default=None,
                     help="directory with *_cut.npz files from gen_cut_transitions.py; "
                          "enables cut-dynamics MSE loss during Phase 3.")
@@ -386,6 +391,7 @@ def main():
             also_train=also_train,
             also_train_encoder=train_encoder,
             encoder_lr_scale=enc_lr_scale,
+            encode_cache_refresh_every=args.encode_cache_refresh_every if train_encoder else 0,
             cut_loader=cut_tr_loader,
             cut_val_loader=cut_val_loader,
             v_consist_weight=_w(args.phase3_value_consist_weight, "v_consist_weight", 0.1),
