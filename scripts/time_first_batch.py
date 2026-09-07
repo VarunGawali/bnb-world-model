@@ -26,8 +26,7 @@ model.load_state_dict(sd["model"], strict=False)
 print("Model loaded.\n")
 
 # ── build loader (same as train.py frozen path) ───────────────────────────────
-from bnb_wm.data.datasets import list_trajectory_files, SequenceDataset
-from bnb_wm.data.collate import make_sequence_collate
+from bnb_wm.data import list_trajectory_files, SequenceDataset, make_sequence_collate
 from torch.utils.data import DataLoader
 
 seq_cache  = Path("checkpoints/seq_cache")
