@@ -59,7 +59,13 @@ from bnb_wm.data import (
     SequenceDataset,
     make_sequence_collate,
 )
-from bnb_wm.data.datasets import ShardedBatchSampler, probe_edge_cost_per_node
+from bnb_wm.data.datasets import (
+    ShardedBatchSampler,
+    probe_edge_cost_per_node,
+    RawSequenceDataset,
+    make_raw_collate,
+    CutTransitionDataset,
+)
 
 
 def load_config(path):
@@ -143,6 +149,29 @@ def main():
                     help="base RNG seed for Python/NumPy/torch/CUDA + workers")
     ap.add_argument("--deterministic", action="store_true",
                     help="request deterministic algorithms (slower, exact repro)")
+    # ---- Phase 3 encoder / cut-transition options ----
+    ap.add_argument("--phase3_train_encoder", action="store_true",
+                    help="unfreeze encoder in Phase 3 (joint dynamics+encoder). "
+                         "Uses RawSequenceDataset (on-the-fly encoding, no stale "
+                         "cache). Requires --encoder_lr_scale to control encoder LR.")
+    ap.add_argument("--encoder_lr_scale", type=float, default=0.1,
+                    help="encoder LR = lr_phase3 * encoder_lr_scale when "
+                         "--phase3_train_encoder is set (default 0.1).")
+    ap.add_argument("--cut_transitions_dir", default=None,
+                    help="directory with *_cut.npz files from gen_cut_transitions.py; "
+                         "enables cut-dynamics MSE loss during Phase 3.")
+    ap.add_argument("--phase3_value_consist_weight", type=float, default=None,
+                    help="weight for value-consistency Huber loss in Phase 3 "
+                         "(default: config training.v_consist_weight or 0.1).")
+    ap.add_argument("--phase3_cut_weight", type=float, default=None,
+                    help="weight for cut-transition MSE in Phase 3 "
+                         "(default: config training.cut_transition_weight or 0.1).")
+    ap.add_argument("--phase3_cf_weight", type=float, default=None,
+                    help="weight for counterfactual contrastive loss in Phase 3 "
+                         "(default: config training.cf_contrastive_weight or 0.3).")
+    ap.add_argument("--phase3_consist_weight", type=float, default=None,
+                    help="weight for free-run consistency loss in Phase 3 "
+                         "(default: config training.free_run_consist_weight or 0.3).")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -273,27 +302,54 @@ def main():
         )
         reload_best(model, ckpt_dir, 2, device)
 
-    # ---- Phase 3: dynamics (pre-encoded sequences) ----
+    # ---- Phase 3: dynamics ----
     if 3 in phases:
         print("\n=== Phase 3: Dynamics ===")
-        seq_collate = make_sequence_collate(include_vars=True)
-
-        # Encode-once cache: the Phase-3 encoder is frozen, so encoding each
-        # trajectory every epoch is pure waste. Cache to disk under the
-        # checkpoint dir; epoch 1 encodes, later epochs load (no GNN forward).
-        seq_cache = ckpt_dir / "seq_cache"
-
-        # Phase 3 (sequences) is the memory-heavy phase; it uses its own,
-        # typically smaller, batch size so the transition phases (1/2/4/5) can
-        # run a much larger batch for speed without OOMing here.
         seq_bs = args.seq_batch_size or bs
 
-        def sequence_loader(file_list, shuffle):
-            ds = SequenceDataset(file_list, model, device, include_vars=True,
-                                 cache_dir=seq_cache)
-            # num_workers=0: the dataset holds the (unpicklable) model.
-            return DataLoader(ds, batch_size=seq_bs, shuffle=shuffle,
-                              collate_fn=seq_collate, num_workers=0)
+        train_encoder = args.phase3_train_encoder
+        enc_lr_scale   = args.encoder_lr_scale
+
+        if train_encoder:
+            # Joint encoder+dynamics: RawSequenceDataset encodes on-the-fly with
+            # the CURRENT encoder every step → no stale latent problem.
+            print("  [encoder trainable] using RawSequenceDataset (on-the-fly encoding)")
+            raw_collate = make_raw_collate()
+
+            def sequence_loader(file_list, shuffle):
+                ds = RawSequenceDataset(file_list)
+                return DataLoader(ds, batch_size=seq_bs, shuffle=shuffle,
+                                  collate_fn=raw_collate, num_workers=0)
+        else:
+            # Frozen encoder: encode once, cache to disk; later epochs load fast.
+            seq_cache  = ckpt_dir / "seq_cache"
+            seq_collate = make_sequence_collate(include_vars=True)
+
+            def sequence_loader(file_list, shuffle):
+                ds = SequenceDataset(file_list, model, device, include_vars=True,
+                                     cache_dir=seq_cache)
+                return DataLoader(ds, batch_size=seq_bs, shuffle=shuffle,
+                                  collate_fn=seq_collate, num_workers=0)
+
+        # Optional cut-transition MSE loss.
+        cut_tr_loader = None
+        if args.cut_transitions_dir:
+            cut_dir = Path(args.cut_transitions_dir)
+            cut_files = sorted(cut_dir.glob("*_cut.npz"))
+            if cut_files:
+                cut_ds = CutTransitionDataset(cut_files)
+                cut_tr_loader = DataLoader(cut_ds, batch_size=seq_bs,
+                                           shuffle=True, collate_fn=CutTransitionDataset.collate,
+                                           num_workers=0)
+                print(f"  Cut transitions: {len(cut_files)} files → loader ready")
+            else:
+                print(f"  [warn] --cut_transitions_dir={cut_dir} has no *_cut.npz files; skipping")
+
+        # Resolve per-loss weights: CLI override > config > hard default.
+        def _w(cli_val, cfg_key, default):
+            if cli_val is not None:
+                return cli_val
+            return tcfg.get(cfg_key, default)
 
         also_train = tuple(
             s.strip() for s in args.phase3_also_train.split(",") if s.strip()
@@ -303,10 +359,15 @@ def main():
             sequence_loader(va_files, False),
             epochs=epochs_of("epochs_phase3"), lr=tcfg["lr_phase3"],
             overshoot_depth=tcfg.get("overshoot_depth", 0),
-            # Phase 3 gets its own (larger) patience so the overshoot curriculum
-            # isn't misread as a plateau; falls back to the global patience.
             patience=tcfg.get("patience_phase3", patience),
             also_train=also_train,
+            also_train_encoder=train_encoder,
+            encoder_lr_scale=enc_lr_scale,
+            cut_loader=cut_tr_loader,
+            v_consist_weight=_w(args.phase3_value_consist_weight, "v_consist_weight", 0.1),
+            cut_weight=_w(args.phase3_cut_weight, "cut_transition_weight", 0.1),
+            cf_weight=_w(args.phase3_cf_weight, "cf_contrastive_weight", 0.3),
+            free_run_weight=_w(args.phase3_consist_weight, "free_run_consist_weight", 0.3),
         )
         reload_best(model, ckpt_dir, 3, device)
 
