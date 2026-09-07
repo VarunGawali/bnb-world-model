@@ -749,19 +749,31 @@ class Trainer:
                     loss = loss + consist_w * F.mse_loss(free_preds, z_next_seq)
 
         # Fix F: cut transition MSE loss.
-        # When the batch carries cut transition pairs (z_before [B,H],
-        # cut_feats [B,6], z_after [H]), train cut_action_embed so that
-        # Dynamics(z_before, cut_action_embed(cut_feats), d=0) ≈ z_after.
-        # Weight 0.1 — warm-start safe (embed starts at zero so L_cut ≈ 0
-        # initially and grows as the embed learns).
-        if d.get("cut_z_before") is not None:
-            cut_zb  = d["cut_z_before"].to(self.device)    # [N, H]
+        # The cut batch carries raw graph features (graph_before, graph_after,
+        # cut_feats) rather than stale cached latents.  We encode them using
+        # the CURRENT encoder so that z_before and z_after are always on the
+        # same manifold as the evolving Phase-3 encoder, then train:
+        #   Dynamics(z_before, cut_action_embed(cut_feats), d=0) ≈ z_after
+        # Weight 0.1 — warm-start safe (cut_action_embed starts at zero so
+        # L_cut ≈ 0 initially and grows as the embedding learns).
+        if d.get("graph_before") is not None:
+            gb  = d["graph_before"].to(self.device)
+            ga  = d["graph_after"].to(self.device)
             cut_phi = d["cut_feats"].to(self.device)        # [N, cut_feat_dim]
-            cut_za  = d["cut_z_after"].to(self.device)     # [N, H]
-            a_cut   = self.model.cut_action_embed(cut_phi) # [N, H]
-            # d=0.0 discriminates cut from branch (+1/-1).
+            # Encode with current (possibly updating) encoder.
+            # grad flows through cut_action_embed and dynamics.step only —
+            # z_before/z_after are detached to avoid coupling the encoder
+            # update to the cut transition loss in Phase 3.
+            with torch.no_grad():
+                _, z_before_all, _ = self.model.encode_with_cons(gb)
+                _, z_after_all, _  = self.model.encode_with_cons(ga)
+            # encoder returns (h_vars, z, h_cons); z is [B, H]
+            cut_zb = z_before_all.detach()
+            cut_za = z_after_all.detach()
+            a_cut  = self.model.cut_action_embed(cut_phi)   # [N, H]
+            # d=0.0 discriminates cut actions from branch (+1/-1).
             z_cut_pred, _, _ = self.model.dynamics.step(
-                cut_zb, a_cut, d_t=0.0)                    # [N, H]
+                cut_zb, a_cut, d_t=0.0)                     # [N, H]
             cut_w = getattr(self, "cut_transition_weight", 0.1)
             loss = loss + cut_w * F.mse_loss(z_cut_pred, cut_za)
 

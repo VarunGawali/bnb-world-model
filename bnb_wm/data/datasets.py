@@ -965,3 +965,73 @@ def make_sequence_collate(include_vars=True):
         return out
 
     return _collate
+
+
+# ---------------------------------------------------------------------------
+# CutTransitionDataset
+# ---------------------------------------------------------------------------
+
+class CutTransitionDataset(Dataset):
+    """
+    Dataset of Gomory cut transitions for Phase-3 cut dynamics training.
+
+    Each item is a dict with PyG Data objects for the before/after states and
+    the 6-dim cut feature vector.  Latent vectors are NOT stored; they are
+    produced by the caller (trainer) using the current encoder — this keeps
+    the training targets on the same manifold as the evolving encoder.
+
+    Schema per .npz (produced by scripts/gen_cut_transitions.py):
+        vf_before   [n_vars, 19]
+        cf_before   [n_cons, 5]
+        ei_before   [2, E_b]
+        ev_before   [E_b]
+        vf_after    [n_vars, 19]
+        cf_after    [n_cons+1, 5]
+        ei_after    [2, E_a]
+        ev_after    [E_a]
+        cut_feats   [6]
+        delta_lb    scalar        LP-bound improvement (for logging)
+        lp_obj_before / lp_obj_after  scalars
+    """
+
+    def __init__(self, data_dir: str | Path):
+        self.files = sorted(Path(data_dir).rglob("*_cut.npz"))
+        if not self.files:
+            raise FileNotFoundError(f"No *_cut.npz files found in {data_dir}")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        d   = np.load(self.files[idx], allow_pickle=True)
+        vfb = d["vf_before"]
+        cfb = d["cf_before"]
+        eib = d["ei_before"]
+        evb = d["ev_before"]
+        vfa = d["vf_after"]
+        cfa = d["cf_after"]
+        eia = d["ei_after"]
+        eva = d["ev_after"]
+
+        return {
+            "graph_before": build_pyg_data(vfb, cfb, eib, evb),
+            "graph_after":  build_pyg_data(vfa, cfa, eia, eva),
+            "cut_feats":    torch.from_numpy(d["cut_feats"].astype(np.float32)),
+            "delta_lb":     float(d["delta_lb"]),
+            "lp_obj_before": float(d["lp_obj_before"]),
+            "lp_obj_after":  float(d["lp_obj_after"]),
+        }
+
+    @staticmethod
+    def collate(items):
+        """Collate a list of dicts into a batch dict with Batched PyG Data."""
+        graphs_b = Batch.from_data_list([it["graph_before"] for it in items])
+        graphs_a = Batch.from_data_list([it["graph_after"]  for it in items])
+        cut_feats = torch.stack([it["cut_feats"] for it in items])
+        delta_lb  = torch.tensor([it["delta_lb"] for it in items], dtype=torch.float32)
+        return {
+            "graph_before": graphs_b,
+            "graph_after":  graphs_a,
+            "cut_feats":    cut_feats,
+            "delta_lb":     delta_lb,
+        }
