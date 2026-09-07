@@ -734,16 +734,29 @@ class SequenceDataset(Dataset):
                            d["edge_indices"][t], d["edge_values"][t])
             for t in range(T)
         ]
-        batch = Batch.from_data_list(datas).to(self.device)
-        h_vars, z = self.model.encode(batch)          # h_vars [sumV,H], z [T,H]
-        z = z.cpu()
-
-        # Split h_vars per step (n_vars constant within a trajectory).
-        var_mask_all = batch.node_type == 0
-        var_batch = batch.batch[var_mask_all].cpu()
-        h_all = h_vars.cpu()
-
         branch = np.asarray(d["branching_vars"]).astype(np.int64)
+
+        # Encode in chunks to avoid OOM on large trajectories.
+        # chunk_size=8 limits peak GPU memory to ~8 steps worth of GATv2 activations.
+        chunk_size = 8
+        z_chunks, hv_chunks, vbatch_chunks = [], [], []
+        step_offset = 0
+        for start in range(0, T, chunk_size):
+            chunk = datas[start:start + chunk_size]
+            cb = Batch.from_data_list(chunk).to(self.device)
+            h_c, z_c = self.model.encode(cb)
+            z_chunks.append(z_c.cpu())
+            vm = cb.node_type == 0
+            vb = cb.batch[vm].cpu() + step_offset
+            hv_chunks.append(h_c.cpu())
+            vbatch_chunks.append(vb)
+            step_offset += len(chunk)
+            del cb, h_c, z_c
+
+        z = torch.cat(z_chunks, dim=0)               # [T, H]
+        h_all = torch.cat(hv_chunks, dim=0)          # [sumV, H]
+        var_batch = torch.cat(vbatch_chunks, dim=0)  # [sumV]
+
         a_list = []
         per_step_h = []
         for t in range(T):
