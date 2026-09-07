@@ -626,6 +626,8 @@ class SequenceDataset(Dataset):
         self.index = []            # list of (file_idx, path, instance_weight)
         for fi, f in enumerate(self.files):
             with np.load(f, allow_pickle=True) as d:
+                if "n_steps" not in d:
+                    continue
                 T = int(d["n_steps"])
                 if "node_ids" in d and "parent_ids" in d:
                     paths = _root_to_leaf_paths(
@@ -939,6 +941,8 @@ class RawSequenceDataset(Dataset):
         self.index = []   # (file_idx, path_list, instance_weight)
         for fi, f in enumerate(self.files):
             with np.load(f, allow_pickle=True) as d:
+                if "n_steps" not in d:
+                    continue
                 T = int(d["n_steps"])
                 if "node_ids" in d and "parent_ids" in d:
                     paths = _root_to_leaf_paths(
