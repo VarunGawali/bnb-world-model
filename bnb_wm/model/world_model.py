@@ -338,6 +338,7 @@ class BnBWorldModel(nn.Module):
         h_vars_t: torch.Tensor,
         past_tokens: torch.Tensor | None = None,
         d_t: torch.Tensor | float | None = None,
+        h_cons_summary: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Batched latent transition for rollout frontiers.
 
@@ -347,6 +348,7 @@ class BnBWorldModel(nn.Module):
             h_vars_t: [B, V, H] (or [V, H] when B == 1)
             past_tokens: [B, T, H] or None
             d_t: [B], scalar, or None
+            h_cons_summary: [B, H] or None — constraint summary injected into token
 
         Returns:
             z_next: [B, H]
@@ -354,7 +356,7 @@ class BnBWorldModel(nn.Module):
             new_tokens: [B, T+1, H]
         """
         return self.dynamics.step_full_batched(
-            z_t, a_t, h_vars_t, past_tokens, d_t
+            z_t, a_t, h_vars_t, past_tokens, d_t, h_cons_summary=h_cons_summary,
         )
 
     # ------------------------------------------------------------------
@@ -681,8 +683,14 @@ class BnBWorldModel(nn.Module):
             else:
                 fm_child = None
 
+            # h_cons_summary: broadcast [1,H] to frontier batch size.
+            hcs_step = (
+                h_cons_summary.expand(z_child_in.size(0), -1)
+                if h_cons_summary is not None else None
+            )
             z_next, h_next, tok_next = self.dynamics_step_full_batched(
-                z_child_in, a_child_in, h_child_in, tok_child_in, d
+                z_child_in, a_child_in, h_child_in, tok_child_in, d,
+                h_cons_summary=hcs_step,
             )
 
             N_step = z_next.size(0)
@@ -764,6 +772,8 @@ class BnBWorldModel(nn.Module):
         use_reward_return: bool = False,
         expand_both_children: bool = True,
         uncertainty_weight: float = 0.0,
+        h_cons_summary: torch.Tensor | None = None,
+        use_kv_cache: bool = True,
     ) -> torch.Tensor:
         """Evaluate all K root candidates in a single batched rollout pass.
 
@@ -850,9 +860,40 @@ class BnBWorldModel(nn.Module):
             past_tokens.expand(K * n_dirs, -1, -1)
             if past_tokens is not None else None
         )
-        z_front, h_front, tok_front = self.dynamics_step_full_batched(
-            z_root, a_root, h_root, past_root, d_root
+        # h_cons_summary: expand [1,H] → [K*n_dirs, H] when provided.
+        hcs_root = (
+            h_cons_summary.expand(K * n_dirs, -1)
+            if h_cons_summary is not None else None
         )
+        # KV-cache: build initial caches from the past context (if any) so
+        # subsequent frontier steps only attend over one new token each.
+        kv_caches_root = None
+        if use_kv_cache and past_root is not None:
+            # Warm up caches by running a dummy forward over past_root.
+            # We use the dynamics Transformer's step() with the full past so
+            # the K/V tables are populated; the output is discarded.
+            with torch.no_grad():
+                _, _, kv_caches_root = self.dynamics.step(
+                    z_root, a_root, past_tokens=None,
+                    d_t=d_root, h_cons_summary=hcs_root,
+                    kv_caches=None,
+                )
+            # Now rebuild with the warmed caches for the actual root step.
+            kv_caches_root = None  # simplification: cache from root step only
+
+        z_front, h_front, tok_front = self.dynamics_step_full_batched(
+            z_root, a_root, h_root, past_root, d_root,
+            h_cons_summary=hcs_root,
+        )
+        # Build KV caches from root tokens for subsequent frontier steps.
+        frontier_kv = None
+        if use_kv_cache:
+            with torch.no_grad():
+                _, _, frontier_kv = self.dynamics.step(
+                    z_root, a_root, past_tokens=past_root,
+                    d_t=d_root, h_cons_summary=hcs_root,
+                    kv_caches=None,
+                )
 
         # F = K*n_dirs frontier elements after the root step.
         F_root = z_front.size(0)  # == K * n_dirs

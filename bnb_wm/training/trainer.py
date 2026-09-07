@@ -613,36 +613,78 @@ class Trainer:
             cand_a  = d["cand_actions_seq"].to(self.device)    # [B, T, K, H]
             cand_sb = d["cand_sb_scores_seq"].to(self.device)  # [B, T, K]
             B, T, K, H = cand_a.shape
-            rank_losses = []
-            for b in range(B):
-                for t in range(T):
-                    if tmask is not None and not tmask[b, t]:
-                        continue
-                    z_t = z_seq[b, t]                          # [H]
-                    d_t = d_seq[b, t] if d_seq is not None else None
-                    candidates = cand_a[b, t]                  # [K, H]
-                    sb_k = cand_sb[b, t]                       # [K]
-                    if not torch.isfinite(sb_k).all() or K < 2:
-                        continue
-                    # Step each candidate through dynamics, decode value.
-                    z_nexts = []
-                    for k in range(K):
-                        z_k, _, _ = self.model.dynamics.step(
-                            z_t.unsqueeze(0), candidates[k].unsqueeze(0),
-                            d_t.unsqueeze(0) if d_t is not None else None,
-                        )
-                        z_nexts.append(z_k.squeeze(0))
-                    z_nexts_stacked = torch.stack(z_nexts, dim=0)   # [K, H]
-                    # Decode scalar per candidate (negative value = better)
-                    scalars = self.model.value(
-                        z_nexts_stacked,
-                        z_nexts_stacked,            # h_vars placeholder
-                        torch.zeros(K, dtype=torch.long, device=self.device),
-                    )                                               # [K]
-                    rank_losses.append(_cand_rank_loss(scalars, sb_k))
-            if rank_losses:
+
+            # Vectorised candidate ranking: replace the B×T×K Python loop with
+            # one batched dynamics step over all valid (b,t) positions at once.
+            # Valid positions: finite SB scores, at least 2 candidates, not masked.
+            finite_mask = torch.isfinite(cand_sb).all(dim=-1)  # [B, T]
+            if tmask is not None:
+                finite_mask = finite_mask & tmask.bool()
+            valid_bt = finite_mask.nonzero(as_tuple=False)  # [N_valid, 2]
+
+            if valid_bt.size(0) > 0 and K >= 2:
+                bs_idx, ts_idx = valid_bt[:, 0], valid_bt[:, 1]
+                N = valid_bt.size(0)
+
+                # Gather z and actions for all valid (b,t) positions.
+                z_bt  = z_seq[bs_idx, ts_idx]          # [N, H]
+                a_bt  = cand_a[bs_idx, ts_idx]         # [N, K, H]
+                sb_bt = cand_sb[bs_idx, ts_idx]         # [N, K]
+                d_bt  = d_seq[bs_idx, ts_idx] if d_seq is not None else None  # [N]
+
+                # Expand to [N*K, H] for a single batched step call.
+                z_exp = z_bt.unsqueeze(1).expand(-1, K, -1).reshape(N * K, H)
+                a_exp = a_bt.reshape(N * K, H)
+                d_exp = d_bt.unsqueeze(1).expand(-1, K).reshape(-1) \
+                    if d_bt is not None else None
+
+                z_nexts_flat, _, _ = self.model.dynamics.step(
+                    z_exp, a_exp, d_t=d_exp,
+                )  # [N*K, H]
+
+                z_nexts = z_nexts_flat.reshape(N, K, H)  # [N, K, H]
+
+                # Decode value per candidate (use z as h_vars placeholder).
+                z_flat = z_nexts.reshape(N * K, H)
+                bvec   = torch.arange(N, device=self.device).repeat_interleave(K)
+                scalars_flat = self.model.value(
+                    z_flat, z_flat, bvec,
+                )  # [N*K] → higher = better bound
+
+                scalars = scalars_flat.reshape(N, K)  # [N, K]
+
+                rank_losses = [
+                    _cand_rank_loss(scalars[i], sb_bt[i]) for i in range(N)
+                ]
                 cand_rank_w = getattr(self, "cand_rank_weight", 0.5)
                 loss = loss + cand_rank_w * torch.stack(rank_losses).mean()
+
+        # Value consistency in Phase 3: predicted latents should decode through
+        # the (frozen) value head to match the target latent's value. Prevents
+        # dynamics from drifting into a region the value head cannot decode.
+        # Weight is small (0.1) so it anchors without overwhelming the MSE loss.
+        v_consist_w = getattr(self, "v_consist_weight", 0.1)
+        if v_consist_w > 0.0:
+            with torch.no_grad():
+                B_s, T_s, H_s = z_next_seq.shape
+                z_tgt_flat = z_next_seq.reshape(B_s * T_s, H_s)
+                bvec_flat  = torch.zeros(B_s * T_s, dtype=torch.long,
+                                         device=self.device)
+                v_tgt = self.model.value(
+                    z_tgt_flat, z_tgt_flat, bvec_flat,
+                ).reshape(B_s, T_s).detach()
+
+            z_pred_flat = z_pred.reshape(B_s * T_s, H_s)
+            v_pred = self.model.value(
+                z_pred_flat, z_pred_flat, bvec_flat,
+            ).reshape(B_s, T_s)
+
+            if tmask is not None:
+                per = F.mse_loss(v_pred, v_tgt, reduction="none")
+                loss = loss + v_consist_w * (per * tmask.float()).sum() / \
+                    tmask.float().sum().clamp_min(1.0)
+            else:
+                loss = loss + v_consist_w * F.mse_loss(v_pred, v_tgt)
 
         return loss
 
