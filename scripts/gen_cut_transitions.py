@@ -39,7 +39,10 @@ No --checkpoint needed: latents are NOT cached here.
 """
 
 import argparse
+import multiprocessing as mp
+import os
 import warnings
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -183,7 +186,12 @@ def _build_after_graph(var_feats, con_feats, edge_idx, edge_vals,
 # Per-file processing
 # ---------------------------------------------------------------------------
 
-def process_file(fpath, out_dir):
+def process_file(fpath, out_dir, resume=False):
+    stem = Path(fpath).stem
+    out_path = Path(out_dir) / f"{stem}_cut.npz"
+    if resume and out_path.exists():
+        return None   # already done
+
     d = np.load(fpath, allow_pickle=True)
     T = int(d["n_steps"])
     if T == 0:
@@ -236,8 +244,6 @@ def process_file(fpath, out_dir):
         var_feats, con_feats, edge_idx, edge_vals, cut, x_new
     )
 
-    stem = Path(fpath).stem
-    out_path = out_dir / f"{stem}_cut.npz"
     np.savez_compressed(
         out_path,
         # Before-cut raw graph (for on-the-fly encoding).
@@ -266,35 +272,59 @@ def process_file(fpath, out_dir):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _worker(args):
+    fpath, out_dir, resume = args
+    try:
+        result = process_file(fpath, out_dir, resume=resume)
+        return result   # True = written, False = skipped, None = already done
+    except Exception as e:
+        warnings.warn(f"skip {Path(fpath).name}: {e}")
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir",  required=True)
     ap.add_argument("--out_dir",   required=True)
     ap.add_argument("--max_files", type=int, default=None)
+    ap.add_argument("--workers",   type=int, default=os.cpu_count(),
+                    help="Parallel worker processes (default: all CPUs)")
+    ap.add_argument("--resume",    action="store_true",
+                    help="Skip files whose output .npz already exists")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     files = sorted(Path(args.data_dir).rglob("*.npz"))
+    # Exclude output files if they end up in the same tree.
+    files = [f for f in files if "_cut.npz" not in f.name]
     if args.max_files:
         files = files[:args.max_files]
 
-    ok = fail = 0
-    for f in files:
-        try:
-            if process_file(f, out_dir):
-                ok += 1
-            else:
-                fail += 1
-        except Exception as e:
-            warnings.warn(f"skip {f.name}: {e}")
-            fail += 1
+    print(f"Processing {len(files)} trajectory files with {args.workers} workers"
+          + (" (resume mode)" if args.resume else "") + " ...")
 
-    print(f"\nDone: {ok} cut transitions written, {fail} skipped → {out_dir}")
+    work = [(str(f), str(out_dir), args.resume) for f in files]
+
+    ok = fail = skipped = 0
+    if args.workers == 1:
+        for item in work:
+            r = _worker(item)
+            if r is True:    ok += 1
+            elif r is None:  skipped += 1
+            else:            fail += 1
+    else:
+        with mp.Pool(args.workers) as pool:
+            for r in pool.imap_unordered(_worker, work, chunksize=4):
+                if r is True:    ok += 1
+                elif r is None:  skipped += 1
+                else:            fail += 1
+
+    print(f"\nDone: {ok} written, {skipped} already done, {fail} skipped → {out_dir}")
     print("NOTE: latent vectors are NOT cached here. The training loop")
     print("      encodes vf/cf/ei/ev on-the-fly using the current Phase-3 encoder.")
-    print("NOTE: cut dynamics was trained on ROOT-STATE transitions only.")
+    print("NOTE: cut dynamics trained on ROOT-STATE transitions only.")
 
 
 if __name__ == "__main__":
