@@ -199,6 +199,60 @@ def _build_after_graph(var_feats, con_feats, edge_idx, edge_vals,
 
 
 # ---------------------------------------------------------------------------
+# LP reconstruction from bipartite graph features
+# ---------------------------------------------------------------------------
+
+def _reconstruct_lp(var_feats, con_feats, edge_idx, edge_vals):
+    """
+    Reconstruct (A, b, c, x_lp) from Ecole NodeBipartite graph features.
+
+    Ecole normalises each constraint row by its L1 norm (sum of |A[i,:]|) and
+    flips the sign for >= constraints → -Ax <= -b.  The stored values are
+    therefore already a valid LP in HiGHS form (Ax <= b, x >= 0) because
+    A_stored = A_orig/scale with sign-flip and b_stored = b_orig/scale with
+    the same sign-flip.  Solving the scaled LP gives the same optimal x as the
+    original.
+
+    Columns used (Ecole NodeBipartite 19-dim variable features):
+        col 13 : sol_val  — LP solution at this node
+        col  5 : obj (normed objective coefficient) used as proxy for c
+
+    The RHS is read from con_features[:, 1] — the same column build_pyg_data
+    uses for edge normalisation.
+    """
+    n_vars = var_feats.shape[0]
+    n_cons = con_feats.shape[0]
+
+    # Build sparse A from edges; both A and b already carry correct signs.
+    A = np.zeros((n_cons, n_vars), dtype=np.float64)
+    rows = edge_idx[0].astype(int)
+    cols = edge_idx[1].astype(int)
+    mask = (rows < n_cons) & (cols < n_vars)
+    A[rows[mask], cols[mask]] = edge_vals[mask].astype(np.float64)
+
+    b = con_feats[:, 1].astype(np.float64)
+
+    # Objective: use normalised obj coefficient (col 5) as proxy.
+    # For uniform-cost problems this equals the true c up to a positive scale,
+    # which is sufficient because LP argmin is scale-invariant.  Fall back to
+    # all-ones (valid for set-cover) when col 5 is identically zero.
+    if var_feats.shape[1] > 5:
+        c_proxy = var_feats[:, 5].astype(np.float64)
+        if np.all(c_proxy == 0):
+            c_proxy = np.ones(n_vars, dtype=np.float64)
+    else:
+        c_proxy = np.ones(n_vars, dtype=np.float64)
+
+    # LP solution at this node (Ecole col 13 = sol_val).
+    if var_feats.shape[1] > 13:
+        x_lp = var_feats[:, 13].astype(np.float64)
+    else:
+        x_lp = np.zeros(n_vars, dtype=np.float64)
+
+    return A, b, c_proxy, x_lp
+
+
+# ---------------------------------------------------------------------------
 # Per-file processing
 # ---------------------------------------------------------------------------
 
@@ -219,84 +273,121 @@ def process_file(fpath, out_dir, resume=False):
     edge_idx  = d["edge_indices"][0]
     edge_vals = d["edge_values"][0]
 
-    # LP matrices — present in files collected with collect_with_cuts_v2.
-    if "A" not in d or "b" not in d or "c" not in d:
-        return False
-    A = np.asarray(d["A"], dtype=np.float64)
-    b = np.asarray(d["b"], dtype=np.float64)
-    c = np.asarray(d["c"], dtype=np.float64)
+    # ---- Obtain (A, b, c, x_lp) ----------------------------------------
+    # Prefer explicitly stored LP matrices (collect_with_cuts_v2 files).
+    # Fall back to graph-based reconstruction for traj_sc_ files which carry
+    # pre-computed cuts but not the raw LP matrices.
+    if "A" in d and "b" in d and "c" in d and "x_lp" in d:
+        A    = np.asarray(d["A"],    dtype=np.float64)
+        b    = np.asarray(d["b"],    dtype=np.float64)
+        c    = np.asarray(d["c"],    dtype=np.float64)
+        x_lp = np.asarray(d["x_lp"], dtype=np.float64)
+        use_precomputed_cuts = False
+    elif "cut_lhs" in d and "cut_rhs" in d:
+        # traj_sc_ style: reconstruct LP from graph, use stored cuts directly.
+        A, b, c, x_lp = _reconstruct_lp(var_feats, con_feats, edge_idx, edge_vals)
+        use_precomputed_cuts = True
+    else:
+        return False   # no LP data and no pre-computed cuts → skip
 
-    # x_lp is required for valid Gomory cut generation; don't substitute zeros.
-    if "x_lp" not in d:
+    # Sanity: x_lp must be finite; all-zeros means no LP info was stored.
+    if not np.all(np.isfinite(x_lp)):
         return False
-    x_lp = np.asarray(d["x_lp"], dtype=np.float64)
 
-    # Sanity: x_lp must be finite and non-trivial (zeros give degenerate cuts).
+    # If x_lp is all zeros (Ecole col 13 not populated), try to recover from
+    # an LP solve on the reconstructed matrices — cheap at the root.
+    if np.all(x_lp == 0):
+        _, x_lp_solved = _solve_lp(A, b, c)
+        if x_lp_solved is None:
+            return False
+        x_lp = x_lp_solved
+
+    # Final check: must still be finite and non-trivial after any solve.
     if not np.all(np.isfinite(x_lp)) or np.all(x_lp == 0):
         return False
 
-    # LP objective before cut.
     lp_obj_before = float(np.dot(c, x_lp))
 
-    # Generate one Gomory cut from the root LP solution.
-    try:
-        from bnb_wm.cuts.cg_cuts import generate_cg_cuts
-        cuts = generate_cg_cuts(A, b, c, x_lp=x_lp, max_cuts=1)
-    except Exception:
-        return False
-    if not cuts:
-        return False
-    cut = cuts[0]
+    # ---- Obtain cut coefficients -----------------------------------------
+    if use_precomputed_cuts:
+        # Use first pre-computed cut stored at root (t=0).
+        cl = d["cut_lhs"][0]   # may be object array wrapping a 2-D array
+        cr = d["cut_rhs"][0]
+        cf_store = d["cut_features"][0] if "cut_features" in d else None
 
-    cut_coeffs_arr = np.asarray(cut["coeffs"], dtype=np.float64)
-    cut_rhs_val    = float(cut["rhs"])
+        cl = np.asarray(cl, dtype=np.float64)
+        if cl.ndim == 2:
+            cl = cl[0]    # first cut row
+        cr = np.asarray(cr, dtype=np.float64)
+        cut_rhs_val = float(cr[0]) if cr.ndim > 0 else float(cr)
 
-    # Sanity: the cut must actually violate the current LP solution.
-    # A Gomory cut is valid only when dot(cut, x_lp) > cut_rhs (violation > 0).
+        # Align coefficient length to n_vars (may differ if problem was padded).
+        n_vars = var_feats.shape[0]
+        if cl.shape[0] > n_vars:
+            cl = cl[:n_vars]
+        elif cl.shape[0] < n_vars:
+            cl = np.pad(cl, (0, n_vars - cl.shape[0]))
+
+        cut_coeffs_arr = cl
+
+        # Use stored 6-dim cut features when available; otherwise compute.
+        if cf_store is not None:
+            cf_store = np.asarray(cf_store, dtype=np.float32)
+            cut_feats = cf_store[0] if cf_store.ndim == 2 else cf_store
+        else:
+            cut = {"coeffs": cut_coeffs_arr, "rhs": cut_rhs_val}
+            cut_feats = _build_cut_features(cut, x_lp, c)
+    else:
+        # Generate one Gomory cut from the root LP solution.
+        try:
+            from bnb_wm.cuts.cg_cuts import generate_cg_cuts
+            cuts = generate_cg_cuts(A, b, c, x_lp=x_lp, max_cuts=1)
+        except Exception:
+            return False
+        if not cuts:
+            return False
+        cut = cuts[0]
+        cut_coeffs_arr = np.asarray(cut["coeffs"], dtype=np.float64)
+        cut_rhs_val    = float(cut["rhs"])
+        cut_feats      = _build_cut_features(cut, x_lp, c)
+
+    # Sanity: the cut must violate the current LP solution.
     violation = float(np.dot(cut_coeffs_arr, x_lp) - cut_rhs_val)
     if violation <= 1e-6:
         return False
 
-    cut_feats  = _build_cut_features(cut, x_lp, c)
     cut_coeffs = cut_coeffs_arr.astype(np.float32)
     cut_rhs    = cut_rhs_val
 
-    # Inject cut and re-solve.
-    lp_obj_after, x_new, _, _ = _inject_cut_and_resolve(A, b, c, cut)
+    # ---- Inject cut and re-solve -----------------------------------------
+    cut_dict = {"coeffs": cut_coeffs_arr, "rhs": cut_rhs_val}
+    lp_obj_after, x_new, _, _ = _inject_cut_and_resolve(A, b, c, cut_dict)
     if x_new is None:
         return False
 
-    # Sanity: for minimisation the LP objective cannot decrease after adding a
-    # valid cut (the feasible region shrinks or stays the same).
+    # For minimisation, LP obj cannot decrease after adding a feasibility cut.
     delta_lb = lp_obj_after - lp_obj_before
     if delta_lb < -1e-6:
-        # Numerical issue from HiGHS; discard this transition.
         return False
 
-    # Build post-cut graph (proper: add constraint node + edges for cut row).
-    # Pass c so _con_features_for_cut can compute the objective cosine similarity
-    # (Ecole col 0) and place the RHS in the correct column (Ecole col 1).
+    # ---- Build post-cut graph --------------------------------------------
     vf_after, cf_after, ei_after, ev_after = _build_after_graph(
-        var_feats, con_feats, edge_idx, edge_vals, cut, x_new, c=c
+        var_feats, con_feats, edge_idx, edge_vals, cut_dict, x_new, c=c
     )
 
     np.savez_compressed(
         out_path,
-        # Before-cut raw graph (for on-the-fly encoding).
         vf_before=var_feats.astype(np.float32),
         cf_before=con_feats.astype(np.float32),
         ei_before=edge_idx.astype(np.int64),
         ev_before=edge_vals.astype(np.float32),
-        # After-cut raw graph (proper constraint added).
         vf_after=vf_after,
         cf_after=cf_after.astype(np.float32),
         ei_after=ei_after.astype(np.int64),
         ev_after=ev_after,
-        # Cut description.
         cut_feats=cut_feats,
         cut_coeffs=cut_coeffs,
         cut_rhs=np.float32(cut_rhs),
-        # LP objective information for auditing.
         lp_obj_before=np.float32(lp_obj_before),
         lp_obj_after=np.float32(lp_obj_after if lp_obj_after is not None else lp_obj_before),
         delta_lb=np.float32(delta_lb),
