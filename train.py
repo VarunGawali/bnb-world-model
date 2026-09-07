@@ -332,18 +332,41 @@ def main():
                                   collate_fn=seq_collate, num_workers=0)
 
         # Optional cut-transition MSE loss.
+        # Split cut files by trajectory stem to avoid train/val contamination:
+        # each *_cut.npz derives from the trajectory file with the same stem,
+        # so we look up {stem}_cut.npz for each tr_file / va_file stem.
         cut_tr_loader = None
+        cut_val_loader = None
         if args.cut_transitions_dir:
             cut_dir = Path(args.cut_transitions_dir)
-            cut_files = sorted(cut_dir.glob("*_cut.npz"))
-            if cut_files:
-                cut_ds = CutTransitionDataset(cut_files)
+
+            def _cut_files_for(traj_list):
+                found = []
+                for f in traj_list:
+                    stem = Path(f).stem
+                    candidate = cut_dir / f"{stem}_cut.npz"
+                    if candidate.exists():
+                        found.append(candidate)
+                return found
+
+            cut_tr_files = _cut_files_for(tr_files)
+            cut_va_files = _cut_files_for(va_files)
+
+            if cut_tr_files:
+                cut_ds = CutTransitionDataset(cut_tr_files)
                 cut_tr_loader = DataLoader(cut_ds, batch_size=seq_bs,
                                            shuffle=True, collate_fn=CutTransitionDataset.collate,
                                            num_workers=0)
-                print(f"  Cut transitions: {len(cut_files)} files → loader ready")
+                print(f"  Cut transitions train: {len(cut_tr_files)} files → loader ready")
             else:
-                print(f"  [warn] --cut_transitions_dir={cut_dir} has no *_cut.npz files; skipping")
+                print(f"  [warn] --cut_transitions_dir={cut_dir}: no train cut files found; skipping")
+
+            if cut_va_files:
+                cut_va_ds = CutTransitionDataset(cut_va_files)
+                cut_val_loader = DataLoader(cut_va_ds, batch_size=seq_bs,
+                                            shuffle=False, collate_fn=CutTransitionDataset.collate,
+                                            num_workers=0)
+                print(f"  Cut transitions val:   {len(cut_va_files)} files → loader ready")
 
         # Resolve per-loss weights: CLI override > config > hard default.
         def _w(cli_val, cfg_key, default):
@@ -364,6 +387,7 @@ def main():
             also_train_encoder=train_encoder,
             encoder_lr_scale=enc_lr_scale,
             cut_loader=cut_tr_loader,
+            cut_val_loader=cut_val_loader,
             v_consist_weight=_w(args.phase3_value_consist_weight, "v_consist_weight", 0.1),
             cut_weight=_w(args.phase3_cut_weight, "cut_transition_weight", 0.1),
             cf_weight=_w(args.phase3_cf_weight, "cf_contrastive_weight", 0.3),

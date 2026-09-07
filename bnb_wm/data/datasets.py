@@ -1116,8 +1116,11 @@ class CutTransitionDataset(Dataset):
         lp_obj_before / lp_obj_after  scalars
     """
 
-    def __init__(self, data_dir: str | Path):
-        self.files = sorted(Path(data_dir).rglob("*_cut.npz"))
+    def __init__(self, data_dir: "str | Path | list"):
+        if isinstance(data_dir, list):
+            self.files = [Path(f) for f in data_dir]
+        else:
+            self.files = sorted(Path(data_dir).rglob("*_cut.npz"))
         if not self.files:
             raise FileNotFoundError(f"No *_cut.npz files found in {data_dir}")
 

@@ -123,32 +123,39 @@ def _inject_cut_and_resolve(A, b, c, cut):
 # Post-cut graph construction
 # ---------------------------------------------------------------------------
 
-def _con_features_for_cut(coeffs, rhs, x_lp_after, n_vars):
+def _con_features_for_cut(coeffs, rhs, x_lp_after, n_vars, c=None):
     """
-    Build a 5-dim constraint feature row for the new Gomory cut constraint,
-    matching the Ecole row-feature layout (5 columns):
-        0: bias / RHS
-        1: obj_cos_sim  (reused as: cosine alignment with LP solution)
-        2: is_tight     (1 if the constraint is active at the LP solution)
-        3: dual_val     (approximated as 0; not available without solving dual)
-        4: scaled_age   (0; cut is brand-new)
+    Build a 5-dim constraint feature row for the new Gomory cut constraint.
+
+    Column layout MUST match Ecole's NodeBipartite row features exactly, because
+    build_pyg_data reads col 1 as the RHS for edge normalisation:
+        0: obj_cosine_sim  cosine(cut_coeffs, c); 0.0 when c unavailable
+        1: bias / RHS      — build_pyg_data reads edge RHS from THIS column
+        2: is_tight        1 if the cut is active at the new LP solution
+        3: dual_val        0.0 — not available without a dual solve
+        4: scaled_age      0.0 — cut is brand-new
     """
-    nz_mask = coeffs != 0
-    rhs_safe = float(rhs) if abs(rhs) > 1e-10 else 1.0
+    rhs_val  = float(rhs)
 
     activity = float(np.dot(coeffs, x_lp_after))
-    is_tight  = float(abs(activity - rhs) < 1e-6)
-    density   = float(nz_mask.mean())
+    is_tight = float(abs(activity - rhs_val) < 1e-6)
 
-    return np.array([rhs_safe, density, is_tight, 0.0, 0.0], dtype=np.float32)
+    if c is not None:
+        obj_cos = float(np.dot(coeffs, c) /
+                        (np.linalg.norm(coeffs) * np.linalg.norm(c) + 1e-8))
+    else:
+        obj_cos = 0.0
+
+    return np.array([obj_cos, rhs_val, is_tight, 0.0, 0.0], dtype=np.float32)
 
 
 def _build_after_graph(var_feats, con_feats, edge_idx, edge_vals,
-                       cut, x_lp_after):
+                       cut, x_lp_after, c=None):
     """
     Return (vf_after, cf_after, ei_after, ev_after):
-      - var_feats with updated LP values (col 0) and fractionality (col 14)
-      - con_feats with a new row for the cut constraint
+      - var_feats with updated LP values (col 13) and fractionality (col 14),
+        matching the Ecole NodeBipartite variable feature layout
+      - con_feats with a new row for the cut constraint (5-col Ecole layout)
       - edge_idx/edge_vals with new edges for the cut
     """
     coeffs = np.asarray(cut["coeffs"], dtype=np.float64)
@@ -156,15 +163,24 @@ def _build_after_graph(var_feats, con_feats, edge_idx, edge_vals,
     n_vars = var_feats.shape[0]
     n_cons = con_feats.shape[0]
 
-    # Updated variable features: LP solution and fractionality columns.
+    # Updated variable features.
+    # Ecole NodeBipartite variable feature layout (19 cols):
+    #   col 13 = sol_val  (LP solution value)   ← updated here
+    #   col 14 = sol_frac (fractionality)        ← updated here
+    # Do NOT write to col 0 — that is obj_cosine_similarity, fixed at collection.
     vf_after = var_feats.copy().astype(np.float32)
     n_use    = min(n_vars, len(x_lp_after))
-    vf_after[:n_use, 0]  = x_lp_after[:n_use].astype(np.float32)
-    frac = np.abs(x_lp_after[:n_use] - np.round(x_lp_after[:n_use])).astype(np.float32)
-    vf_after[:n_use, 14] = frac
+    if vf_after.shape[1] > 14:
+        vf_after[:n_use, 13] = x_lp_after[:n_use].astype(np.float32)
+        frac = np.abs(
+            x_lp_after[:n_use] - np.round(x_lp_after[:n_use])
+        ).astype(np.float32)
+        vf_after[:n_use, 14] = frac
+    # If the feature matrix is narrower than 15 cols (shouldn't happen with
+    # Ecole 19-dim features), skip the update rather than corrupting data.
 
-    # New constraint node: append to con_feats.
-    cut_con_feats = _con_features_for_cut(coeffs, rhs, x_lp_after, n_vars)
+    # New constraint node (5-dim, matching Ecole row-feature layout).
+    cut_con_feats = _con_features_for_cut(coeffs, rhs, x_lp_after, n_vars, c=c)
     cf_after = np.vstack([con_feats, cut_con_feats[np.newaxis, :]])
 
     # New edges: connect the new constraint (index n_cons) to variables with
@@ -215,6 +231,10 @@ def process_file(fpath, out_dir, resume=False):
         return False
     x_lp = np.asarray(d["x_lp"], dtype=np.float64)
 
+    # Sanity: x_lp must be finite and non-trivial (zeros give degenerate cuts).
+    if not np.all(np.isfinite(x_lp)) or np.all(x_lp == 0):
+        return False
+
     # LP objective before cut.
     lp_obj_before = float(np.dot(c, x_lp))
 
@@ -228,20 +248,36 @@ def process_file(fpath, out_dir, resume=False):
         return False
     cut = cuts[0]
 
+    cut_coeffs_arr = np.asarray(cut["coeffs"], dtype=np.float64)
+    cut_rhs_val    = float(cut["rhs"])
+
+    # Sanity: the cut must actually violate the current LP solution.
+    # A Gomory cut is valid only when dot(cut, x_lp) > cut_rhs (violation > 0).
+    violation = float(np.dot(cut_coeffs_arr, x_lp) - cut_rhs_val)
+    if violation <= 1e-6:
+        return False
+
     cut_feats  = _build_cut_features(cut, x_lp, c)
-    cut_coeffs = np.asarray(cut["coeffs"], dtype=np.float32)
-    cut_rhs    = float(cut["rhs"])
+    cut_coeffs = cut_coeffs_arr.astype(np.float32)
+    cut_rhs    = cut_rhs_val
 
     # Inject cut and re-solve.
     lp_obj_after, x_new, _, _ = _inject_cut_and_resolve(A, b, c, cut)
     if x_new is None:
         return False
 
-    delta_lb = (lp_obj_after - lp_obj_before) if lp_obj_after is not None else 0.0
+    # Sanity: for minimisation the LP objective cannot decrease after adding a
+    # valid cut (the feasible region shrinks or stays the same).
+    delta_lb = lp_obj_after - lp_obj_before
+    if delta_lb < -1e-6:
+        # Numerical issue from HiGHS; discard this transition.
+        return False
 
     # Build post-cut graph (proper: add constraint node + edges for cut row).
+    # Pass c so _con_features_for_cut can compute the objective cosine similarity
+    # (Ecole col 0) and place the RHS in the correct column (Ecole col 1).
     vf_after, cf_after, ei_after, ev_after = _build_after_graph(
-        var_feats, con_feats, edge_idx, edge_vals, cut, x_new
+        var_feats, con_feats, edge_idx, edge_vals, cut, x_new, c=c
     )
 
     np.savez_compressed(

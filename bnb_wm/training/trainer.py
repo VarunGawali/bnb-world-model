@@ -872,20 +872,26 @@ class Trainer:
 
         # Fix F: cut transition MSE loss (raw graph → encode on-the-fly →
         # Dynamics(z_before, cut_action_embed(cut_feats), d=0) ≈ z_after).
+        # When also_train_encoder=True, encode WITHOUT no_grad so the cut loss
+        # trains the encoder too (the primary reason we store raw graphs).
         if d.get("graph_before") is not None:
             gb  = d["graph_before"].to(self.device)
             ga  = d["graph_after"].to(self.device)
             cut_phi = d["cut_feats"].to(self.device)        # [N, cut_feat_dim]
-            with torch.no_grad():
-                _, z_before_all, _ = self.model.encode_with_cons(gb)
-                _, z_after_all, _  = self.model.encode_with_cons(ga)
-            cut_zb = z_before_all.detach()
-            cut_za = z_after_all.detach()
-            a_cut  = self.model.cut_action_embed(cut_phi)   # [N, H]
+            also_enc = getattr(self, "_also_train_encoder", False)
+            _enc_ctx = torch.enable_grad() if also_enc else torch.no_grad()
+            with _enc_ctx:
+                _, z_cut_zb = self.model.encode(gb)        # [N, H]
+                _, z_cut_za = self.model.encode(ga)        # [N, H]
+            if not also_enc:
+                z_cut_zb = z_cut_zb.detach()
+                z_cut_za = z_cut_za.detach()
+            a_cut  = self.model.cut_action_embed(cut_phi)  # [N, H]
+            d_zeros = torch.zeros(gb.num_graphs, device=self.device)
             z_cut_pred, _, _ = self.model.dynamics.step(
-                cut_zb, a_cut, d_t=0.0)                     # [N, H]
+                z_cut_zb, a_cut, d_t=d_zeros)              # [N, H]
             cut_w = getattr(self, "cut_transition_weight", 0.1)
-            L_cut = cut_w * F.mse_loss(z_cut_pred, cut_za)
+            L_cut = cut_w * F.mse_loss(z_cut_pred, z_cut_za)
             comps["cut"] = L_cut.item()
             loss = loss + L_cut
 
@@ -917,6 +923,7 @@ class Trainer:
                        also_train_encoder: bool = False,
                        encoder_lr_scale: float = 0.1,
                        cut_loader=None,
+                       cut_val_loader=None,
                        v_consist_weight: float = 0.1,
                        cut_weight: float = 0.1,
                        cf_weight: float = 0.3,
@@ -1143,12 +1150,43 @@ class Trainer:
                                 val_horizon_se[h]  += float((se * m).sum().item())
                                 val_horizon_cnt[h] += float(m.sum().item())
 
+            # --- separate cut-transition validation (does not affect early stop) ---
+            val_cut_loss = float("nan")
+            val_cut_dlb  = float("nan")
+            if cut_val_loader is not None:
+                cut_val_sum = cut_val_n = 0
+                dlb_sum = 0.0
+                with torch.no_grad():
+                    for cbatch in cut_val_loader:
+                        gb  = cbatch["graph_before"].to(self.device)
+                        ga  = cbatch["graph_after"].to(self.device)
+                        phi = cbatch["cut_feats"].to(self.device)
+                        try:
+                            _, zb = self.model.encode(gb)
+                            _, za = self.model.encode(ga)
+                            a_cut = self.model.cut_action_embed(phi)
+                            d_z   = torch.zeros(gb.num_graphs, device=self.device)
+                            z_pred_cut, _, _ = self.model.dynamics.step(zb, a_cut, d_t=d_z)
+                            cut_val_sum += F.mse_loss(z_pred_cut, za).item()
+                            cut_val_n   += 1
+                            if "delta_lb" in cbatch:
+                                dlb_sum += float(cbatch["delta_lb"].mean())
+                        except RuntimeError as e:
+                            if _is_oom(e):
+                                _recover_oom()
+                                continue
+                            raise
+                if cut_val_n > 0:
+                    val_cut_loss = cut_val_sum / cut_val_n
+                    val_cut_dlb  = dlb_sum / cut_val_n
+
             train_loss = total_loss / n if n else float("inf")
             val_loss   = val_loss_sum / val_w_sum if val_w_sum > 0 else float("inf")
             scheduler.step()
 
             self.history["p3_train_loss"].append(train_loss)
             self.history["p3_val_loss"].append(val_loss)
+            self.history["p3_val_cut_loss"].append(val_cut_loss)
 
             # Per-component log line.
             comp_str = "  ".join(
@@ -1156,12 +1194,15 @@ class Trainer:
             horizon_str = "  ".join(
                 f"mse@{h}={val_horizon_se[h]/val_horizon_cnt[h]:.4f}"
                 for h in horizons if val_horizon_cnt[h] > 0)
+            cut_str = (f"  val_cut={val_cut_loss:.4f}  mean_ΔLB={val_cut_dlb:.4f}"
+                       if not (val_cut_loss != val_cut_loss) else "")  # not nan
 
             print(
                 f"[Phase3] Epoch {epoch:02d} | "
                 f"TrainLoss={train_loss:.4f} | ValLoss={val_loss:.4f}"
                 + (f"\n  train: {comp_str}" if comp_str else "")
                 + (f"\n  val:   {horizon_str}" if horizon_str else "")
+                + (f"\n  cut:   {cut_str}" if cut_str else "")
             )
 
             if val_loss < best_val_loss:
