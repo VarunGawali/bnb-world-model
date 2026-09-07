@@ -1186,3 +1186,142 @@ class CutTransitionDataset(Dataset):
             "cut_feats":    cut_feats,
             "delta_lb":     delta_lb,
         }
+
+
+# ---------------------------------------------------------------------------
+# Pre-encoded datasets (Phase-3 fast path)
+# ---------------------------------------------------------------------------
+
+class EncodedSequenceDataset(Dataset):
+    """
+    Loads pre-encoded trajectory bundles from data/encoded/<stem>.pt.
+    No model, no GNN, no caching logic — just torch.load and slice.
+
+    Each .pt file contains:
+        z_seq     [T, H]
+        a_seq     [T, H]
+        hv_seq    [T, K, H]
+        bound_seq [T]
+        dir_seq   [T]
+        branch    [T]
+
+    Returns one root→leaf path per __getitem__ (same semantics as
+    SequenceDataset), built from node_ids / parent_ids when present,
+    otherwise the full visitation order.
+    """
+
+    def __init__(self, pt_files, max_path_len=None):
+        self.files = [Path(f) for f in pt_files]
+        self.max_path_len = max_path_len
+        self.index = []  # list of (file_idx, path_slice, weight)
+        for fi, f in enumerate(self.files):
+            try:
+                b = torch.load(f, map_location="cpu", weights_only=False)
+                T = b["z_seq"].size(0)
+                if T < 2:
+                    continue
+                # Use contiguous path slices of length ≤ max_path_len.
+                step = max_path_len or T
+                paths = [list(range(s, min(s + step, T)))
+                         for s in range(0, T, step)]
+                paths = [p for p in paths if len(p) >= 2]
+                w = 1.0 / max(len(paths), 1)
+                for p in paths:
+                    self.index.append((fi, p, w))
+            except Exception:
+                continue
+        self._cache: dict = {}
+        self._cache_size = 32
+
+    def _load(self, fi):
+        if fi in self._cache:
+            b = self._cache.pop(fi)
+            self._cache[fi] = b
+            return b
+        b = torch.load(self.files[fi], map_location="cpu", weights_only=False)
+        if len(self._cache) >= self._cache_size:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[fi] = b
+        return b
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, i):
+        fi, path, w = self.index[i]
+        b = self._load(fi)
+        idx = torch.tensor(path, dtype=torch.long)
+        T = len(path)
+        item = {
+            "z_seq":          b["z_seq"][idx[:-1]],        # [T-1, H]
+            "z_next_seq":     b["z_seq"][idx[1:]],         # [T-1, H]
+            "a_seq":          b["a_seq"][idx[:-1]],        # [T-1, H]
+            "bound_next_seq": b["bound_seq"][idx[1:]],     # [T-1]
+            "dir_seq":        b["dir_seq"][idx[:-1]],      # [T-1]
+            "hv_seq":         b["hv_seq"][idx[:-1]],       # [T-1, K, H]
+            "hv_next_seq":    b["hv_seq"][idx[1:]],        # [T-1, K, H]
+            "instance_weight": torch.tensor(w, dtype=torch.float32),
+        }
+        return item
+
+    @staticmethod
+    def collate(batch):
+        B = len(batch)
+        H = batch[0]["z_seq"].size(-1)
+        K = batch[0]["hv_seq"].size(-2)
+        lengths = [b["z_seq"].size(0) for b in batch]
+        Tmax = max(lengths)
+
+        z_seq   = torch.zeros(B, Tmax, H)
+        z_next  = torch.zeros(B, Tmax, H)
+        a_seq   = torch.zeros(B, Tmax, H)
+        bound   = torch.zeros(B, Tmax)
+        dir_seq = torch.zeros(B, Tmax)
+        hv_seq  = torch.zeros(B, Tmax, K, H)
+        hv_next = torch.zeros(B, Tmax, K, H)
+        tmask   = torch.zeros(B, Tmax, dtype=torch.bool)
+        vmask   = torch.zeros(B, Tmax, K, dtype=torch.bool)
+
+        for i, b in enumerate(batch):
+            L = lengths[i]
+            z_seq[i, :L]   = b["z_seq"]
+            z_next[i, :L]  = b["z_next_seq"]
+            a_seq[i, :L]   = b["a_seq"]
+            bound[i, :L]   = b["bound_next_seq"]
+            dir_seq[i, :L] = b["dir_seq"]
+            hv_seq[i, :L]  = b["hv_seq"]
+            hv_next[i, :L] = b["hv_next_seq"]
+            tmask[i, :L]   = True
+            vmask[i, :L]   = True
+
+        return {
+            "z_seq": z_seq, "z_next_seq": z_next, "a_seq": a_seq,
+            "bound_next_seq": bound, "dir_seq": dir_seq,
+            "hv_seq": hv_seq, "hv_next_seq": hv_next,
+            "time_mask": tmask, "var_mask": vmask,
+        }
+
+
+class EncodedCutDataset(Dataset):
+    """
+    Loads pre-encoded cut-transition bundles from data/encoded_cuts/<stem>.pt.
+    Each .pt file contains z_before [H], z_after [H], cut_feats [6], delta_lb.
+    """
+
+    def __init__(self, pt_files):
+        self.files = [Path(f) for f in pt_files]
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        return torch.load(self.files[i], map_location="cpu", weights_only=False)
+
+    @staticmethod
+    def collate(batch):
+        return {
+            "z_before":  torch.stack([b["z_before"]  for b in batch]),
+            "z_after":   torch.stack([b["z_after"]   for b in batch]),
+            "cut_feats": torch.stack([b["cut_feats"]  for b in batch]),
+            "delta_lb":  torch.stack([b["delta_lb"]   for b in batch]),
+        }

@@ -58,6 +58,8 @@ from bnb_wm.data import (
     transition_collate,
     SequenceDataset,
     make_sequence_collate,
+    EncodedSequenceDataset,
+    EncodedCutDataset,
 )
 from bnb_wm.data.datasets import (
     ShardedBatchSampler,
@@ -109,6 +111,14 @@ def main():
                     help="load cut fields and enable Phase 5")
     ap.add_argument("--max_files", type=int, default=None,
                     help="cap number of trajectory files (fast experiments)")
+    ap.add_argument("--encoded_dir", default=None,
+                    help="path to pre-encoded trajectory .pt files "
+                         "(from scripts/encode_all.py). When set, Phase 3 "
+                         "uses EncodedSequenceDataset — no GNN during training.")
+    ap.add_argument("--encoded_cuts_dir", default=None,
+                    help="path to pre-encoded cut .pt files "
+                         "(from scripts/encode_cuts.py). When set alongside "
+                         "--encoded_dir, Phase 3 cut loss is purely tensor-based.")
     ap.add_argument("--phase3_also_train", default="",
                     help="comma-separated module name-prefixes to unfreeze in Phase 3 "
                          "alongside dynamics/dyn_bound/dyn_reward. "
@@ -318,9 +328,33 @@ def main():
         train_encoder = args.phase3_train_encoder
         enc_lr_scale   = args.encoder_lr_scale
 
-        if train_encoder:
-            # Joint encoder+dynamics: RawSequenceDataset encodes on-the-fly with
-            # the CURRENT encoder every step → no stale latent problem.
+        if args.encoded_dir:
+            # Fast path: load pre-encoded latent tensors — no GNN during training.
+            enc_dir = Path(args.encoded_dir)
+            all_enc = sorted(enc_dir.glob("*.pt"))
+            # Match encoded files to tr/va split by stem.
+            tr_stems = {Path(f).stem for f in tr_files}
+            va_stems = {Path(f).stem for f in va_files}
+            tr_enc = [f for f in all_enc if f.stem in tr_stems]
+            va_enc = [f for f in all_enc if f.stem in va_stems]
+            # Fall back to 80/20 split if stems don't match (different naming).
+            if not tr_enc:
+                split = int(0.8 * len(all_enc))
+                tr_enc, va_enc = all_enc[:split], all_enc[split:]
+            print(f"  [encoded] train={len(tr_enc)}  val={len(va_enc)}  "
+                  f"(from {enc_dir})")
+
+            def sequence_loader(file_list, shuffle):
+                # file_list ignored — we use the pre-encoded files above.
+                is_train = shuffle
+                files_to_use = tr_enc if is_train else va_enc
+                ds = EncodedSequenceDataset(files_to_use)
+                return DataLoader(ds, batch_size=seq_bs, shuffle=shuffle,
+                                  collate_fn=EncodedSequenceDataset.collate,
+                                  num_workers=0)
+
+        elif train_encoder:
+            # Joint encoder+dynamics: RawSequenceDataset encodes on-the-fly.
             print("  [encoder trainable] using RawSequenceDataset (on-the-fly encoding)")
             raw_collate = make_raw_collate()
 
@@ -339,13 +373,30 @@ def main():
                 return DataLoader(ds, batch_size=seq_bs, shuffle=shuffle,
                                   collate_fn=seq_collate, num_workers=0)
 
-        # Optional cut-transition MSE loss.
-        # Split cut files by trajectory stem to avoid train/val contamination:
-        # each *_cut.npz derives from the trajectory file with the same stem,
-        # so we look up {stem}_cut.npz for each tr_file / va_file stem.
+        # Cut-transition loader: prefer pre-encoded tensors when available.
         cut_tr_loader = None
         cut_val_loader = None
-        if args.cut_transitions_dir:
+        if args.encoded_cuts_dir:
+            cuts_dir = Path(args.encoded_cuts_dir)
+            all_cuts = sorted(cuts_dir.glob("*.pt"))
+            split = int(0.8 * len(all_cuts))
+            cut_tr_pt = all_cuts[:split]
+            cut_va_pt = all_cuts[split:]
+            if cut_tr_pt:
+                cut_ds = EncodedCutDataset(cut_tr_pt)
+                cut_tr_loader = DataLoader(cut_ds, batch_size=seq_bs,
+                                           shuffle=True,
+                                           collate_fn=EncodedCutDataset.collate,
+                                           num_workers=0)
+                print(f"  Cut transitions train: {len(cut_tr_pt)} encoded files → loader ready")
+            if cut_va_pt:
+                cut_va_ds = EncodedCutDataset(cut_va_pt)
+                cut_val_loader = DataLoader(cut_va_ds, batch_size=seq_bs,
+                                            shuffle=False,
+                                            collate_fn=EncodedCutDataset.collate,
+                                            num_workers=0)
+                print(f"  Cut transitions val:   {len(cut_va_pt)} encoded files → loader ready")
+        elif args.cut_transitions_dir:
             cut_dir = Path(args.cut_transitions_dir)
 
             def _cut_files_for(traj_list):

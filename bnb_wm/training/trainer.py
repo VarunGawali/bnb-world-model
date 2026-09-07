@@ -872,24 +872,39 @@ class Trainer:
 
         # Fix F: cut transition MSE loss (raw graph → encode on-the-fly →
         # Dynamics(z_before, cut_action_embed(cut_feats), d=0) ≈ z_after).
-        # When also_train_encoder=True, encode WITHOUT no_grad so the cut loss
-        # trains the encoder too (the primary reason we store raw graphs).
-        if d.get("graph_before") is not None:
+        # Cut-transition loss: two paths depending on data format.
+        # Fast path: pre-encoded z_before / z_after tensors (no GNN needed).
+        # Slow path: raw PyG graphs (encode on-the-fly, supports encoder training).
+        if d.get("z_before") is not None:
+            # Pre-encoded tensors from EncodedCutDataset / encode_cuts.py.
+            z_cut_zb = d["z_before"].to(self.device)       # [N, H]
+            z_cut_za = d["z_after"].to(self.device)        # [N, H]
+            cut_phi  = d["cut_feats"].to(self.device)      # [N, 6]
+            a_cut    = self.model.cut_action_embed(cut_phi)
+            d_zeros  = torch.zeros(z_cut_zb.size(0), device=self.device)
+            z_cut_pred, _, _ = self.model.dynamics.step(
+                z_cut_zb, a_cut, d_t=d_zeros)
+            cut_w = getattr(self, "cut_transition_weight", 0.1)
+            L_cut = cut_w * F.mse_loss(z_cut_pred, z_cut_za)
+            comps["cut"] = L_cut.item()
+            loss = loss + L_cut
+        elif d.get("graph_before") is not None:
+            # Raw PyG graphs: encode on-the-fly (slow, supports encoder training).
             gb  = d["graph_before"].to(self.device)
             ga  = d["graph_after"].to(self.device)
-            cut_phi = d["cut_feats"].to(self.device)        # [N, cut_feat_dim]
+            cut_phi = d["cut_feats"].to(self.device)
             also_enc = getattr(self, "_also_train_encoder", False)
             _enc_ctx = torch.enable_grad() if also_enc else torch.no_grad()
             with _enc_ctx:
-                _, z_cut_zb = self.model.encode(gb)        # [N, H]
-                _, z_cut_za = self.model.encode(ga)        # [N, H]
+                _, z_cut_zb = self.model.encode(gb)
+                _, z_cut_za = self.model.encode(ga)
             if not also_enc:
                 z_cut_zb = z_cut_zb.detach()
                 z_cut_za = z_cut_za.detach()
-            a_cut  = self.model.cut_action_embed(cut_phi)  # [N, H]
+            a_cut  = self.model.cut_action_embed(cut_phi)
             d_zeros = torch.zeros(gb.num_graphs, device=self.device)
             z_cut_pred, _, _ = self.model.dynamics.step(
-                z_cut_zb, a_cut, d_t=d_zeros)              # [N, H]
+                z_cut_zb, a_cut, d_t=d_zeros)
             cut_w = getattr(self, "cut_transition_weight", 0.1)
             L_cut = cut_w * F.mse_loss(z_cut_pred, z_cut_za)
             comps["cut"] = L_cut.item()
@@ -1242,14 +1257,19 @@ class Trainer:
                 dlb_sum = 0.0
                 with torch.no_grad():
                     for cbatch in cut_val_loader:
-                        gb  = cbatch["graph_before"].to(self.device)
-                        ga  = cbatch["graph_after"].to(self.device)
                         phi = cbatch["cut_feats"].to(self.device)
                         try:
-                            _, zb = self.model.encode(gb)
-                            _, za = self.model.encode(ga)
+                            if "z_before" in cbatch:
+                                # Pre-encoded fast path.
+                                zb = cbatch["z_before"].to(self.device)
+                                za = cbatch["z_after"].to(self.device)
+                            else:
+                                gb = cbatch["graph_before"].to(self.device)
+                                ga = cbatch["graph_after"].to(self.device)
+                                _, zb = self.model.encode(gb)
+                                _, za = self.model.encode(ga)
                             a_cut = self.model.cut_action_embed(phi)
-                            d_z   = torch.zeros(gb.num_graphs, device=self.device)
+                            d_z   = torch.zeros(zb.size(0), device=self.device)
                             z_pred_cut, _, _ = self.model.dynamics.step(zb, a_cut, d_t=d_z)
                             cut_val_sum += F.mse_loss(z_pred_cut, za).item()
                             cut_val_n   += 1
