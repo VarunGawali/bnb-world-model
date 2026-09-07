@@ -289,7 +289,7 @@ class BipartiteGNN(nn.Module):
 
         h = torch.zeros(x.size(0), self.hidden_dim, device=x.device, dtype=h_v.dtype)
         h[var_mask] = h_v
-        h[con_mask] = h_c
+        h[con_mask] = h_c.to(h.dtype)
 
         # Split edges
         src, dst = edge_index
