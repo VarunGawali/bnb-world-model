@@ -105,6 +105,14 @@ class BnBWorldModel(nn.Module):
         # Reward head (Fix 3): predicts per-step reward from the predicted latent.
         self.dyn_reward = nn.Linear(hidden_dim, 1)
 
+        # Fix F: cut action embedding — projects 6-dim Gomory cut features to H
+        # so cut actions enter the dynamics on the same footing as branch actions.
+        # Zero-init → cut_embed(φ) = 0 at load → Dynamics(z, 0, d=0) ≈ identity.
+        # Branch dynamics weights are completely unaffected (no shape changes).
+        self.cut_feat_dim = cut_feat_dim
+        self.cut_action_embed = nn.Linear(cut_feat_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.cut_action_embed.weight)
+
 
     # ------------------------------------------------------------------
     # Primary forward (Phase 1 training)

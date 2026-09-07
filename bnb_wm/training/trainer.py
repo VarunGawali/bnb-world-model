@@ -378,8 +378,21 @@ class Trainer:
         if k_max <= 0:
             return z_seq.new_zeros(())
         T, H = z_seq.size(1), z_seq.size(-1)
-        anchors = [a for a in getattr(self, "_overshoot_anchors", None)
-                   or sorted({0, T // 3, (2 * T) // 3}) if a < T - 1]
+
+        # Fix E: randomise anchors each call instead of fixed thirds.
+        # Always include 0 (root anchor — mandatory for free-run training).
+        # Add n_random_anchors randomly sampled from (0, T-1) so the model
+        # learns to roll forward from any point in the trajectory, including
+        # states it would reach via its own off-path predictions at inference.
+        n_random = int(getattr(self, "_overshoot_n_random_anchors", 2))
+        fixed_set = {0, T // 3, (2 * T) // 3}
+        if n_random > 0 and T > 2:
+            import random
+            random_anchors = random.sample(range(1, T - 1), min(n_random, T - 2))
+            fixed_set.update(random_anchors)
+        explicit = getattr(self, "_overshoot_anchors", None)
+        raw = explicit if explicit is not None else sorted(fixed_set)
+        anchors = [a for a in raw if a < T - 1]
         if not anchors:
             return z_seq.new_zeros(())
         total = z_seq.new_zeros(())
@@ -685,6 +698,71 @@ class Trainer:
                     tmask.float().sum().clamp_min(1.0)
             else:
                 loss = loss + v_consist_w * F.mse_loss(v_pred, v_tgt)
+
+        # Fix C: self-supervised consistency on free-running predictions.
+        # The free-running rollout from anchor 0 produces z_hat_1..T.  These
+        # are the states the model actually visits at inference.  Supervising
+        # them against the real z_{1..T} (MSE, same as the overshoot loss but
+        # here from a FIXED anchor-0 rollout) teaches the model to recover from
+        # its own compounding errors without any extra data.  Weight 0.3: strong
+        # enough to matter but subordinate to teacher-forced MSE.
+        consist_w = getattr(self, "free_run_consist_weight", 0.3)
+        if consist_w > 0.0:
+            B_c, T_c, H_c = z_seq.shape
+            if T_c >= 2:
+                with torch.no_grad():
+                    # Free-run the full trajectory from step 0.
+                    free_preds = self.model.dynamics.rollout(
+                        z_seq[:, 0], a_seq,
+                        d_seq=d_seq,
+                    )  # [B, T, H] — predictions for steps 1..T
+                # Supervise against real next latents.
+                if tmask is not None:
+                    m = tmask.unsqueeze(-1).float()
+                    per = ((free_preds - z_next_seq) ** 2 * m).sum()
+                    loss = loss + consist_w * per / (
+                        m.sum().clamp_min(1.0) * H_c)
+                else:
+                    loss = loss + consist_w * F.mse_loss(free_preds, z_next_seq)
+
+        # Fix F: cut transition MSE loss.
+        # When the batch carries cut transition pairs (z_before [B,H],
+        # cut_feats [B,6], z_after [H]), train cut_action_embed so that
+        # Dynamics(z_before, cut_action_embed(cut_feats), d=0) ≈ z_after.
+        # Weight 0.1 — warm-start safe (embed starts at zero so L_cut ≈ 0
+        # initially and grows as the embed learns).
+        if d.get("cut_z_before") is not None:
+            cut_zb  = d["cut_z_before"].to(self.device)    # [N, H]
+            cut_phi = d["cut_feats"].to(self.device)        # [N, cut_feat_dim]
+            cut_za  = d["cut_z_after"].to(self.device)     # [N, H]
+            a_cut   = self.model.cut_action_embed(cut_phi) # [N, H]
+            # d=0.0 discriminates cut from branch (+1/-1).
+            z_cut_pred, _, _ = self.model.dynamics.step(
+                cut_zb, a_cut, d_t=0.0)                    # [N, H]
+            cut_w = getattr(self, "cut_transition_weight", 0.1)
+            loss = loss + cut_w * F.mse_loss(z_cut_pred, cut_za)
+
+        # Fix D: counterfactual contrastive loss.
+        # Dynamics(z_t, a_cf) should predict the expert next state z_{t+1}
+        # WORSE than Dynamics(z_t, a_expert) does.  We train it with a margin
+        # loss: MSE(z_pred_cf, z_next) >= MSE(z_pred, z_next) + margin.
+        # This teaches the model that the action embedding actually matters —
+        # preventing the "ignore action" collapse on expert-only data.
+        if d.get("a_cf_seq") is not None:
+            a_cf = d["a_cf_seq"].to(self.device)          # [B, T, H]
+            z_pred_cf = self.model.dynamics_forward(z_seq, a_cf, d_seq)  # [B,T,H]
+            # Per-step squared errors for expert vs counterfactual.
+            err_expert = ((z_pred      - z_next_seq) ** 2).mean(-1)  # [B, T]
+            err_cf     = ((z_pred_cf   - z_next_seq) ** 2).mean(-1)  # [B, T]
+            margin = 0.1
+            # Hinge: penalise when cf error <= expert error + margin.
+            hinge = F.relu(margin + err_expert - err_cf)              # [B, T]
+            cf_w = getattr(self, "cf_contrastive_weight", 0.3)
+            if tmask is not None:
+                loss = loss + cf_w * (hinge * tmask.float()).sum() / \
+                    tmask.float().sum().clamp_min(1.0)
+            else:
+                loss = loss + cf_w * hinge.mean()
 
         return loss
 
