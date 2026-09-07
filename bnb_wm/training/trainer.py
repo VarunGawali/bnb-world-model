@@ -1015,12 +1015,17 @@ class Trainer:
 
         def _build_latent_cache(loader):
             """Encode every batch and return list of latent dicts (no grad)."""
+            torch.cuda.empty_cache()
             cache = []
             self.model.eval()
             with torch.no_grad():
                 for raw in tqdm(loader, desc="  [cache] encoding", leave=False):
                     if "batch_graphs" in raw:
-                        enc = self._online_encode_raw_batch(raw)
+                        try:
+                            enc = self._online_encode_raw_batch(raw)
+                        except torch.cuda.OutOfMemoryError:
+                            torch.cuda.empty_cache()
+                            continue   # skip oversized graphs
                         # Move to CPU to save GPU VRAM between epochs.
                         enc_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v
                                    for k, v in enc.items()}
