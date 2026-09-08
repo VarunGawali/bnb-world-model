@@ -177,7 +177,7 @@ def importance_from_attn(
         importance : [V] numpy array
     """
     frac = np.minimum(x_lp, 1.0 - x_lp)          # ∈ [0, 0.5], max at 0.5
-    return attn.cpu().numpy() * frac
+    return attn.detach().cpu().numpy() * frac
 
 
 def importance_from_policy(
