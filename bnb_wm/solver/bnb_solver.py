@@ -186,7 +186,7 @@ class BnBSolver:
         # Dive heuristic via IntegralityHead (feature 4)
         dive_bonus: float = 0.0,
         # Hierarchical cut gate
-        cut_integrality_thresh: float = 0.7,   # IntegralityHead level-1 gate
+        cut_integrality_thresh: float = 0.95,  # IntegralityHead level-1 gate (raised — model over-predicts integrality on OOD instances)
         cut_min_nfrac: int = 3,                # skip cuts when very few fractional vars
         cut_min_gain: float = 1e-4,            # ΔLP stopping rule: skip if last gain tiny
         cut_subtree_thresh: float = 1.0,       # S(z) gate: skip cuts on tiny subtrees
@@ -1547,31 +1547,28 @@ class BnBSolver:
             tok_best     : [1, T', H]  updated token buffer
             cg_pool      : list of dicts from generate_cg_cuts (for physical commit)
         """
-        from .cg_cuts import (
-            generate_cg_cuts, importance_from_attn, importance_from_policy,
-        )
+        from .gomory import generate_root_gomory_cuts
 
-        # Phase A importance: attention × fractionality
-        attn = self.model.encoder.pool.forward_attn(h_vars, z)
-        importance_a = importance_from_attn(attn, x_lp)
+        # Use Gomory fractional cuts (mathematically guaranteed to be violated
+        # when the LP is fractional).  The previous CG-cut generator from
+        # cg_cuts.py systematically returned empty pools: for binary A with
+        # normalized lambda, floor(lambda^T A) is 0 for all but the intersection
+        # of ALL selected rows, which is rarely violated by the LP.
+        # Gomory cuts are derived from the LP tableau and are always valid + violated.
+        if getattr(self, "_gomory_pool", None) is None:
+            pool_pairs = generate_root_gomory_cuts(
+                A, b, c, self._highs, x_lp=x_lp, max_cuts=50
+            )
+            self._gomory_pool = [
+                {"coeff": np.asarray(lhs, dtype=np.float64), "rhs": float(rhs)}
+                for lhs, rhs in pool_pairs
+            ]
 
-        # Phase B importance: policy × fractionality (use cached logits if available)
-        bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
-        if precomputed_policy_logits is not None:
-            policy_logits = precomputed_policy_logits
-        else:
-            with torch.no_grad():
-                policy_logits = self.model.policy_scores(h_vars, z, bvec)
-        importance_b = importance_from_policy(policy_logits.cpu(), x_lp)
-
-        # Blend: early rounds use structural (attn) signal; later rounds use
-        # uncertainty (policy) signal. With n_cuts=6 both phases contribute.
-        blended = 0.6 * importance_a + 0.4 * importance_b
-
-        cg_pool = generate_cg_cuts(
-            A, b, x_lp, blended, h_vars.cpu(),
-            n_cuts=self.cut_beam * 2,   # generate 2× beam width, pre-filter to beam
-        )
+        # Filter to cuts still violated at this node's LP solution
+        cg_pool = [
+            cut for cut in self._gomory_pool
+            if float(cut["coeff"] @ x_lp) < cut["rhs"] - 1e-6
+        ][:self.cut_beam * 2]
 
         if not cg_pool:
             self._cut_diag["pool_empty"] += 1
