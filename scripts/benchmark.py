@@ -47,7 +47,8 @@ parser.add_argument("--cut_mode",     default="latent",
                     help="cut_mode for BnBSolver (latent|classic|none)")
 parser.add_argument("--cut_beam",     type=int,   default=3)
 parser.add_argument("--cut_rounds",   type=int,   default=2)
-parser.add_argument("--rollout_depth",type=int,   default=3)
+parser.add_argument("--rollout_depth",type=int,   default=3,
+                    dest="lookahead_depth")
 parser.add_argument("--out",          default="results/benchmark.json")
 args = parser.parse_args()
 
@@ -239,7 +240,7 @@ def main():
         cut_mode=args.cut_mode,
         cut_beam=args.cut_beam,
         cut_rounds=args.cut_rounds,
-        rollout_depth=args.rollout_depth,
+        lookahead_depth=args.lookahead_depth,
     )
 
     print(f"\nGenerating {args.n_instances} {args.problem} instances "
