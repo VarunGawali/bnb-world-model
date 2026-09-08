@@ -1586,7 +1586,7 @@ class BnBSolver:
             __slots__ = ("lhs", "rhs")
             def __init__(self, lhs, rhs): self.lhs = lhs; self.rhs = rhs
         cut_objs = [_Cut(cg["coeff"], cg["rhs"]) for cg in cg_pool]
-        cut_feats_np = self._build_cut_features(cut_objs, x_lp, c)
+        cut_feats_np = self._cut_features(cut_objs, x_lp, c)
         cut_feats_t = torch.tensor(cut_feats_np, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             cut_embeds = self.model.cut_action_embed(cut_feats_t)   # [C, H]
