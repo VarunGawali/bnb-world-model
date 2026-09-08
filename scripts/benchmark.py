@@ -50,6 +50,8 @@ parser.add_argument("--cut_rounds",   type=int,   default=2)
 parser.add_argument("--rollout_depth",type=int,   default=3,
                     dest="lookahead_depth")
 parser.add_argument("--out",          default="results/benchmark.json")
+parser.add_argument("--diag_mode",    action="store_true",
+                    help="disable ORS+neural pruning for clean node counts")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -183,6 +185,7 @@ def run_our_solver(A, b, c, solver):
         "primal":    primal,
         "dual_gap":  float(result.optimality_gap),
         "n_cuts":    n_cuts,
+        "cut_diag":  result.cut_diag,
     }
 
 # ---------------------------------------------------------------------------
@@ -213,6 +216,7 @@ def main():
         cut_beam=args.cut_beam,
         cut_rounds=args.cut_rounds,
         lookahead_depth=args.lookahead_depth,
+        diag_mode=args.diag_mode,
     )
 
     print(f"\nGenerating {args.n_instances} {args.problem} instances "
@@ -233,6 +237,19 @@ def main():
               f"{r_ours['nodes']:>7d}  {r_ours['wall_time']:>7.2f}  "
               f"{r_ours['primal']:>10.4f}  {r_ours['dual_gap']:>8.4f}  "
               f"{r_ours['n_cuts']:>5d}")
+        if r_ours.get("cut_diag"):
+            d = r_ours["cut_diag"]
+            print(f"     cut_diag: attempts={d.get('gate_attempts',0)} "
+                  f"pool_empty={d.get('pool_empty',0)} "
+                  f"selected={d.get('cut_selected',0)} "
+                  f"no_sel={d.get('no_cut_selected',0)} "
+                  f"committed={d.get('cut_committed',0)} "
+                  f"rej_integ={d.get('rejected_integrality',0)} "
+                  f"rej_nfrac={d.get('rejected_nfrac',0)} "
+                  f"rej_depth={d.get('rejected_depth',0)} "
+                  f"rej_budget={d.get('rejected_budget',0)} "
+                  f"rej_subtree={d.get('rejected_subtree',0)} "
+                  f"rej_gap={d.get('rejected_gap',0)}")
 
         # --- SCIP+HiGHS ---
         r_scip = run_scip_highs(A, b, c, None, args.time_limit)

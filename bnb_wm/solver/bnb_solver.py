@@ -91,6 +91,7 @@ class SolveResult:
     # Mean near 0 → world model correctly predicts cut effects.
     # Mean near 1+ → dynamics not learning cuts; re-encode and latent diverge.
     cut_latent_errors: list = field(default_factory=list)
+    cut_diag: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -166,9 +167,12 @@ class BnBSolver:
         cut_ctg_thresh_root: float = 10.0,
         cut_entropy_thresh: float = 0.5,        # depth 1+: require more uncertainty
         cut_ctg_thresh: float = 30.0,           # depth 1+: require larger subtree
-        cut_budget_cap: int = 10,
+        cut_budget_cap: int = 200,       # global cut budget per solve (was 10 — too restrictive)
+        cut_budget_per_node: int = 5,    # per-node cut cap (separate from global)
         cut_beam: int = 3,
         cut_rounds: int = 2,
+        # Diagnostic / ablation flags
+        diag_mode: bool = False,         # disable ORS + neural pruning for clean node counts
         # Confidence-gated rollout (feature 5)
         skip_confident: Optional[float] = None,
         adaptive_conf_high: Optional[float] = None,
@@ -236,8 +240,10 @@ class BnBSolver:
         self.cut_entropy_thresh      = cut_entropy_thresh
         self.cut_ctg_thresh          = cut_ctg_thresh
         self.cut_budget_cap          = cut_budget_cap
+        self.cut_budget_per_node     = cut_budget_per_node
         self.cut_beam                = cut_beam
         self.cut_rounds              = cut_rounds
+        self.diag_mode               = diag_mode
         self.skip_confident          = skip_confident
         self.adaptive_conf_high      = adaptive_conf_high
         self.adaptive_conf_mid       = adaptive_conf_mid
@@ -311,6 +317,20 @@ class BnBSolver:
         # instance-specific and must not leak across solve() calls.
         self._gomory_pool = None
         self._cuts_added = 0
+        self._cut_diag = {
+            "gate_attempts": 0,
+            "rejected_integrality": 0,
+            "rejected_nfrac": 0,
+            "rejected_depth": 0,
+            "rejected_budget": 0,
+            "rejected_subtree": 0,
+            "rejected_gap": 0,
+            "rejected_delta_lp": 0,
+            "pool_empty": 0,
+            "no_cut_selected": 0,
+            "cut_selected": 0,
+            "cut_committed": 0,
+        }
         self._cut_latent_errors = []
         self._precompute_static_graph(A, b, c)
 
@@ -379,17 +399,12 @@ class BnBSolver:
             if node.lb >= global_ub - 1e-6:
                 continue
 
-            # ORS pre-LP-solve gate: skip flagged low-significance nodes.
-            # A node is flagged when its push-time significance score (V - 0.5*S)
-            # is below ors_sig_thresh.  At pop time we skip the LP solve unless:
-            #   (a) the incumbent tightened since push (new info → re-evaluate), or
-            #   (b) random exploration fires (ors_p_explore probability, ~5%).
-            # Saves ~LP-solve cost per skipped node — the dominant 89% bottleneck.
-            if node.significance_score < self.ors_sig_thresh:
+            # ORS pre-LP-solve gate (disabled in diag_mode for clean node counts).
+            if not self.diag_mode and node.significance_score < self.ors_sig_thresh:
                 ub_tightened = (node.ub_at_push < float("inf")
                                 and global_ub < node.ub_at_push * (1.0 - self.ors_ub_tol))
                 if not ub_tightened and random.random() > self.ors_p_explore:
-                    continue   # skip: low significance, bound unchanged, no exploration roll
+                    continue
 
             # Solve node LP (warmstart from parent basis)
             lp_obj, x_lp, dual, feasible, node_basis = self._solve_lp(
@@ -434,7 +449,7 @@ class BnBSolver:
             # Gate: near incumbent bound AND GNN predicts large costly subtree
             # AND poor LP quality.  leaf_prob already computed above (free).
             # This saves rollout + cut + child-dynamics cost for pruned nodes.
-            if self.neural_prune and global_ub < 1e29:
+            if self.neural_prune and not self.diag_mode and global_ub < 1e29:
                 with torch.no_grad():
                     cur_heads = self.model.multi_head_pred(
                         z, h_vars, bvec_br, frac_mask=frac_t,
@@ -520,7 +535,7 @@ class BnBSolver:
 
                 cut_indices, cand_scores, z_branch, tok_branch, cg_pool = \
                     self._run_cut_branch_beam(
-                        z, h_vars, x_lp, A, b, node,
+                        z, h_vars, x_lp, A, b, c, node,
                         top_k, valid_mask_v, frac_t, rollout_kw,
                         precomputed_policy_logits=node_policy_logits,
                     )
@@ -763,6 +778,7 @@ class BnBSolver:
             solve_time=time.perf_counter() - t_start,
             optimality_gap=gap,
             cut_latent_errors=list(self._cut_latent_errors),
+            cut_diag=dict(self._cut_diag),
         )
 
     # ------------------------------------------------------------------
@@ -1327,31 +1343,49 @@ class BnBSolver:
 
         Returns True iff cut planning should proceed.
         """
+        self._cut_diag["gate_attempts"] += 1
+
+        # force_root_cuts=True: bypass all learned gates at depth 0.
+        # The model should see what cuts look like and learn to handle them;
+        # suppressing cuts before candidates are generated prevents this.
+        if node.depth == 0 and self.force_root_cuts:
+            if self._cuts_added >= self.cut_budget_cap:
+                self._cut_diag["rejected_budget"] += 1
+                return False
+            return True
+
         # Level 1: near-integral — skip cuts
         if leaf_prob >= self.cut_integrality_thresh:
+            self._cut_diag["rejected_integrality"] += 1
             return False
 
-        # Level 2a: structural guards — all inputs pre-computed by caller, zero cost here
+        # Level 2a: structural guards
         if n_frac < self.cut_min_nfrac:
+            self._cut_diag["rejected_nfrac"] += 1
             return False
         if node.depth > self.cut_depth_max:
+            self._cut_diag["rejected_depth"] += 1
             return False
         if self._cuts_added >= self.cut_budget_cap:
+            self._cut_diag["rejected_budget"] += 1
             return False
 
-        # Level 2b: ΔLP stopping rule — if the last cut barely moved LP, skip
+        # Level 2b: ΔLP stopping rule
         if 0 < node.last_cut_gain < self.cut_min_gain:
+            self._cut_diag["rejected_delta_lp"] += 1
             return False
 
-        # Level 2c: LP gap check (arithmetic only)
+        # Level 2c: LP gap check
         lp_gap = (global_ub - lp_obj) / (abs(global_ub) + 1e-8)
         if lp_gap < self.gap_tolerance:
+            self._cut_diag["rejected_gap"] += 1
             return False
 
-        # Level 2d: subtree size gate — uses caller-provided bvec and frac_t
+        # Level 2d: subtree size gate
         with torch.no_grad():
             s_val = self.model.subtree_size_pred(z, h_vars, bvec, frac_mask=frac_t).item()
         if s_val < self.cut_subtree_thresh:
+            self._cut_diag["rejected_subtree"] += 1
             return False
 
         return True
@@ -1477,6 +1511,7 @@ class BnBSolver:
         x_lp: np.ndarray,
         A: np.ndarray,
         b: np.ndarray,
+        c: np.ndarray,
         node,
         top_k: torch.Tensor,
         valid_mask: torch.Tensor,
@@ -1525,7 +1560,7 @@ class BnBSolver:
         )
 
         if not cg_pool:
-            # No valid violated cuts — fall back to plain branch rollout
+            self._cut_diag["pool_empty"] += 1
             branch_scores = self.model.rollout_top_k_batched(
                 z, h_vars, top_k,
                 past_tokens=node.past_tokens,
@@ -1533,10 +1568,17 @@ class BnBSolver:
             )
             return [], branch_scores, z, node.past_tokens, []
 
-        # Stack cut embeddings: [C, H]
-        cut_embeds = torch.stack(
-            [c["embed"].to(self.device) for c in cg_pool]
-        )
+        # Build cut embeddings via cut_action_embed(cut_feats[6]) — matching Phase-3
+        # training exactly.  The weighted-sum lhs@h_vars embedding (cg_pool embed)
+        # is a different representation from what the dynamics was trained on.
+        class _Cut:
+            __slots__ = ("lhs", "rhs")
+            def __init__(self, lhs, rhs): self.lhs = lhs; self.rhs = rhs
+        cut_objs = [_Cut(cg["coeff"], cg["rhs"]) for cg in cg_pool]
+        cut_feats_np = self._build_cut_features(cut_objs, x_lp, c)
+        cut_feats_t = torch.tensor(cut_feats_np, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            cut_embeds = self.model.cut_action_embed(cut_feats_t)   # [C, H]
 
         with torch.no_grad():
             cut_indices, branch_scores, z_best, tok_best = \
@@ -1551,6 +1593,11 @@ class BnBSolver:
                     precomputed_policy_logits=precomputed_policy_logits,
                     **rollout_kwargs,
                 )
+
+        if cut_indices:
+            self._cut_diag["cut_selected"] += 1
+        else:
+            self._cut_diag["no_cut_selected"] += 1
 
         return cut_indices, branch_scores, z_best, tok_best, cg_pool
 
