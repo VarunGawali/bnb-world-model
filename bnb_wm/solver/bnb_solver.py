@@ -374,6 +374,12 @@ class BnBSolver:
             return SolveResult("optimal", lp_obj, sol, 1,
                                time.perf_counter() - t_start, 0.0)
 
+        # Primal heuristic at root — gives an initial feasible upper bound before
+        # B&B starts.  Without this, on hard instances B&B never finds primal
+        # solutions (LP relaxations stay fractional in finite node budget).
+        global_ub, best_sol = self._primal_heuristic(A, b, c, x_lp, np.inf, None)
+        status = "feasible" if best_sol is not None else "infeasible"
+
         # Initialise tree
         root_node = Node(
             lb=lp_obj, depth=0,
@@ -384,10 +390,8 @@ class BnBSolver:
         )
         heap = [root_node]
 
-        global_ub   = np.inf
-        best_sol    = None
         n_nodes     = 0
-        status      = "infeasible"
+        _heur_every = 200   # re-run heuristic every N nodes on current LP
 
         while heap and n_nodes < self.node_limit:
             if time.perf_counter() - t_start > self.time_limit:
@@ -424,6 +428,15 @@ class BnBSolver:
                     best_sol  = np.round(x_lp)
                     status    = "feasible"
                 continue
+
+            # Periodic primal heuristic: round current LP to get an upper bound.
+            # Fires every _heur_every nodes so warm-start benefits compound.
+            if n_nodes % _heur_every == 0:
+                global_ub, best_sol = self._primal_heuristic(
+                    A, b, c, x_lp, global_ub, best_sol
+                )
+                if best_sol is not None:
+                    status = "feasible"
 
             # Encode node
             h_vars, z, h_cons = self._encode_node(
@@ -1670,3 +1683,58 @@ class BnBSolver:
     @staticmethod
     def _is_integral(x: np.ndarray, tol: float = 1e-4) -> bool:
         return bool(np.all(np.abs(x - np.round(x)) < tol))
+
+    @staticmethod
+    def _primal_heuristic(
+        A: np.ndarray,
+        b: np.ndarray,
+        c: np.ndarray,
+        x_lp: np.ndarray,
+        global_ub: float,
+        best_sol,
+    ):
+        """Greedy LP-rounding heuristic for set-cover-style MIPs (Ax >= b, x in {0,1}).
+
+        Round x_j >= 0.5 → 1, then greedily add the cheapest column that covers
+        any remaining uncovered row until Ax >= b is satisfied.
+        Returns (updated_ub, updated_best_sol).
+        """
+        x_round = (x_lp >= 0.5).astype(np.float64)
+
+        # Check and repair feasibility row by row
+        slack = A @ x_round - b          # >= 0 means row satisfied
+        uncovered = np.where(slack < -1e-8)[0]
+
+        if len(uncovered) > 0:
+            # Greedy repair: for each uncovered row pick the variable not yet 1
+            # that covers the most remaining uncovered rows per unit cost.
+            remaining = set(uncovered.tolist())
+            x_greedy = x_round.copy()
+            n_vars = len(c)
+            while remaining:
+                # Score each variable: #remaining_rows_covered / cost
+                best_j, best_score = -1, -1.0
+                for j in range(n_vars):
+                    if x_greedy[j] >= 0.5:
+                        continue   # already selected
+                    covered = sum(1 for i in remaining if A[i, j] > 0.5)
+                    if covered == 0:
+                        continue
+                    score = covered / (c[j] + 1e-8)
+                    if score > best_score:
+                        best_score, best_j = score, j
+                if best_j == -1:
+                    break   # no variable can cover remaining rows — infeasible
+                x_greedy[best_j] = 1.0
+                slack = A @ x_greedy - b
+                remaining = set(np.where(slack < -1e-8)[0].tolist())
+            x_round = x_greedy
+
+        # Final feasibility check
+        if np.any(A @ x_round - b < -1e-6):
+            return global_ub, best_sol   # repair failed
+
+        obj = float(c @ x_round)
+        if obj < global_ub - 1e-8:
+            return obj, x_round
+        return global_ub, best_sol
