@@ -1371,7 +1371,9 @@ class BnBSolver:
             return True
 
         # Level 1: near-integral — skip cuts
-        if leaf_prob >= self.cut_integrality_thresh:
+        # In diag_mode the integrality_logit is miscalibrated (OOD instances),
+        # so we skip this gate entirely to isolate the cut contribution.
+        if not self.diag_mode and leaf_prob >= self.cut_integrality_thresh:
             self._cut_diag["rejected_integrality"] += 1
             return False
 
