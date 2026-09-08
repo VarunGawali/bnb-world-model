@@ -162,7 +162,7 @@ class BnBSolver:
         use_reward_return: bool = False,
         uncertainty_weight: float = 0.0,
         cut_mode: str = "learned",
-        cut_depth_max: int = 3,
+        cut_depth_max: int = 20,
         force_root_cuts: bool = True,           # always attempt cuts at depth=0
         cut_entropy_thresh_root: float = 0.2,   # depth=0 fallback (only when force_root_cuts=False)
         cut_ctg_thresh_root: float = 10.0,
@@ -571,11 +571,12 @@ class BnBSolver:
                             node.inherited_cuts + chosen_cuts,
                             warm_basis=node_basis,
                         )
-                        if feas2 and lp_obj2 > lp_obj + 1e-8:
-                            cut_gain = lp_obj2 - lp_obj   # ΔLP — propagated to children
+                        if feas2 and lp_obj2 >= lp_obj - 1e-6:  # accept even tiny LP gain; cut still tightens feasible region
+                            cut_gain = max(0.0, lp_obj2 - lp_obj)
                             lp_obj, x_lp, dual, node_basis = lp_obj2, x_lp2, dual2, node_basis2
                             new_cuts = chosen_cuts
                             self._cuts_added += len(new_cuts)
+                            self._cut_diag["cut_committed"] += len(new_cuts)
                             if self._is_integral(x_lp):
                                 if lp_obj < global_ub:
                                     global_ub = lp_obj
