@@ -157,6 +157,7 @@ class BnBSolver:
         size_weight: float = 0.7,
         ctg_weight: float = 0.0,
         branch_factor: int = 1,
+        branch_mode: str = "rollout",      # "rollout" | "policy" | "most_fractional"
         node_selection: str = "bound",
         use_reward_return: bool = False,
         uncertainty_weight: float = 0.0,
@@ -269,7 +270,7 @@ class BnBSolver:
         self._cut_latent_errors: list[float] = []
         # Branching mode for the ablation: "rollout" (latent world-model
         # lookahead), "policy" (argmax policy, no rollout), "most_fractional".
-        self.branch_mode         = "rollout"
+        self.branch_mode         = branch_mode
 
         try:
             import highspy

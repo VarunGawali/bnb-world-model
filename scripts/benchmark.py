@@ -52,6 +52,9 @@ parser.add_argument("--rollout_depth",type=int,   default=3,
 parser.add_argument("--out",          default="results/benchmark.json")
 parser.add_argument("--diag_mode",    action="store_true",
                     help="disable ORS+neural pruning for clean node counts")
+parser.add_argument("--branch_mode",  default="rollout",
+                    choices=["rollout", "policy", "most_fractional"],
+                    help="branching strategy (most_fractional = classical baseline)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -217,6 +220,7 @@ def main():
         cut_rounds=args.cut_rounds,
         lookahead_depth=args.lookahead_depth,
         diag_mode=args.diag_mode,
+        branch_mode=args.branch_mode,
     )
 
     print(f"\nGenerating {args.n_instances} {args.problem} instances "
