@@ -178,20 +178,20 @@ def generate_root_gomory_cuts(
             if violation <= _VIOL_TOL:
                 continue
 
-        # Normalize to inf-norm = 1 for stable deduplication and scoring
+        # Deduplicate on normalized representation (inf-norm = 1) but return
+        # the original un-normalized cut so LP injection has full strength.
         inf_norm = np.max(np.abs(alpha))
         if inf_norm < _COEFF_TOL:
             continue
         alpha_n = alpha / inf_norm
         beta_n  = beta  / inf_norm
 
-        # Deduplicate on normalized representation
         key = (tuple(np.round(alpha_n, 5)), round(beta_n, 5))
         if key in seen:
             continue
         seen.add(key)
 
-        cuts.append((alpha_n, float(beta_n)))
+        cuts.append((alpha, float(beta)))  # un-normalized: full LP strength
         if len(cuts) >= max_cuts:
             break
 

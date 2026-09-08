@@ -577,6 +577,7 @@ class BnBSolver:
                             new_cuts = chosen_cuts
                             self._cuts_added += len(new_cuts)
                             self._cut_diag["cut_committed"] += len(new_cuts)
+                            self._gomory_pool = None  # pool is stale after cut commit; regenerate next call
                             if self._is_integral(x_lp):
                                 if lp_obj < global_ub:
                                     global_ub = lp_obj
