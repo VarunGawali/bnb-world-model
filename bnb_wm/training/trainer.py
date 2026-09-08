@@ -1145,9 +1145,15 @@ class Trainer:
                             cut_iter = iter(cut_loader)
                             cut_batch = next(cut_iter)
                         if isinstance(batch, dict):
-                            batch["graph_before"] = cut_batch["graph_before"]
-                            batch["graph_after"]  = cut_batch["graph_after"]
-                            batch["cut_feats"]    = cut_batch["cut_feats"]
+                            # Support both encoded (.pt) and raw graph formats
+                            if "z_before" in cut_batch:
+                                batch["z_before"]  = cut_batch["z_before"]
+                                batch["z_after"]   = cut_batch["z_after"]
+                                batch["cut_feats"] = cut_batch["cut_feats"]
+                            else:
+                                batch["graph_before"] = cut_batch["graph_before"]
+                                batch["graph_after"]  = cut_batch["graph_after"]
+                                batch["cut_feats"]    = cut_batch["cut_feats"]
 
                     with autocast("cuda", enabled=self.amp):
                         loss, comps = self._dynamics_batch_loss(
