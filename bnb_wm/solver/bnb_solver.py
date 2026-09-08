@@ -577,7 +577,6 @@ class BnBSolver:
                             new_cuts = chosen_cuts
                             self._cuts_added += len(new_cuts)
                             self._cut_diag["cut_committed"] += len(new_cuts)
-                            self._gomory_pool = None  # pool is stale after cut commit; regenerate next call
                             if self._is_integral(x_lp):
                                 if lp_obj < global_ub:
                                     global_ub = lp_obj
@@ -1561,16 +1560,23 @@ class BnBSolver:
         # normalized lambda, floor(lambda^T A) is 0 for all but the intersection
         # of ALL selected rows, which is rarely violated by the LP.
         # Gomory cuts are derived from the LP tableau and are always valid + violated.
-        if getattr(self, "_gomory_pool", None) is None:
-            pool_pairs = generate_root_gomory_cuts(
-                A, b, c, self._highs, x_lp=x_lp, max_cuts=50
-            )
-            self._gomory_pool = [
-                {"coeff": np.asarray(lhs, dtype=np.float64), "rhs": float(rhs)}
-                for lhs, rhs in pool_pairs
-            ]
+        # Generate Gomory cuts from the current node's LP basis (with branching
+        # bounds). Do NOT cache across nodes — cuts derived from the root LP
+        # become satisfied after 1 commit and pool_empty dominates.
+        pool_pairs = generate_root_gomory_cuts(
+            A, b, c, self._highs,
+            x_lp=x_lp,
+            var_lb=node.var_lb,
+            var_ub=node.var_ub,
+            max_cuts=50,
+        )
+        self._gomory_pool = [
+            {"coeff": np.asarray(lhs, dtype=np.float64), "rhs": float(rhs)}
+            for lhs, rhs in pool_pairs
+        ]
 
-        # Filter to cuts still violated at this node's LP solution
+        # Filter to cuts violated at this node's LP solution (should be all of
+        # them since we just generated them with x_lp, but keep as safety check)
         cg_pool = [
             cut for cut in self._gomory_pool
             if float(cut["coeff"] @ x_lp) < cut["rhs"] - 1e-6

@@ -53,22 +53,25 @@ def generate_root_gomory_cuts(
     A, b, c, highspy,
     max_cuts: int = 50,
     x_lp: "np.ndarray | None" = None,
+    var_lb: "np.ndarray | None" = None,
+    var_ub: "np.ndarray | None" = None,
 ):
     """
-    Generate globally valid Gomory fractional cuts at the root.
+    Generate Gomory fractional cuts valid at the current B&B node.
 
     Args:
         A       : [m, n] covering matrix (A x >= b)
-        b       : [m]    right-hand side (integer, typically all-ones for set cover)
+        b       : [m]    right-hand side
         c       : [n]    objective coefficients
         highspy : imported highspy module; returns [] if None
         max_cuts: maximum number of cuts to return
-        x_lp    : [n] current LP optimal solution; used for violation check.
-                  If None, violation check is skipped (weaker — not recommended).
+        x_lp    : [n] current LP solution at this node; used for violation check
+        var_lb  : [n] variable lower bounds from branching (default 0)
+        var_ub  : [n] variable upper bounds from branching (default 1)
 
     Returns:
         list of (lhs [n] float64, rhs float) where  lhs @ x >= rhs  is a
-        globally valid and LP-violated cut.  Empty on any failure.
+        valid cut violated by the current node's LP solution.
     """
     if highspy is None:
         return []
@@ -78,9 +81,15 @@ def generate_root_gomory_cuts(
     c = np.asarray(c, dtype=np.float64).reshape(-1)
     m, n = A.shape
 
+    lb = np.zeros(n) if var_lb is None else np.asarray(var_lb, dtype=np.float64)
+    ub = np.ones(n)  if var_ub is None else np.asarray(var_ub, dtype=np.float64)
+
     # ---- build the standard-form equality system  E z = d,  z >= 0 ----------
     # columns: [ x (n) | s (m) | t (n) ]  -> N = 2n + m
     # rows:    [ cover (m) | ubound (n) ] -> M = m + n
+    # Branching bounds are passed directly to the LP solver as variable bounds
+    # (lb[j], ub[j]); the GMI derivation still holds because t_j = ub_j - x_j
+    # and the substitution is valid for any fixed ub_j.
     N = 2 * n + m
     M = m + n
     E = np.zeros((M, N), dtype=np.float64)
@@ -90,16 +99,16 @@ def generate_root_gomory_cuts(
     E[:m, :n]    = A
     E[:m, n:n+m] = -np.eye(m)
     d[:m]        = b
-    # ubound rows: x + t = 1
+    # ubound rows: x + t = ub_j  (root: ub=1; after branching ub may be 0 or 1)
     E[m:, :n]    = np.eye(n)
     E[m:, n+m:]  = np.eye(n)
-    d[m:]        = 1.0
+    d[m:]        = ub   # node-local upper bounds
 
     cost = np.concatenate([c, np.zeros(m), np.zeros(n)])
 
     # ---- solve the standard-form LP with highspy, read the basis ------------
     try:
-        basic_cols, z_sf = _solve_standard_form(highspy, E, d, cost, N, M)
+        basic_cols, z_sf = _solve_standard_form(highspy, E, d, cost, N, M, lb, ub)
     except Exception:
         return []
     if basic_cols is None:
@@ -198,19 +207,30 @@ def generate_root_gomory_cuts(
     return cuts
 
 
-def _solve_standard_form(highspy, E, d, cost, N, M):
+def _solve_standard_form(highspy, E, d, cost, N, M, var_lb=None, var_ub=None):
     """
-    Solve  min cost^T z  s.t.  E z = d,  z >= 0  with highspy.
+    Solve  min cost^T z  s.t.  E z = d,  lb <= x <= ub, slack/surplus >= 0
+    with highspy. var_lb/var_ub apply only to the first n x-columns.
     Returns (basic_column_indices, z_values) or (None, None) on failure.
     """
     inf = highspy.kHighsInf
+    n_x = len(var_lb) if var_lb is not None else 0
+
+    col_lo = [0.0] * N
+    col_hi = [inf] * N
+    if var_lb is not None:
+        for j in range(n_x):
+            col_lo[j] = float(var_lb[j])
+    if var_ub is not None:
+        for j in range(n_x):
+            col_hi[j] = float(var_ub[j])
 
     lp = highspy.HighsLp()
     lp.num_col_   = N
     lp.num_row_   = M
     lp.col_cost_  = cost.astype(np.float64).tolist()
-    lp.col_lower_ = [0.0] * N
-    lp.col_upper_ = [inf] * N
+    lp.col_lower_ = col_lo
+    lp.col_upper_ = col_hi
     lp.row_lower_ = d.astype(np.float64).tolist()
     lp.row_upper_ = d.astype(np.float64).tolist()
 
