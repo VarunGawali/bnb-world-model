@@ -174,6 +174,7 @@ class BnBSolver:
         cut_rounds: int = 2,
         # Diagnostic / ablation flags
         diag_mode: bool = False,         # disable ORS + neural pruning for clean node counts
+        cut_selection: str = "model",    # "model" = beam search; "max_violation" = pick most violated cut (bypass value_head)
         # Confidence-gated rollout (feature 5)
         skip_confident: Optional[float] = None,
         adaptive_conf_high: Optional[float] = None,
@@ -245,6 +246,7 @@ class BnBSolver:
         self.cut_beam                = cut_beam
         self.cut_rounds              = cut_rounds
         self.diag_mode               = diag_mode
+        self.cut_selection           = cut_selection
         self.skip_confident          = skip_confident
         self.adaptive_conf_high      = adaptive_conf_high
         self.adaptive_conf_mid       = adaptive_conf_mid
@@ -1578,6 +1580,20 @@ class BnBSolver:
                 **rollout_kwargs,
             )
             return [], branch_scores, z, node.past_tokens, []
+
+        # --- max_violation mode: bypass value_head entirely -------------------
+        # Used when the learned value_head is miscalibrated (OOD instances).
+        # Selects the most-violated Gomory cut deterministically; no beam search.
+        if self.cut_selection == "max_violation":
+            violations = [float(cut["rhs"] - cut["coeff"] @ x_lp) for cut in cg_pool]
+            best_idx = int(np.argmax(violations))
+            self._cut_diag["cut_selected"] += 1
+            # Branch scores from a quick policy-only pass (no rollout overhead)
+            with torch.no_grad():
+                bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
+                branch_scores = self.model.policy_scores(h_vars, z, bvec)
+                branch_scores = branch_scores[top_k]
+            return [best_idx], branch_scores, z, node.past_tokens, cg_pool
 
         # Build cut embeddings via cut_action_embed(cut_feats[6]) — matching Phase-3
         # training exactly.  The weighted-sum lhs@h_vars embedding (cg_pool embed)
