@@ -91,45 +91,17 @@ def _generate_set_cover_scipy(rng, n_rows, n_cols, density):
     return A, b, c
 
 
-def _ecole_to_lp(instance):
-    """Convert an Ecole instance to (A, b, c) standard form for BnBSolver."""
-    m = instance.as_pyscipopt()
-    vars_ = m.getVars()
-    cons_ = m.getConss()
-    n_vars = len(vars_)
-    n_cons = len(cons_)
-    var_idx = {v.name: i for i, v in enumerate(vars_)}
-    A = np.zeros((n_cons, n_vars), dtype=np.float64)
-    b = np.zeros(n_cons, dtype=np.float64)
-    for j, con in enumerate(cons_):
-        row = m.getValsLinear(con)
-        lhs = m.getLhs(con)
-        rhs = m.getRhs(con)
-        for vname, coeff in row.items():
-            A[j, var_idx[vname]] = coeff
-        b[j] = rhs if rhs < 1e29 else lhs
-    c = np.array([m.getObjective().getCoefficients().get(v.name, 0.0)
-                  for v in vars_])
-    return A, b, c
-
-
 def generate_instances(n, rng, args):
+    """Generate instances as (A, b, c, scip_model_or_None).
+
+    We always build (A, b, c) with the scipy generator so both solvers share
+    the exact same problem data.  For SCIP we build a pyscipopt Model directly
+    from (A, b, c) at solve time, so ecole is not required for correctness.
+    """
     instances = []
-    if _ECOLE_OK and args.problem == "set_cover":
-        gen = ecole.instance.SetCoverGenerator(
-            n_rows=args.n_rows, n_cols=args.n_cols, density=args.density,
-        )
-        for _ in range(n):
-            inst = next(gen)
-            try:
-                A, b, c = _ecole_to_lp(inst)
-                instances.append((A, b, c, inst))
-            except Exception as e:
-                print(f"  [WARN] ecole→LP conversion failed: {e}")
-    else:
-        for _ in range(n):
-            A, b, c = _generate_set_cover_scipy(rng, args.n_rows, args.n_cols, args.density)
-            instances.append((A, b, c, None))
+    for _ in range(n):
+        A, b, c = _generate_set_cover_scipy(rng, args.n_rows, args.n_cols, args.density)
+        instances.append((A, b, c))
     return instances
 
 # ---------------------------------------------------------------------------
@@ -253,7 +225,7 @@ def main():
     print(header)
     print("-" * len(header))
 
-    for i, (A, b, c, ecole_inst) in enumerate(instances):
+    for i, (A, b, c) in enumerate(instances):
         # --- Our solver ---
         r_ours = run_our_solver(A, b, c, solver)
         results["ours"].append(r_ours)
@@ -263,7 +235,7 @@ def main():
               f"{r_ours['n_cuts']:>5d}")
 
         # --- SCIP+HiGHS ---
-        r_scip = run_scip_highs(A, b, c, ecole_inst, args.time_limit)
+        r_scip = run_scip_highs(A, b, c, None, args.time_limit)
         if r_scip is not None:
             results["scip_highs"].append(r_scip)
             print(f"{i+1:>3}  {'SCIP+HiGHS':<12}  {r_scip['status']:<9}  "
