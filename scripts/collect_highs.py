@@ -133,16 +133,18 @@ class _HiGHSLP:
         h.setOptionValue("presolve", "off")
 
         inf = highspy.kHighsInf
-        for j in range(self.n):
-            h.addVar(float(self.var_lb[j]), float(self.var_ub[j]))
-        h.changeColsCostsByRange(0, self.n - 1, self.c.tolist())
+        lb = np.asarray(self.var_lb, dtype=np.float64)
+        ub = np.asarray(self.var_ub, dtype=np.float64)
+        h.addVars(self.n, lb, ub)
+        col_idx = np.arange(self.n, dtype=np.int32)
+        h.changeColsCost(self.n, col_idx, np.asarray(self.c, dtype=np.float64))
         for i in range(self.m):
             idx = np.where(np.abs(self.A[i]) > 1e-12)[0]
             if len(idx) == 0:
                 continue
             h.addRow(float(self.b[i]), inf,
-                     len(idx), idx.tolist(),
-                     self.A[i, idx].tolist())
+                     len(idx), idx.astype(np.int32),
+                     self.A[i, idx].astype(np.float64))
         h.run()
         # HighsModelStatus.kOptimal is the correct enum member for getModelStatus().
         # kSolutionStatusOptimal does not exist; using it would always mismatch.
@@ -159,19 +161,17 @@ class _HiGHSLP:
             "obj":  h.getInfoValue("objective_function_value")[1],
         }
         basis = h.getBasis()
-        kBasic = highspy.kBasisStatusBasic
-        self._sol["basis"] = np.array(
-            [1 if list(basis.col_status)[j] == kBasic else 0
-             for j in range(self.n)], dtype=np.int8)
-        # basis_at_lb / at_ub (for feature encoding)
-        kLower = highspy.kBasisStatusLower
-        kUpper = highspy.kBasisStatusUpper
+        kBasic = highspy.HighsBasisStatus.kBasic
+        kLower = highspy.HighsBasisStatus.kLower
+        kUpper = highspy.HighsBasisStatus.kUpper
         col_status = list(basis.col_status)
+        self._sol["basis"] = np.array(
+            [1 if col_status[j] == kBasic else 0 for j in range(self.n)], dtype=np.int8)
         self._sol["at_lb"] = np.array(
             [1 if col_status[j] == kLower else 0 for j in range(self.n)], dtype=np.int8)
         self._sol["at_ub"] = np.array(
             [1 if col_status[j] == kUpper else 0 for j in range(self.n)], dtype=np.int8)
-        # encode basis_status: lower=0, basic=1, upper=2, superbasic=3
+        # encode basis_status: lower=0, basic=1, upper=2
         self._sol["basis_status"] = np.array(
             [1 if col_status[j] == kBasic else
              (2 if col_status[j] == kUpper else 0)
