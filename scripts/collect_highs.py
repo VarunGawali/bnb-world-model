@@ -50,14 +50,24 @@ Constraint feature layout (5 dims) — mirrors Ecole NodeBipartite:
 
 Usage
 -----
+    # Easy tier (curriculum warmup, fast SB):
     python scripts/collect_highs.py \\
-        --n_instances 500 \\
-        --n_rows 200 --n_cols 400 --density 0.05 \\
-        --max_steps 300 --seed 42 \\
-        --out_dir data/highs_trajectories/train
+        --n_instances 200 --n_rows 100 --n_cols 200 --max_steps 150 \\
+        --out_dir data/highs_trajectories/easy --seed 0
 
-    # Smaller smoke-test run:
-    python scripts/collect_highs.py --n_instances 5 --max_steps 50 --debug
+    # Medium tier (primary training distribution):
+    python scripts/collect_highs.py \\
+        --n_instances 400 --n_rows 500 --n_cols 1000 --max_steps 300 \\
+        --out_dir data/highs_trajectories/medium --seed 1000
+
+    # Hard tier (generalisation target):
+    python scripts/collect_highs.py \\
+        --n_instances 200 --n_rows 1000 --n_cols 2000 --max_steps 500 \\
+        --out_dir data/highs_trajectories/hard --seed 2000
+
+    # Smoke-test:
+    python scripts/collect_highs.py --n_instances 3 --n_rows 100 --n_cols 200 \\
+        --max_steps 50 --debug
 """
 
 from __future__ import annotations
@@ -134,7 +144,9 @@ class _HiGHSLP:
                      len(idx), idx.tolist(),
                      self.A[i, idx].tolist())
         h.run()
-        if h.getModelStatus() != highspy.kSolutionStatusOptimal:
+        # HighsModelStatus.kOptimal is the correct enum member for getModelStatus().
+        # kSolutionStatusOptimal does not exist; using it would always mismatch.
+        if h.getModelStatus() != highspy.HighsModelStatus.kOptimal:
             self.h = h
             return False
         self.h = h
@@ -276,21 +288,6 @@ def _bipartite_edges(A):
 
 
 # ── strong branching ──────────────────────────────────────────────────────────
-
-def _strong_branching_scores(lp: _HiGHSLP, action_set: np.ndarray) -> np.ndarray:
-    """
-    Full strong branching: for each candidate j, solve both child LPs,
-    return max(up_gain, down_gain) as the SB score (product-score variant
-    can be used too, but max is simpler and matches SCIP's default for binary).
-    """
-    scores = np.zeros(len(action_set), dtype=np.float64)
-    lp_obj = lp.obj
-    for k, j in enumerate(action_set):
-        gain_up   = max(0.0, lp._tighten_and_solve_cached(j, +1) - lp_obj)
-        gain_down = max(0.0, lp._tighten_and_solve_cached(j, -1) - lp_obj)
-        scores[k] = max(gain_up, gain_down)
-    return scores.astype(np.float32)
-
 
 def _strong_branching_scores_cached(lp: _HiGHSLP, action_set: np.ndarray,
                                     cache: dict) -> np.ndarray:
@@ -504,6 +501,23 @@ def _record_trajectory(A, b, c, args, rng):
         [0.0 if int(nid) in child_of else 1.0 for nid in node_ids],
         dtype=np.float32)
 
+    # subtree_size: number of recorded descendants (inclusive of self) for each
+    # node, computed bottom-up over the recorded tree.
+    # Required by SubtreeSizeHead training and solver's size_weight scoring.
+    nid_to_idx = {int(nid): t for t, nid in enumerate(node_ids.tolist())}
+    children: dict[int, list[int]] = {int(nid): [] for nid in node_ids.tolist()}
+    for t, (nid, pid) in enumerate(zip(node_ids.tolist(), parent_ids.tolist())):
+        if int(pid) in children:
+            children[int(pid)].append(int(nid))
+    subtree_size_arr = np.ones(n, dtype=np.float32)
+    # Process nodes in reverse-recorded order (children tend to appear after
+    # parents in best-bound order, so reverse is a reasonable bottom-up pass).
+    for t in range(n - 1, -1, -1):
+        nid = int(node_ids[t])
+        pid = int(parent_ids[t])
+        if pid in nid_to_idx:
+            subtree_size_arr[nid_to_idx[pid]] += subtree_size_arr[t]
+
     # norm_dual_bounds: per-traj fallback (real anchors stored separately)
     ptp = float(np.ptp(db))
     norm_db = ((db - db.min()) / (ptp + 1e-8)).astype(np.float32)
@@ -558,6 +572,7 @@ def _record_trajectory(A, b, c, args, rng):
         "primal_bound":         np.asarray(primal, dtype=np.float32),
         "optimal_valid":        np.asarray(optimal_valid),
         "next_is_leaf":         next_is_leaf,
+        "subtree_size":         subtree_size_arr,
         "depths":               np.asarray(buf["depths"], dtype=np.int32),
         "node_ids":             node_ids.astype(np.int64),
         "parent_ids":           parent_ids.astype(np.int64),
@@ -647,6 +662,8 @@ def main():
             print(f"  depths:     {traj['depths'][:5]}")
             frac_nonzero = (traj['var_features'][0][:, 14] > 0.05).sum()
             print(f"  fractional vars at root: {frac_nonzero}/{args.n_cols}")
+            print(f"  subtree_size[:5]:  {traj['subtree_size'][:5]}")
+            print(f"  next_is_leaf[:5]:  {traj['next_is_leaf'][:5]}")
             print()
 
     total = time.perf_counter() - t0_global

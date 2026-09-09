@@ -128,14 +128,16 @@ def _split_files(files: list[Path], train_frac: float, val_frac: float, seed: in
     return files[:n_train], files[n_train:n_train + n_val], files[n_train + n_val:]
 
 
-def _transition_loaders(data_dir: Path, cfg: dict, seed: int):
-    """Build TransitionDataset train/val loaders from .npz files."""
-    files = sorted(data_dir.glob("**/*.npz"))
-    # Exclude cut-transition files (suffix _cut.npz)
+def _transition_loaders(data_dirs: list[Path], cfg: dict, seed: int):
+    """Build TransitionDataset train/val loaders from .npz files in one or more dirs."""
+    files = []
+    for d in data_dirs:
+        files.extend(sorted(d.glob("**/*.npz")))
     files = [f for f in files if not f.name.endswith("_cut.npz")]
     if not files:
-        raise FileNotFoundError(f"No .npz trajectory files found in {data_dir}")
-    print(f"Found {len(files)} trajectory files for TransitionDataset")
+        raise FileNotFoundError(f"No .npz trajectory files found in {data_dirs}")
+    print(f"Found {len(files)} trajectory files for TransitionDataset "
+          f"(from {len(data_dirs)} dir(s))")
 
     dc   = cfg["data"]
     tc   = cfg["training"]
@@ -159,13 +161,15 @@ def _transition_loaders(data_dir: Path, cfg: dict, seed: int):
     return tr_loader, va_loader
 
 
-def _sequence_loaders(data_dir: Path, cfg: dict, seed: int,
+def _sequence_loaders(data_dirs: list[Path], cfg: dict, seed: int,
                       raw: bool = False):
     """Build Sequence(Raw)Dataset train/val loaders."""
-    files = sorted(data_dir.glob("**/*.npz"))
+    files = []
+    for d in data_dirs:
+        files.extend(sorted(d.glob("**/*.npz")))
     files = [f for f in files if not f.name.endswith("_cut.npz")]
     if not files:
-        raise FileNotFoundError(f"No .npz trajectory files found in {data_dir}")
+        raise FileNotFoundError(f"No .npz trajectory files found in {data_dirs}")
 
     dc = cfg["data"]
     tc = cfg["training"]
@@ -224,15 +228,15 @@ def run(args, cfg, device):
     trainer = Trainer(model, device, ckpt_dir, amp=tc["amp"])
     seed    = 42
 
-    phases  = set(args.phase) if args.phase else {1, 2, 3, 4}
-    data_dir = Path(args.data_dir)
+    phases   = set(args.phase) if args.phase else {1, 2, 3, 4}
+    data_dirs = [Path(d) for d in args.data_dir]
 
     # ── Phase 1: Policy ───────────────────────────────────────────────────────
     if 1 in phases:
         print("\n" + "=" * 60)
         print("PHASE 1 — Policy imitation (HiGHS strong branching labels)")
         print("=" * 60)
-        tr_l, va_l = _transition_loaders(data_dir, cfg, seed)
+        tr_l, va_l = _transition_loaders(data_dirs, cfg, seed)
         trainer.train_policy(
             tr_l, va_l,
             epochs=tc["epochs_phase1"],
@@ -251,7 +255,7 @@ def run(args, cfg, device):
         if p1_ckpt.exists() and 1 in phases:
             load_weights_only(model, p1_ckpt, device=device, strict=False)
             print(f"  Loaded {p1_ckpt}")
-        tr_l, va_l = _transition_loaders(data_dir, cfg, seed)
+        tr_l, va_l = _transition_loaders(data_dirs, cfg, seed)
         trainer.train_value(
             tr_l, va_l,
             epochs=tc["epochs_phase2"],
@@ -272,7 +276,7 @@ def run(args, cfg, device):
             print(f"  Loaded {p2_ckpt}")
 
         raw = args.phase3_train_encoder
-        tr_l, va_l = _sequence_loaders(data_dir, cfg, seed, raw=raw)
+        tr_l, va_l = _sequence_loaders(data_dirs, cfg, seed, raw=raw)
         cut_l = _cut_loader(
             Path(args.cut_transitions_dir) if args.cut_transitions_dir else None,
             cfg,
@@ -302,7 +306,7 @@ def run(args, cfg, device):
         if p3_ckpt.exists() and 3 in phases:
             load_weights_only(model, p3_ckpt, device=device, strict=False)
             print(f"  Loaded {p3_ckpt}")
-        tr_l, va_l = _transition_loaders(data_dir, cfg, seed)
+        tr_l, va_l = _transition_loaders(data_dirs, cfg, seed)
         trainer.train_joint(
             tr_l, va_l,
             epochs=tc["epochs_phase4"],
@@ -320,8 +324,10 @@ def run(args, cfg, device):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data_dir", required=True,
-                        help="Root directory of HiGHS trajectory .npz files")
+    parser.add_argument("--data_dir", required=True, nargs="+",
+                        help="One or more directories of HiGHS trajectory .npz files "
+                             "(e.g. --data_dir data/highs_trajectories/easy "
+                             "data/highs_trajectories/medium data/highs_trajectories/hard)")
     parser.add_argument("--ckpt_dir", default="checkpoints/highs_retrain",
                         help="Where to save checkpoints")
     parser.add_argument("--warm_start", default=None,
