@@ -894,13 +894,16 @@ class Trainer:
             ga  = d["graph_after"].to(self.device)
             cut_phi = d["cut_feats"].to(self.device)
             also_enc = getattr(self, "_also_train_encoder", False)
+            # z_before: grad flows when training encoder (prediction side).
+            # z_after: always frozen — it is the target, not a prediction.
+            # Encoding both with grad doubles GNN activation memory → OOM.
             _enc_ctx = torch.enable_grad() if also_enc else torch.no_grad()
             with _enc_ctx:
                 _, z_cut_zb = self.model.encode(gb)
-                _, z_cut_za = self.model.encode(ga)
             if not also_enc:
                 z_cut_zb = z_cut_zb.detach()
-                z_cut_za = z_cut_za.detach()
+            with torch.no_grad():
+                _, z_cut_za = self.model.encode(ga)
             a_cut  = self.model.cut_action_embed(cut_phi)
             d_zeros = torch.zeros(gb.num_graphs, device=self.device)
             z_cut_pred, _, _ = self.model.dynamics.step(

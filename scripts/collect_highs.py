@@ -586,6 +586,85 @@ def _record_trajectory(A, b, c, args, rng):
     }
 
 
+# ── cut transition helper ─────────────────────────────────────────────────────
+
+def _maybe_save_cut_transition(traj_path: Path, A, b, c, traj):
+    """
+    Inject the best root Gomory cut, re-solve the augmented LP, and save a
+    *_cut.npz alongside the trajectory file.
+
+    Schema matches CutTransitionDataset expectations:
+        vf_before  [n_vars, 19]   variable features before cut
+        cf_before  [n_cons, 5]    constraint features before cut
+        ei_before  [2, E_b]       bipartite edge indices before cut
+        ev_before  [E_b]          bipartite edge values before cut
+        vf_after   [n_vars, 19]   variable features after cut (augmented LP)
+        cf_after   [n_cons+1, 5]  constraint features after cut (one extra row)
+        ei_after   [2, E_a]       bipartite edge indices after cut
+        ev_after   [E_a]          bipartite edge values after cut
+        cut_feats  [6]            6-dim Gomory cut feature vector
+        delta_lb   scalar         LP-bound improvement from the cut
+        lp_obj_before  scalar
+        lp_obj_after   scalar
+    """
+    cut_lhs_arr = traj.get("cut_lhs")
+    cut_rhs_arr = traj.get("cut_rhs")
+    cut_feats_arr = traj.get("cut_features")
+    if (cut_lhs_arr is None or len(cut_lhs_arr) == 0
+            or cut_lhs_arr[0] is None or len(cut_lhs_arr[0]) == 0):
+        return  # no Gomory cuts at root → skip
+
+    # Pick the cut with the highest violation (index 0 of cut_feats = violation)
+    root_lhs   = cut_lhs_arr[0].astype(np.float64)   # [K, n_vars]
+    root_rhs   = cut_rhs_arr[0].astype(np.float64)   # [K]
+    root_phi   = cut_feats_arr[0].astype(np.float32) # [K, 6]
+    best_k     = int(np.argmax(root_phi[:, 0]))       # highest violation
+
+    lhs_best = root_lhs[best_k]   # [n_vars]
+    rhs_best = float(root_rhs[best_k])
+    phi_best = root_phi[best_k]   # [6]
+
+    # Features BEFORE the cut (root node — already in traj)
+    n_rows_per_var = (A != 0).sum(axis=0).astype(np.float32)
+    root_lp = _HiGHSLP(A, b, c)
+    if not root_lp.solve():
+        return
+    lp_obj_before = float(root_lp.obj)
+    vf_b = _var_features(A, b, c, root_lp._sol, n_rows_per_var)
+    cf_b = _con_features(A, b, c, root_lp._sol)
+    ei_b, ev_b = _bipartite_edges(A)
+
+    # Augment LP with the cut row:  lhs_best @ x >= rhs_best
+    A_aug = np.vstack([A, lhs_best[np.newaxis, :]])
+    b_aug = np.append(b, rhs_best)
+
+    aug_lp = _HiGHSLP(A_aug, b_aug, c)
+    if not aug_lp.solve():
+        return  # cut makes LP infeasible → skip (shouldn't happen for valid Gomory)
+    lp_obj_after = float(aug_lp.obj)
+
+    vf_a = _var_features(A_aug, b_aug, c, aug_lp._sol, n_rows_per_var)
+    cf_a = _con_features(A_aug, b_aug, c, aug_lp._sol)
+    ei_a, ev_a = _bipartite_edges(A_aug)
+
+    cut_path = traj_path.with_name(traj_path.stem + "_cut.npz")
+    np.savez_compressed(
+        cut_path,
+        vf_before=vf_b.astype(np.float32),
+        cf_before=cf_b.astype(np.float32),
+        ei_before=ei_b.astype(np.int64),
+        ev_before=ev_b.astype(np.float32),
+        vf_after=vf_a.astype(np.float32),
+        cf_after=cf_a.astype(np.float32),
+        ei_after=ei_a.astype(np.int64),
+        ev_after=ev_a.astype(np.float32),
+        cut_feats=phi_best,
+        delta_lb=np.float32(lp_obj_after - lp_obj_before),
+        lp_obj_before=np.float32(lp_obj_before),
+        lp_obj_after=np.float32(lp_obj_after),
+    )
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -637,6 +716,10 @@ def main():
         n_cuts = int(traj["n_cuts"][0])
         manifest.append({"file": str(out_path), "n_steps": n,
                           "root_cuts": n_cuts})
+
+        # Cut transition: inject best root Gomory cut, re-solve, save *_cut.npz.
+        # Stores raw features so CutTransitionDataset can encode on-the-fly.
+        _maybe_save_cut_transition(out_path, A, b, c, traj)
 
         if args.debug or i == 0 or (i + 1) % 50 == 0 or i + 1 == n_inst:
             print(f"  [{i+1}/{n_inst}] steps={n} root_cuts={n_cuts} "
