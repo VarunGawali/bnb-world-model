@@ -162,7 +162,7 @@ class BnBSolver:
         use_reward_return: bool = False,
         uncertainty_weight: float = 0.0,
         cut_mode: str = "learned",
-        cut_depth_max: int = 20,
+        cut_depth_max: int = 0,   # root cuts only; per-node Gomory is too expensive (~8s/node)
         force_root_cuts: bool = True,           # always attempt cuts at depth=0
         cut_entropy_thresh_root: float = 0.2,   # depth=0 fallback (only when force_root_cuts=False)
         cut_ctg_thresh_root: float = 10.0,
@@ -1560,27 +1560,24 @@ class BnBSolver:
         # normalized lambda, floor(lambda^T A) is 0 for all but the intersection
         # of ALL selected rows, which is rarely violated by the LP.
         # Gomory cuts are derived from the LP tableau and are always valid + violated.
-        # Generate Gomory cuts from the current node's LP basis (with branching
-        # bounds). Do NOT cache across nodes — cuts derived from the root LP
-        # become satisfied after 1 commit and pool_empty dominates.
-        pool_pairs = generate_root_gomory_cuts(
-            A, b, c, self._highs,
-            x_lp=x_lp,
-            var_lb=node.var_lb,
-            var_ub=node.var_ub,
-            max_cuts=50,
-        )
-        self._gomory_pool = [
-            {"coeff": np.asarray(lhs, dtype=np.float64), "rhs": float(rhs)}
-            for lhs, rhs in pool_pairs
-        ]
+        # Root-only Gomory pool: generate once at depth=0 (cheap — one internal LP
+        # solve), cache for the whole solve. All cuts are globally valid so
+        # descendants inherit them via inherited_cuts. Per-node regeneration costs
+        # ~8s/node (internal LP solve) which destroys node throughput.
+        if getattr(self, "_gomory_pool", None) is None:
+            pool_pairs = generate_root_gomory_cuts(
+                A, b, c, self._highs, x_lp=x_lp, max_cuts=50,
+            )
+            self._gomory_pool = [
+                {"coeff": np.asarray(lhs, dtype=np.float64), "rhs": float(rhs)}
+                for lhs, rhs in pool_pairs
+            ]
 
-        # Filter to cuts violated at this node's LP solution (should be all of
-        # them since we just generated them with x_lp, but keep as safety check)
+        # Filter to cuts still violated at this node's LP solution
         cg_pool = [
             cut for cut in self._gomory_pool
             if float(cut["coeff"] @ x_lp) < cut["rhs"] - 1e-6
-        ][:self.cut_beam * 2]
+        ]
 
         if not cg_pool:
             self._cut_diag["pool_empty"] += 1
@@ -1595,15 +1592,16 @@ class BnBSolver:
         # Used when the learned value_head is miscalibrated (OOD instances).
         # Selects the most-violated Gomory cut deterministically; no beam search.
         if self.cut_selection == "max_violation":
-            violations = [float(cut["rhs"] - cut["coeff"] @ x_lp) for cut in cg_pool]
-            best_idx = int(np.argmax(violations))
-            self._cut_diag["cut_selected"] += 1
-            # Branch scores from a quick policy-only pass (no rollout overhead)
+            # Commit ALL violated cuts in one batch (root cut round).
+            # Remaining cuts become satisfied after the LP re-solves, so
+            # committing one-at-a-time wastes node budget with no extra benefit.
+            all_indices = list(range(len(cg_pool)))
+            self._cut_diag["cut_selected"] += len(all_indices)
             with torch.no_grad():
                 bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
                 branch_scores = self.model.policy_scores(h_vars, z, bvec)
                 branch_scores = branch_scores[top_k]
-            return [best_idx], branch_scores, z, node.past_tokens, cg_pool
+            return all_indices, branch_scores, z, node.past_tokens, cg_pool
 
         # Build cut embeddings via cut_action_embed(cut_feats[6]) — matching Phase-3
         # training exactly.  The weighted-sum lhs@h_vars embedding (cg_pool embed)
