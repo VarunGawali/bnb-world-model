@@ -305,6 +305,42 @@ def _strong_branching_scores_cached(lp: _HiGHSLP, action_set: np.ndarray,
     return scores.astype(np.float32)
 
 
+# ── candidate subsampling ─────────────────────────────────────────────────────
+
+def _subsample_candidates(aset: np.ndarray, lp: _HiGHSLP,
+                           max_cands: int) -> np.ndarray:
+    """
+    Reduce the SB candidate set to at most `max_cands` variables.
+
+    Priority: keep all highly-fractional candidates (sol_frac > 0.3) first,
+    then fill remaining slots by highest absolute reduced cost (good proxy for
+    SB gain without any LP re-solves). This preserves label quality while
+    cutting SB time from O(|aset|) to O(max_cands) LP re-solves.
+
+    When max_cands <= 0 or len(aset) <= max_cands, returns aset unchanged.
+    """
+    if max_cands <= 0 or len(aset) <= max_cands:
+        return aset
+    x  = lp._sol["x"][aset]
+    rc = np.abs(lp._sol["rc"][aset])
+    frac = np.abs(x - np.round(np.clip(x, 0.0, 1.0)))
+
+    # Tier 1: highly fractional (near 0.5) — always include
+    tier1 = np.where(frac > 0.3)[0]
+    if len(tier1) >= max_cands:
+        # Among tier1, take those closest to 0.5
+        order = np.argsort(-frac[tier1])
+        return aset[tier1[order[:max_cands]]]
+
+    # Tier 2: fill remaining slots by |rc| descending
+    tier2_mask = frac <= 0.3
+    tier2 = np.where(tier2_mask)[0]
+    order2 = np.argsort(-rc[tier2])
+    n_fill = max_cands - len(tier1)
+    selected = np.concatenate([tier1, tier2[order2[:n_fill]]])
+    return aset[np.sort(selected)]
+
+
 # ── cut features (identical to collect_with_cuts_v2) ─────────────────────────
 
 def _cut_features(lhs, rhs, x_lp, obj, n_vars):
@@ -391,8 +427,14 @@ def _record_trajectory(A, b, c, args, rng):
     if len(action_set_root) == 0:
         return None  # root LP already integer
 
-    # SB at root
+    # SB at root — subsample candidates if action set is large.
+    # On medium/hard instances (500×1000, 1000×2000) the full SB candidate set
+    # can be 200-500 variables; each costs 2 LP re-solves → minutes per node.
+    # We keep the highest-reduced-cost candidates (good proxy for SB gain) and
+    # always include all candidates with sol_frac > 0.3 so the label is sound.
     sb_cache = {}
+    action_set_root = _subsample_candidates(
+        action_set_root, root_lp, args.sb_max_cands)
     sb_root = _strong_branching_scores_cached(root_lp, action_set_root, sb_cache)
     best_local_root = int(np.argmax(sb_root))
     chosen_root = int(action_set_root[best_local_root])
@@ -472,7 +514,8 @@ def _record_trajectory(A, b, c, args, rng):
                 best_int = obj_val
             continue  # leaf: do not record (no branching decision)
 
-        # SB scores for this node (no cache: different LP state each node)
+        # SB scores for this node — subsample candidates for large instances.
+        aset = _subsample_candidates(aset, lp, args.sb_max_cands)
         sb_scores = _strong_branching_scores_cached(lp, aset, {})
         best_local = int(np.argmax(sb_scores))
         chosen = int(aset[best_local])
@@ -679,6 +722,9 @@ def main():
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("--out_dir",        type=Path,  default=Path("data/highs_trajectories/train"))
     p.add_argument("--max_cut_evals",  type=int,   default=50)
+    p.add_argument("--sb_max_cands",   type=int,   default=0,
+                   help="Cap SB candidates per node (0 = no cap). "
+                        "Use 20-30 for medium/hard to keep time < 30s/instance.")
     p.add_argument("--overwrite",      action="store_true")
     p.add_argument("--debug",          action="store_true",
                    help="collect 3 instances and print schema summary")
