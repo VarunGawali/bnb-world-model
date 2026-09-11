@@ -152,9 +152,9 @@ def _transition_loaders(data_dirs: list[Path], cfg: dict, seed: int):
         return Batch.from_data_list(graphs), list(metas)
 
     tr_loader = DataLoader(tr_ds, batch_size=bs, shuffle=True,
-                           collate_fn=_collate, num_workers=2, pin_memory=True)
+                           collate_fn=_collate, num_workers=8, pin_memory=True)
     va_loader = DataLoader(va_ds, batch_size=bs, shuffle=False,
-                           collate_fn=_collate, num_workers=2, pin_memory=True)
+                           collate_fn=_collate, num_workers=8, pin_memory=True)
     return tr_loader, va_loader
 
 
@@ -192,9 +192,9 @@ def _sequence_loaders(data_dirs: list[Path], cfg: dict, seed: int,
         return default_collate(batch)
 
     tr_loader = DataLoader(tr_ds, batch_size=bs, shuffle=True,
-                           collate_fn=_collate_seq, num_workers=2)
+                           collate_fn=_collate_seq, num_workers=8)
     va_loader = DataLoader(va_ds, batch_size=bs, shuffle=False,
-                           collate_fn=_collate_seq, num_workers=2)
+                           collate_fn=_collate_seq, num_workers=8)
     return tr_loader, va_loader
 
 
