@@ -111,11 +111,8 @@ def _warm_start(model: BnBWorldModel, ckpt_path: Path, device: torch.device):
 
     _reset(model.dynamics)
     _reset(model.value)
-    if hasattr(model, "integrality_logit"):
-        torch.nn.init.zeros_(model.integrality_logit)
-    if hasattr(model, "integrality_head"):
-        _reset(model.integrality_head)
-    print("[warm_start] dynamics + value_head + integrality reset to random")
+    _reset(model.integrality)
+    print("[warm_start] dynamics + value + integrality reset to random")
 
 
 def _split_files(files: list[Path], train_frac: float, val_frac: float, seed: int):
