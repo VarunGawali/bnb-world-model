@@ -110,7 +110,7 @@ def _warm_start(model: BnBWorldModel, ckpt_path: Path, device: torch.device):
                 torch.nn.init.zeros_(p)
 
     _reset(model.dynamics)
-    _reset(model.value_pred)
+    _reset(model.value)
     if hasattr(model, "integrality_logit"):
         torch.nn.init.zeros_(model.integrality_logit)
     if hasattr(model, "integrality_head"):
