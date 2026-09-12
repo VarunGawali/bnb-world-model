@@ -247,9 +247,9 @@ def run(args, cfg, device):
         print("\n" + "=" * 60)
         print("PHASE 2 — Value head (encoder frozen)")
         print("=" * 60)
-        # Load best phase1 if it exists and we trained it this run.
+        # Load best phase1 if it exists (from this run or a previous one).
         p1_ckpt = ckpt_dir / "phase1_best.pt"
-        if p1_ckpt.exists() and 1 in phases:
+        if p1_ckpt.exists():
             load_weights_only(model, p1_ckpt, device=device, strict=False)
             print(f"  Loaded {p1_ckpt}")
         tr_l, va_l = _transition_loaders(data_dirs, cfg, seed)
@@ -268,7 +268,7 @@ def run(args, cfg, device):
         print(f"PHASE 3 — Dynamics Transformer ({mode})")
         print("=" * 60)
         p2_ckpt = ckpt_dir / "phase2_best.pt"
-        if p2_ckpt.exists() and 2 in phases:
+        if p2_ckpt.exists():
             load_weights_only(model, p2_ckpt, device=device, strict=False)
             print(f"  Loaded {p2_ckpt}")
 
@@ -300,7 +300,7 @@ def run(args, cfg, device):
         print("PHASE 4 — Joint fine-tune (all parameters)")
         print("=" * 60)
         p3_ckpt = ckpt_dir / "phase3_best.pt"
-        if p3_ckpt.exists() and 3 in phases:
+        if p3_ckpt.exists():
             load_weights_only(model, p3_ckpt, device=device, strict=False)
             print(f"  Loaded {p3_ckpt}")
         tr_l, va_l = _transition_loaders(data_dirs, cfg, seed)
