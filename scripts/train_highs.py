@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Sampler
 
 # ── project root on path ──────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +42,43 @@ from bnb_wm.data.datasets import (
 )
 from bnb_wm.training.trainer import Trainer
 from bnb_wm.training.checkpoint import load_weights_only
+
+
+# ── sharded sampler ───────────────────────────────────────────────────────────
+
+class ShardedSampler(Sampler):
+    """
+    Shuffles trajectory files, then yields all item indices from each file
+    consecutively. This keeps TransitionDataset's single-file LRU cache at
+    ~100% hit rate instead of ~0% under random shuffling across thousands of
+    files. One file is decompressed once per epoch instead of once per item.
+    """
+    def __init__(self, dataset, seed: int = 0):
+        self.dataset = dataset
+        self.seed    = seed
+        self._epoch  = 0
+
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        # Group item indices by file index
+        from collections import defaultdict
+        file_to_items: dict[int, list[int]] = defaultdict(list)
+        for item_idx, (fi, _) in enumerate(self.dataset.index):
+            file_to_items[fi].append(item_idx)
+        file_order = list(file_to_items.keys())
+        rng.shuffle(file_order)
+        indices = []
+        for fi in file_order:
+            items = file_to_items[fi]
+            rng.shuffle(items)
+            indices.extend(items)
+        return iter(indices)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -151,7 +188,8 @@ def _transition_loaders(data_dirs: list[Path], cfg: dict, seed: int):
         graphs, metas = zip(*batch)
         return Batch.from_data_list(graphs), list(metas)
 
-    tr_loader = DataLoader(tr_ds, batch_size=bs, shuffle=True,
+    tr_sampler = ShardedSampler(tr_ds, seed=seed)
+    tr_loader = DataLoader(tr_ds, batch_size=bs, sampler=tr_sampler,
                            collate_fn=_collate, num_workers=8, pin_memory=True)
     va_loader = DataLoader(va_ds, batch_size=bs, shuffle=False,
                            collate_fn=_collate, num_workers=8, pin_memory=True)
