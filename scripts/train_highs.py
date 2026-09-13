@@ -245,7 +245,8 @@ def _cut_loader(cut_dir: Path, cfg: dict):
     print(f"Found {len(files)} cut-transition files")
     ds = CutTransitionDataset(files)
     bs = max(4, cfg["training"]["batch_size"] // 4)
-    return DataLoader(ds, batch_size=bs, shuffle=True, num_workers=1)
+    return DataLoader(ds, batch_size=bs, shuffle=True, num_workers=1,
+                      collate_fn=CutTransitionDataset.collate)
 
 
 # ── main phases ───────────────────────────────────────────────────────────────
