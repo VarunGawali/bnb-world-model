@@ -39,6 +39,7 @@ from bnb_wm.data.datasets import (
     SequenceDataset,
     RawSequenceDataset,
     CutTransitionDataset,
+    make_raw_collate,
 )
 from bnb_wm.training.trainer import Trainer
 from bnb_wm.training.checkpoint import load_weights_only
@@ -215,24 +216,27 @@ def _sequence_loaders(data_dirs: list[Path], cfg: dict, seed: int,
     va_ds = DS(va_f)
     bs    = max(4, tc["batch_size"] // 4)  # sequences are longer; shrink batch
 
-    def _collate_seq(batch):
-        from torch.utils.data.dataloader import default_collate
-        if isinstance(batch[0], dict):
-            keys = batch[0].keys()
-            out = {}
-            for k in keys:
-                vals = [b[k] for b in batch]
-                try:
-                    out[k] = torch.stack(vals) if isinstance(vals[0], torch.Tensor) else vals
-                except Exception:
-                    out[k] = vals
-            return out
-        return default_collate(batch)
+    if raw:
+        collate_fn = make_raw_collate()
+    else:
+        def collate_fn(batch):
+            from torch.utils.data.dataloader import default_collate
+            if isinstance(batch[0], dict):
+                keys = batch[0].keys()
+                out = {}
+                for k in keys:
+                    vals = [b[k] for b in batch]
+                    try:
+                        out[k] = torch.stack(vals) if isinstance(vals[0], torch.Tensor) else vals
+                    except Exception:
+                        out[k] = vals
+                return out
+            return default_collate(batch)
 
     tr_loader = DataLoader(tr_ds, batch_size=bs, shuffle=True,
-                           collate_fn=_collate_seq, num_workers=8)
+                           collate_fn=collate_fn, num_workers=8)
     va_loader = DataLoader(va_ds, batch_size=bs, shuffle=False,
-                           collate_fn=_collate_seq, num_workers=8)
+                           collate_fn=collate_fn, num_workers=8)
     return tr_loader, va_loader
 
 
