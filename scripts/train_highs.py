@@ -334,6 +334,7 @@ def run(args, cfg, device):
             v_consist_weight=tc.get("v_consist_weight", 0.1),
             also_train_encoder=raw,
             encoder_lr_scale=tc.get("encoder_lr_scale", 0.1),
+            encode_cache_refresh_every=tc.get("encode_cache_refresh_every", 5),
         )
         print("[Phase 3] Done. Best checkpoint: phase3_best.pt")
 
