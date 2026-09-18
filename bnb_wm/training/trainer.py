@@ -482,6 +482,56 @@ class Trainer:
             print(f"  saved -> {save_path}")
         return out
 
+    def _online_encode_raw_batch(self, d: dict) -> dict | None:
+        """Encode a raw-graph batch from RawSequenceDataset into z_seq/a_seq form.
+
+        Called when _dynamics_batch_loss receives batch_graphs instead of z_seq.
+        Gradients flow through the encoder so joint GNN+dynamics training works.
+        Returns None on OOM (caller should skip this batch).
+        """
+        try:
+            gb    = d["batch_graphs"].to(self.device)
+            sizes = d["batch_sizes"]          # [B] steps per path
+            bvars = d["branch_vars"].to(self.device)
+
+            h_vars_all, z_all = self.model.encode(gb)  # gradients flow through GNN
+
+            B    = len(sizes)
+            H    = z_all.size(-1)
+            Tmax = int(sizes.max().item())
+
+            z_seq_batch      = torch.zeros(B, Tmax, H, device=self.device)
+            z_next_seq_batch = torch.zeros(B, Tmax, H, device=self.device)
+            a_seq_batch      = torch.zeros(B, Tmax, dtype=torch.long, device=self.device)
+
+            offset = 0
+            for b_i, T_i in enumerate(sizes.tolist()):
+                T_i = int(T_i)
+                z_i = z_all[offset:offset + T_i]
+                z_seq_batch[b_i, :T_i]           = z_i
+                z_next_seq_batch[b_i, :T_i - 1]  = z_i[1:]
+                offset += T_i
+                bv_start = int(sizes[:b_i].sum()) if b_i > 0 else 0
+                a_seq_batch[b_i, :T_i] = bvars[bv_start:bv_start + T_i]
+
+            out = {
+                "z_seq":      z_seq_batch,
+                "z_next_seq": z_next_seq_batch,
+                "a_seq":      a_seq_batch,
+            }
+            for k in ("dir_seq", "bound_seq", "time_mask"):
+                if k in d:
+                    out[k] = d[k].to(self.device)
+            if "bound_seq" in out:
+                out["bound_next_seq"] = out.pop("bound_seq")
+            return out
+
+        except Exception as exc:
+            if _is_oom(exc):
+                _recover_oom()
+                return None
+            raise
+
     def _dynamics_batch_loss(self, batch):
         """
         Compute the Phase-3 dynamics loss for one batch.
@@ -515,6 +565,14 @@ class Trainer:
                  "var_mask"),
                 batch,
             ))
+
+        # Online encoding path: batch_graphs present means the loader yielded raw
+        # PyG graphs (RawSequenceDataset / --phase3_train_encoder). Encode the
+        # full path graph with the live encoder (gradients flow through GNN).
+        if "batch_graphs" in d and "z_seq" not in d:
+            d = self._online_encode_raw_batch(d)
+            if d is None:
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         z_seq      = d["z_seq"].to(self.device)
         a_seq      = d["a_seq"].to(self.device)
@@ -661,25 +719,37 @@ class Trainer:
                 leave=False,
             ):
                 optimizer.zero_grad(set_to_none=True)
-                with autocast("cuda", enabled=self.amp):
-                    loss = self._dynamics_batch_loss(batch)
+                try:
+                    with autocast("cuda", enabled=self.amp):
+                        loss = self._dynamics_batch_loss(batch)
 
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
 
-                total_loss += loss.item()
-                n += 1
+                    total_loss += loss.item()
+                    n += 1
+                except Exception as exc:
+                    if _is_oom(exc):
+                        _recover_oom(optimizer)
+                        continue
+                    raise
 
             # Validation
             self.model.eval()
             val_loss_sum = val_n = 0
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc="Dyn Val", leave=False):
-                    val_loss_sum += self._dynamics_batch_loss(batch).item()
-                    val_n += 1
+                    try:
+                        val_loss_sum += self._dynamics_batch_loss(batch).item()
+                        val_n += 1
+                    except Exception as exc:
+                        if _is_oom(exc):
+                            _recover_oom()
+                            continue
+                        raise
 
             train_loss = total_loss / n if n else float("inf")
             val_loss   = val_loss_sum / val_n if val_n > 0 else float("inf")
