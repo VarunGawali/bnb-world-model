@@ -15,7 +15,11 @@ from .datasets import (
     TransitionDataset,
     transition_collate,
     SequenceDataset,
+    EncodedSequenceDataset,
+    CutTransitionDataset,
     make_sequence_collate,
+    RawSequenceDataset,
+    make_raw_collate,
 )
 
 # P0.10: `pyg_collate` is the historical name still referenced by
@@ -37,5 +41,9 @@ __all__ = [
     "transition_collate",
     "pyg_collate",
     "SequenceDataset",
+    "EncodedSequenceDataset",
+    "CutTransitionDataset",
     "make_sequence_collate",
+    "RawSequenceDataset",
+    "make_raw_collate",
 ]

@@ -909,6 +909,53 @@ def make_sequence_collate(include_vars=True):
     return _collate
 
 
+# Alias: EncodedSequenceDataset is the historical name for SequenceDataset.
+EncodedSequenceDataset = SequenceDataset
+
+
+# ---------------------------------------------------------------------------
+# CutTransitionDataset — cut-selection transitions (*_cut.npz files)
+# ---------------------------------------------------------------------------
+
+class CutTransitionDataset(Dataset):
+    """Minimal stub for cut-selection transitions. Skipped when no cut files exist."""
+
+    def __init__(self, files):
+        self.files = list(files)
+        self.index = []
+        for fi, f in enumerate(self.files):
+            try:
+                with np.load(f, allow_pickle=True) as d:
+                    T = int(d["n_steps"])
+                    self.index.extend([(fi, t) for t in range(T)])
+            except Exception:
+                continue
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        fi, t = self.index[idx]
+        f = self.files[fi]
+        with np.load(f, allow_pickle=True) as d:
+            vf = d["var_features"][t]
+            cf = d["con_features"][t]
+            ei = d["edge_indices"][t]
+            ev = d["edge_values"][t]
+            cut_feats = d["cut_features"][t] if "cut_features" in d else np.zeros((0, 6), np.float32)
+            cut_labels = d["cut_labels"][t] if "cut_labels" in d else np.zeros(0, np.float32)
+        graph = build_pyg_data(vf, cf, ei, ev)
+        return graph, {
+            "cut_feats":  torch.from_numpy(np.asarray(cut_feats,  dtype=np.float32)),
+            "cut_labels": torch.from_numpy(np.asarray(cut_labels, dtype=np.float32)),
+        }
+
+    @staticmethod
+    def collate(batch):
+        graphs, metas = zip(*batch)
+        return Batch.from_data_list(graphs), list(metas)
+
+
 # ---------------------------------------------------------------------------
 # RawSequenceDataset — raw PyG graphs for joint encoder+dynamics training
 # ---------------------------------------------------------------------------
