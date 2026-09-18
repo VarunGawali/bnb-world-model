@@ -907,3 +907,129 @@ def make_sequence_collate(include_vars=True):
         return out
 
     return _collate
+
+
+# ---------------------------------------------------------------------------
+# RawSequenceDataset — raw PyG graphs for joint encoder+dynamics training
+# ---------------------------------------------------------------------------
+
+class RawSequenceDataset(Dataset):
+    """
+    Like SequenceDataset but returns raw (unencoded) PyG graphs so the GNN
+    encoder runs during training with gradients (joint encoder+dynamics).
+
+    Each item is a dict for one root->leaf path:
+        graphs        list[Data]   one PyG graph per path step
+        branch_vars   [T] long     chosen branching variable index (local, 0-based)
+        dir_seq       [T] float    branch direction +1/-1/0
+        bound_seq     [T] float    normalised dual bounds
+        path_len      int          T (number of steps)
+        instance_weight float      1.0 (placeholder; future: per-difficulty weight)
+    """
+
+    def __init__(self, files, max_path_len=32, allow_visitation_fallback=False):
+        self.files = list(files)
+        self.max_path_len = max_path_len
+        self.allow_visitation_fallback = allow_visitation_fallback
+
+        self.index = []   # (file_idx, path)
+        for fi, f in enumerate(self.files):
+            try:
+                with np.load(f, allow_pickle=True) as d:
+                    T = int(d["n_steps"])
+                    if "node_ids" in d and "parent_ids" in d:
+                        paths = _root_to_leaf_paths(
+                            np.asarray(d["node_ids"]),
+                            np.asarray(d["parent_ids"]),
+                            self.max_path_len)
+                    elif self.allow_visitation_fallback:
+                        paths = [list(range(T))] if T >= 2 else []
+                    else:
+                        continue  # skip files without path info
+                    for p in paths:
+                        self.index.append((fi, p))
+            except Exception:
+                continue
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        fi, path = self.index[idx]
+        f = self.files[fi]
+        with np.load(f, allow_pickle=True) as d:
+            vf_all = d["var_features"]
+            cf_all = d["con_features"]
+            ei_all = d["edge_indices"]
+            ev_all = d["edge_values"]
+            bv_all = np.asarray(d["branching_vars"], dtype=np.int64)
+            ndb_all = np.asarray(d["norm_dual_bounds"], dtype=np.float32) \
+                if "norm_dual_bounds" in d else np.zeros(len(path), np.float32)
+            bdir_all = np.asarray(d["branch_dirs"], dtype=np.float32) \
+                if "branch_dirs" in d else np.zeros(len(path), np.float32)
+
+        graphs = []
+        branch_vars = []
+        bound_seq = []
+        dir_seq = []
+
+        for t in path:
+            g = build_pyg_data(vf_all[t], cf_all[t], ei_all[t], ev_all[t])
+            graphs.append(g)
+            n_vars = int(vf_all[t].shape[0])
+            bv = int(bv_all[t])
+            bv = bv if 0 <= bv < n_vars else 0
+            branch_vars.append(bv)
+            bound_seq.append(float(ndb_all[t]) if t < len(ndb_all) else 0.0)
+            dir_seq.append(float(bdir_all[t]) if t < len(bdir_all) else 0.0)
+
+        return {
+            "graphs":       graphs,
+            "branch_vars":  torch.tensor(branch_vars, dtype=torch.long),
+            "bound_seq":    torch.tensor(bound_seq,   dtype=torch.float32),
+            "dir_seq":      torch.tensor(dir_seq,     dtype=torch.float32),
+            "path_len":     len(path),
+            "instance_weight": 1.0,
+        }
+
+
+def make_raw_collate():
+    """
+    Collate for RawSequenceDataset. Batches all graphs from all paths into one
+    big PyG Batch, records per-path step counts (batch_sizes) so the trainer
+    can split h_vars / z back into per-path sequences after encoding.
+    """
+    def _collate(batch):
+        all_graphs = []
+        batch_sizes = []   # number of steps (graphs) per path in this batch
+        branch_vars = []   # flat list of per-step branching var indices
+        dir_seqs    = []   # [B, Tmax] — padded below
+        bound_seqs  = []
+        iw          = []
+        Tmax = max(b["path_len"] for b in batch)
+
+        dir_pad   = torch.zeros(len(batch), Tmax)
+        bound_pad = torch.zeros(len(batch), Tmax)
+        tmask     = torch.zeros(len(batch), Tmax, dtype=torch.bool)
+
+        for i, b in enumerate(batch):
+            T = b["path_len"]
+            all_graphs.extend(b["graphs"])
+            batch_sizes.append(T)
+            branch_vars.append(b["branch_vars"])
+            dir_pad[i,   :T] = b["dir_seq"]
+            bound_pad[i, :T] = b["bound_seq"]
+            tmask[i,     :T] = True
+            iw.append(b["instance_weight"])
+
+        return {
+            "batch_graphs": Batch.from_data_list(all_graphs),
+            "batch_sizes":  torch.tensor(batch_sizes, dtype=torch.long),
+            "branch_vars":  torch.cat(branch_vars, dim=0),   # flat [sum(T)]
+            "dir_seq":      dir_pad,
+            "bound_seq":    bound_pad,
+            "time_mask":    tmask,
+            "instance_weight": torch.tensor(iw, dtype=torch.float32),
+        }
+
+    return _collate

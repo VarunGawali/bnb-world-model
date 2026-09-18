@@ -491,10 +491,17 @@ class Trainer:
         """
         try:
             gb    = d["batch_graphs"].to(self.device)
-            sizes = d["batch_sizes"]          # [B] steps per path
-            bvars = d["branch_vars"].to(self.device)
+            sizes = d["batch_sizes"]          # [B] steps per path (flat over B paths)
+            bvars = d["branch_vars"]          # [sum(T)] local var indices, flat
 
             h_vars_all, z_all = self.model.encode(gb)  # gradients flow through GNN
+            # h_vars_all: [total_vars_across_all_steps, H]
+            # gb.batch gives graph index for each node; we need var nodes only.
+            var_mask  = gb.node_type == 0
+            var_batch = gb.batch[var_mask].cpu()  # graph index per var node
+            # n_vars per graph step (graphs are indexed 0..sum(T)-1)
+            n_graphs  = int(sizes.sum().item())
+            n_vars_per_step = torch.bincount(var_batch, minlength=n_graphs)  # [sum(T)]
 
             B    = len(sizes)
             H    = z_all.size(-1)
@@ -502,28 +509,40 @@ class Trainer:
 
             z_seq_batch      = torch.zeros(B, Tmax, H, device=self.device)
             z_next_seq_batch = torch.zeros(B, Tmax, H, device=self.device)
-            a_seq_batch      = torch.zeros(B, Tmax, dtype=torch.long, device=self.device)
+            a_seq_batch      = torch.zeros(B, Tmax, H, device=self.device)
 
-            offset = 0
+            # Offsets into flat z_all and h_vars_all per path and per step.
+            step_offset = 0    # index into z_all (one entry per graph/step)
+            var_offset  = 0    # index into h_vars_all (one entry per var node)
+            flat_bvars  = bvars  # [sum(T)] local indices
+
             for b_i, T_i in enumerate(sizes.tolist()):
                 T_i = int(T_i)
-                z_i = z_all[offset:offset + T_i]
-                z_seq_batch[b_i, :T_i]           = z_i
-                z_next_seq_batch[b_i, :T_i - 1]  = z_i[1:]
-                offset += T_i
-                bv_start = int(sizes[:b_i].sum()) if b_i > 0 else 0
-                a_seq_batch[b_i, :T_i] = bvars[bv_start:bv_start + T_i]
+                z_i = z_all[step_offset:step_offset + T_i]          # [T_i, H]
+                z_seq_batch[b_i, :T_i]          = z_i
+                z_next_seq_batch[b_i, :T_i - 1] = z_i[1:]
+
+                # Build a_seq for this path: look up each step's branching var.
+                for s in range(T_i):
+                    nv = int(n_vars_per_step[step_offset + s].item())
+                    bv = int(flat_bvars[step_offset + s].item())
+                    bv = bv if 0 <= bv < nv else 0
+                    hv = h_vars_all[var_offset:var_offset + nv]  # [nv, H]
+                    a_seq_batch[b_i, s] = hv[bv]
+                    var_offset += nv
+
+                step_offset += T_i
 
             out = {
                 "z_seq":      z_seq_batch,
                 "z_next_seq": z_next_seq_batch,
                 "a_seq":      a_seq_batch,
             }
-            for k in ("dir_seq", "bound_seq", "time_mask"):
+            for k in ("dir_seq", "time_mask"):
                 if k in d:
                     out[k] = d[k].to(self.device)
-            if "bound_seq" in out:
-                out["bound_next_seq"] = out.pop("bound_seq")
+            if "bound_seq" in d:
+                out["bound_next_seq"] = d["bound_seq"].to(self.device)
             return out
 
         except Exception as exc:
