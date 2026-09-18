@@ -538,9 +538,12 @@ class Trainer:
                 "z_next_seq": z_next_seq_batch,
                 "a_seq":      a_seq_batch,
             }
-            for k in ("dir_seq", "time_mask"):
-                if k in d:
-                    out[k] = d[k].to(self.device)
+            # dir_seq must be [B, T, 1] for dynamics._tokens cat; unsqueeze here.
+            if "dir_seq" in d:
+                ds = d["dir_seq"].to(self.device)
+                out["dir_seq"] = ds.unsqueeze(-1) if ds.dim() == 2 else ds
+            if "time_mask" in d:
+                out["time_mask"] = d["time_mask"].to(self.device)
             if "bound_seq" in d:
                 out["bound_next_seq"] = d["bound_seq"].to(self.device)
             return out
