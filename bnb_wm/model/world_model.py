@@ -45,12 +45,14 @@ class BnBWorldModel(nn.Module):
         cut_feat_dim: int = 6,
         dyn_residual: bool = True,
         dyn_heteroscedastic: bool = False,
+        gnn_use_checkpoint: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
 
         self.encoder = BipartiteGNN(
             hidden_dim=hidden_dim, n_layers=n_gnn_layers, n_heads=n_gnn_heads,
+            use_checkpoint=gnn_use_checkpoint,
         )
         self.policy = PolicyHead(hidden_dim)
         self.value = ValueHead(hidden_dim)

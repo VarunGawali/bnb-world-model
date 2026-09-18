@@ -145,7 +145,8 @@ def _apply_overrides(cfg: dict, overrides: list[str]):
         d[parts[-1]] = val
 
 
-def _build_model(cfg: dict, device: torch.device) -> BnBWorldModel:
+def _build_model(cfg: dict, device: torch.device,
+                 gnn_use_checkpoint: bool = False) -> BnBWorldModel:
     mc = cfg["model"]
     return BnBWorldModel(
         hidden_dim=mc["hidden_dim"],
@@ -156,6 +157,7 @@ def _build_model(cfg: dict, device: torch.device) -> BnBWorldModel:
         max_seq=mc.get("max_seq", 512),
         dyn_residual=mc.get("dyn_residual", True),
         dyn_heteroscedastic=mc.get("dyn_heteroscedastic", False),
+        gnn_use_checkpoint=gnn_use_checkpoint,
     ).to(device)
 
 
@@ -373,7 +375,8 @@ def run(args, cfg, device):
     if _is_main():
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    model = _build_model(cfg, device)
+    model = _build_model(cfg, device,
+                         gnn_use_checkpoint=getattr(args, "gnn_checkpoint", False))
     tc    = cfg["training"]
 
     if args.warm_start:
@@ -509,6 +512,10 @@ def main():
     parser.add_argument("--phase3_train_encoder", action="store_true",
                         help="Joint encoder+dynamics training in Phase 3 "
                              "(NextLat Theorem 3.2 requirement). Uses RawSequenceDataset.")
+    parser.add_argument("--gnn_checkpoint", action="store_true",
+                        help="Enable gradient checkpointing on GNN layers during Phase 3 "
+                             "joint training. Reduces GATv2 activation memory ~5-10x at "
+                             "~1.5x slower GNN pass. Required to fit medium graphs with gradients.")
     parser.add_argument("--phase3_latent_cache", default=None,
                         help="Path to pre-encoded latent cache dir (from prebuild_latent_cache.py). "
                              "When set, Phase 3 skips live GNN encoding — minutes/epoch instead of hours. "

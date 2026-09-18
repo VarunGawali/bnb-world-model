@@ -22,6 +22,7 @@ Architecture changes vs. original:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 from torch_geometric.nn import GATv2Conv
 from torch_geometric.utils import softmax as segment_softmax
 from torch_geometric.utils import scatter
@@ -95,11 +96,13 @@ class BipartiteGNN(nn.Module):
         hidden_dim: int = 128,
         n_layers: int = 3,
         n_heads: int = 4,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
 
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
+        self.use_checkpoint = use_checkpoint
 
         # Fixed per-feature input standardisation ("prenorm"). Buffers hold the
         # training-set mean/std; set once via set_feature_stats before training
@@ -203,27 +206,42 @@ class BipartiteGNN(nn.Module):
         attr_c2v = edge_attr[c2v_mask]
         attr_v2c = edge_attr[v2c_mask]
 
+        var_idx = var_mask.nonzero(as_tuple=True)[0]
+        con_idx = con_mask.nonzero(as_tuple=True)[0]
+
         for i in range(self.n_layers):
             last = i == self.n_layers - 1
-            # Constraints -> variables
-            upd_v = self.conv_c2v[i](h, edge_c2v, edge_attr=attr_c2v)[var_mask]
-            upd_v = self.norm_var[i](F.relu(upd_v)).to(h.dtype)
 
-            # Variables -> constraints. The LAST layer's constraint update is
-            # dead — only h_vars is pooled afterwards, so updated constraint rows
-            # are never read. Skip it (both upd_v and upd_c are computed from the
-            # SAME pre-update h, so skipping only the last con update leaves h_vars
-            # bit-identical while saving one GATv2 pass).
-            if not last:
-                upd_c = self.conv_v2c[i](h, edge_v2c, edge_attr=attr_v2c)[con_mask]
-                upd_c = self.norm_con[i](F.relu(upd_c)).to(h.dtype)
+            if self.use_checkpoint and self.training:
+                # Gradient checkpointing: recompute activations during backward
+                # instead of storing them. Cuts GATv2 activation memory ~5-10x.
+                # use_reentrant=False avoids issues with in-place ops.
+                conv_c2v_i = self.conv_c2v[i]
+                norm_var_i = self.norm_var[i]
+                upd_v = grad_ckpt(
+                    lambda _h, _e, _a: norm_var_i(F.relu(conv_c2v_i(_h, _e, edge_attr=_a)[var_mask])).to(_h.dtype),
+                    h, edge_c2v, attr_c2v,
+                    use_reentrant=False,
+                )
+                if not last:
+                    conv_v2c_i = self.conv_v2c[i]
+                    norm_con_i = self.norm_con[i]
+                    upd_c = grad_ckpt(
+                        lambda _h, _e, _a: norm_con_i(F.relu(conv_v2c_i(_h, _e, edge_attr=_a)[con_mask])).to(_h.dtype),
+                        h, edge_v2c, attr_v2c,
+                        use_reentrant=False,
+                    )
+            else:
+                upd_v = self.conv_c2v[i](h, edge_c2v, edge_attr=attr_c2v)[var_mask]
+                upd_v = self.norm_var[i](F.relu(upd_v)).to(h.dtype)
+                if not last:
+                    upd_c = self.conv_v2c[i](h, edge_v2c, edge_attr=attr_v2c)[con_mask]
+                    upd_c = self.norm_con[i](F.relu(upd_c)).to(h.dtype)
 
-            # Residual update — in-place scatter to avoid h.clone()
-            h = h.index_put((var_mask.nonzero(as_tuple=True)[0],),
-                            h[var_mask] + upd_v)
+            # Residual update
+            h = h.index_put((var_idx,), h[var_mask] + upd_v)
             if not last:
-                h = h.index_put((con_mask.nonzero(as_tuple=True)[0],),
-                                h[con_mask] + upd_c)
+                h = h.index_put((con_idx,), h[con_mask] + upd_c)
 
         h_vars = h[var_mask]
         z = self.pool(h_vars, batch_vec[var_mask])
