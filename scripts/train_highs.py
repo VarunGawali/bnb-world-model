@@ -47,6 +47,7 @@ from bnb_wm.data.datasets import (
 from bnb_wm.training.trainer import Trainer
 from bnb_wm.training.checkpoint import load_weights_only
 import bnb_wm.training.checkpoint as _ckpt_module
+from torch.utils.data import Dataset
 
 
 # ── DDP helpers ──────────────────────────────────────────────────────────────
@@ -286,6 +287,72 @@ def _sequence_loaders(data_dirs: list[Path], cfg: dict, seed: int,
     return tr_loader, va_loader
 
 
+class CachedLatentDataset(Dataset):
+    """Reads pre-encoded latent sequences from chunk_NNNNN.pt files in cache_dir."""
+
+    def __init__(self, cache_dir: Path):
+        self.seqs: list[dict] = []
+        for chunk_file in sorted(cache_dir.glob("chunk_*.pt")):
+            chunk = torch.load(chunk_file, map_location="cpu", weights_only=False)
+            self.seqs.extend(chunk)
+        if not self.seqs:
+            raise FileNotFoundError(f"No cached latent sequences found in {cache_dir}")
+
+    def __len__(self):
+        return len(self.seqs)
+
+    def __getitem__(self, idx):
+        return self.seqs[idx]
+
+
+def _cached_latent_collate(batch: list[dict]) -> dict:
+    """Collate pre-encoded latent dicts — tensors are already fixed-length."""
+    keys = batch[0].keys()
+    out = {}
+    for k in keys:
+        vals = [b[k] for b in batch]
+        if isinstance(vals[0], torch.Tensor):
+            try:
+                out[k] = torch.stack(vals)
+            except RuntimeError:
+                # Variable-length sequences — pad to longest
+                max_len = max(v.shape[0] for v in vals)
+                padded = torch.zeros(len(vals), max_len, *vals[0].shape[1:])
+                for i, v in enumerate(vals):
+                    padded[i, :v.shape[0]] = v
+                out[k] = padded
+        else:
+            out[k] = vals
+    return out
+
+
+def _cached_sequence_loaders(cache_dir: Path, cfg: dict, seed: int):
+    """Build train/val DataLoaders from pre-encoded latent cache."""
+    ds = CachedLatentDataset(cache_dir)
+    n = len(ds)
+    n_val = max(1, int(n * cfg["data"]["val_split"]))
+    n_train = n - n_val
+    rng = torch.Generator().manual_seed(seed)
+    tr_ds, va_ds = torch.utils.data.random_split(ds, [n_train, n_val], generator=rng)
+    bs = max(4, cfg["training"].get("phase3_seq_batch_size", 4))
+
+    ddp_active = dist.is_available() and dist.is_initialized()
+    if ddp_active:
+        tr_sampler = DistributedSampler(tr_ds, shuffle=True)
+        va_sampler = DistributedSampler(va_ds, shuffle=False)
+        tr_loader = DataLoader(tr_ds, batch_size=bs, sampler=tr_sampler,
+                               collate_fn=_cached_latent_collate, num_workers=4)
+        va_loader = DataLoader(va_ds, batch_size=bs, sampler=va_sampler,
+                               collate_fn=_cached_latent_collate, num_workers=4)
+    else:
+        tr_loader = DataLoader(tr_ds, batch_size=bs, shuffle=True,
+                               collate_fn=_cached_latent_collate, num_workers=4)
+        va_loader = DataLoader(va_ds, batch_size=bs, shuffle=False,
+                               collate_fn=_cached_latent_collate, num_workers=4)
+    print(f"[CachedLatent] {n_train} train / {n_val} val sequences from {cache_dir}")
+    return tr_loader, va_loader
+
+
 def _cut_loader(cut_dir: Path, cfg: dict):
     if cut_dir is None or not cut_dir.exists():
         return None
@@ -371,12 +438,24 @@ def run(args, cfg, device):
             load_weights_only(model, p2_ckpt, device=device, strict=False)
             print(f"  Loaded {p2_ckpt}")
 
-        raw = args.phase3_train_encoder
-        tr_l, va_l = _sequence_loaders(data_dirs, cfg, seed, raw=raw)
-        cut_l = _cut_loader(
-            Path(args.cut_transitions_dir) if args.cut_transitions_dir else None,
-            cfg,
-        )
+        use_disk_cache = bool(args.phase3_latent_cache)
+        if use_disk_cache:
+            cache_dir = Path(args.phase3_latent_cache)
+            print(f"  Using pre-encoded disk cache: {cache_dir}")
+            tr_l, va_l = _cached_sequence_loaders(cache_dir, cfg, seed)
+            # Encoder is frozen; dynamics-only training; cache refreshed externally.
+            also_train_encoder = False
+            encode_cache_refresh = 0
+        else:
+            raw = args.phase3_train_encoder
+            tr_l, va_l = _sequence_loaders(data_dirs, cfg, seed, raw=raw)
+            also_train_encoder = raw
+            encode_cache_refresh = tc.get("encode_cache_refresh_every", 5)
+
+        # Unfreeze encoder if joint training is requested (no disk cache).
+        if also_train_encoder:
+            for p in raw_model.encoder.parameters():
+                p.requires_grad_(True)
 
         trainer.train_dynamics(
             tr_l, va_l,
@@ -384,13 +463,6 @@ def run(args, cfg, device):
             lr=tc["lr_phase3"],
             patience=tc.get("patience_phase3", tc.get("patience", 12)),
             overshoot_depth=tc.get("overshoot_depth", 3),
-            cand_rank_weight=tc.get("cand_rank_weight", 0.5),
-            cut_loader=cut_l,
-            cut_weight=tc.get("cut_transition_weight", 0.1),
-            v_consist_weight=tc.get("v_consist_weight", 0.1),
-            also_train_encoder=raw,
-            encoder_lr_scale=tc.get("encoder_lr_scale", 0.1),
-            encode_cache_refresh_every=tc.get("encode_cache_refresh_every", 5),
         )
         print("[Phase 3] Done. Best checkpoint: phase3_best.pt")
 
@@ -437,6 +509,10 @@ def main():
     parser.add_argument("--phase3_train_encoder", action="store_true",
                         help="Joint encoder+dynamics training in Phase 3 "
                              "(NextLat Theorem 3.2 requirement). Uses RawSequenceDataset.")
+    parser.add_argument("--phase3_latent_cache", default=None,
+                        help="Path to pre-encoded latent cache dir (from prebuild_latent_cache.py). "
+                             "When set, Phase 3 skips live GNN encoding — minutes/epoch instead of hours. "
+                             "Re-run prebuild_latent_cache.py every ~5 epochs to refresh the encoder.")
     parser.add_argument("--config", default=str(ROOT / "configs" / "default.yaml"),
                         help="Path to YAML config")
     parser.add_argument("--seed", type=int, default=42)
