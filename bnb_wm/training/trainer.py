@@ -901,7 +901,7 @@ class Trainer:
                     # on its own distribution, removing the OOD gap it would
                     # otherwise face during the latent rollout at inference.
                     a_chosen = h_vars[torch.tensor(chosen_idx, device=self.device)]
-                    z_pred1, _ = self.model.dynamics_step(z, a_chosen)
+                    z_pred1 = self.model.dynamics_step(z, a_chosen)[0]
                     bvec_g   = torch.zeros(z.size(0), dtype=torch.long, device=self.device)
                     v_on_pred = self.model.value_pred(z_pred1, z_pred1, bvec_g, None)
                     v_consist = F.mse_loss(v_on_pred, v_pred_real.detach())
