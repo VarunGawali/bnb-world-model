@@ -435,6 +435,10 @@ class Trainer:
         for batch in loader:
             d = batch if isinstance(batch, dict) else dict(zip(
                 ("z_seq", "a_seq", "z_next_seq"), batch))
+            if "batch_graphs" in d and "z_seq" not in d:
+                d = self._online_encode_raw_batch(d)
+                if d is None:
+                    continue
             z_seq      = d["z_seq"].to(self.device)
             a_seq      = d["a_seq"].to(self.device)
             z_next_seq = d["z_next_seq"].to(self.device)
