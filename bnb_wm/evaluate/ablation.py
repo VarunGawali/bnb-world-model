@@ -47,6 +47,7 @@ except ImportError:
     wilcoxon = None
 
 from bnb_wm.evaluate.benchmark import _format_obs
+from bnb_wm.solver.bnb_solver import BnBSolver
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +272,57 @@ def _root_dual(env):
         return float("nan")
 
 
+def _instance_to_abc(instance):
+    """Extract (A, b, c) numpy arrays from an Ecole instance (pyscipopt Model).
+
+    Returns the LP relaxation in the form:
+        min  c^T x   s.t.  A x >= b,   x in {0,1}^n
+    which matches BnBSolver.solve()'s expected format.
+
+    Uses pyscipopt's getLPRowsData / getColsData to read constraint coefficients.
+    Falls back to None on any error so the caller can skip the HiGHS baseline.
+    """
+    try:
+        scip = instance.copy_orig().as_pyscipopt()
+        scip.hideOutput()
+        scip.setParam("presolving/maxrounds", 0)
+        scip.setParam("separating/maxrounds", 0)
+        # Solve LP relaxation only to access row/column data
+        scip.optimize()
+
+        vars_ = scip.getVars(transformed=False)
+        n = len(vars_)
+        c = np.array([v.getObj() for v in vars_], dtype=np.float64)
+
+        rows = scip.getLPRowsData()
+        if rows is None or len(rows) == 0:
+            # Fallback: read from constraints before LP solve
+            rows = scip.getConss()
+
+        m_rows = len(rows)
+        A = np.zeros((m_rows, n), dtype=np.float64)
+        b = np.zeros(m_rows, dtype=np.float64)
+        var_idx = {v.name: i for i, v in enumerate(vars_)}
+
+        for ri, row in enumerate(rows):
+            try:
+                lhs = row.getLhs()
+                rhs = row.getRhs()
+                # Use LHS (>=) side; if both finite use LHS
+                b[ri] = lhs if lhs > -1e19 else -rhs
+                cols, vals = scip.getRowVarsAndCoefs(row)
+                for v, coef in zip(cols, vals):
+                    j = var_idx.get(v.name, -1)
+                    if j >= 0:
+                        A[ri, j] = coef if lhs > -1e19 else -coef
+            except Exception:
+                pass
+
+        return A, b, c
+    except Exception:
+        return None
+
+
 def _episode_stats(env, fallback_steps):
     """(nodes, solved, time_s, cuts, obj, dual, gap) for the just-finished episode."""
     try:
@@ -286,7 +338,7 @@ def _episode_stats(env, fallback_steps):
 
 def run(model, device, configs, n_instances, generator_kwargs,
         time_limit=60, seed=0, separate=False, strong_branching=False,
-        pseudocost=False):
+        pseudocost=False, highs_baseline=False):
     """
     Returns a dict: method -> list of per-instance node counts (aligned by index).
     "scip" is always included as the baseline.
@@ -320,7 +372,8 @@ def run(model, device, configs, n_instances, generator_kwargs,
     )
 
     extra = (["strong_branching"] if strong_branching else []) \
-            + (["pseudocost"] if pseudocost else [])
+            + (["pseudocost"] if pseudocost else []) \
+            + (["highs_mf"] if highs_baseline else [])
     methods = ["scip"] + extra + list(configs.keys())
     nodes    = {m: [] for m in methods}
     solved   = {m: [] for m in methods}   # solved-to-optimality flags
@@ -388,6 +441,36 @@ def run(model, device, configs, n_instances, generator_kwargs,
             mp.setParam("branching/pscost/priority", 536870911)
             mp.optimize()
             _append("pseudocost", *_scip_metrics(mp, 0))
+
+        # ---- HiGHS most-fractional baseline (same Python overhead as model) ----
+        if highs_baseline:
+            abc = _instance_to_abc(instance)
+            if abc is not None:
+                A, b, c = abc
+                mf_solver = BnBSolver(
+                    model, device,
+                    time_limit=time_limit,
+                    node_limit=500_000,
+                    cut_mode="none",
+                )
+                mf_solver.branch_mode = "most_fractional"
+                t0 = time.perf_counter()
+                try:
+                    res = mf_solver.solve(A, b, c)
+                    mf_t = time.perf_counter() - t0
+                    mf_opt = (res.status == "optimal")
+                    mf_obj = float(res.objective)
+                    mf_dual = float(res.objective) if mf_opt else float("nan")
+                    mf_gap = float(res.optimality_gap)
+                    _append("highs_mf", res.n_nodes, mf_opt, mf_t, -1,
+                            mf_obj, mf_dual, mf_gap)
+                except Exception as e:
+                    print(f"  [highs_mf] instance {i+1} failed: {e}")
+                    _append("highs_mf", 0, False, float("nan"), -1,
+                            float("nan"), float("nan"), float("nan"))
+            else:
+                _append("highs_mf", 0, False, float("nan"), -1,
+                        float("nan"), float("nan"), float("nan"))
 
         # ---- each learned config ----
         for name, cfg in configs.items():
@@ -696,6 +779,10 @@ def main():
     ap.add_argument("--pseudocost", action="store_true",
                     help="add a pure pseudocost-branching baseline (the standard "
                          "cheap classical rule).")
+    ap.add_argument("--highs_baseline", action="store_true",
+                    help="add a HiGHS most-fractional baseline: same Python B&B loop "
+                         "and LP overhead as our model, but dumb branching. This is "
+                         "the FAIR comparison (vs SCIP which uses near-zero C++ overhead).")
     ap.add_argument("--methods", default=None,
                     help="comma-separated subset of methods to run (e.g. "
                          "'reward_return' for a fast final-model-vs-SCIP head-to-"
@@ -752,6 +839,7 @@ def main():
                               density=args.density),
         time_limit=args.time_limit, seed=args.seed, separate=args.separate,
         strong_branching=args.strong_branching, pseudocost=args.pseudocost,
+        highs_baseline=args.highs_baseline,
     )
     summary = summarize(nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps,
                         timings=timings, rollout_acc=rollout_acc)
