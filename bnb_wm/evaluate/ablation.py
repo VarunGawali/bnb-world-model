@@ -305,40 +305,48 @@ def _instance_to_abc(instance):
     try:
         scip = instance.copy_orig().as_pyscipopt()
         scip.hideOutput()
-        scip.setParam("presolving/maxrounds", 0)
-        scip.setParam("separating/maxrounds", 0)
-        # Solve LP relaxation only to access row/column data
-        scip.optimize()
 
+        # Read constraint matrix WITHOUT solving. Calling scip.optimize() then
+        # getLPRowsData() returns LP data at the final B&B leaf (all vars integral),
+        # so BnBSolver sees a trivially-integer root and exits in 1 node every time.
         vars_ = scip.getVars(transformed=False)
         n = len(vars_)
         c = np.array([v.getObj() for v in vars_], dtype=np.float64)
-
-        rows = scip.getLPRowsData()
-        if rows is None or len(rows) == 0:
-            # Fallback: read from constraints before LP solve
-            rows = scip.getConss()
-
-        m_rows = len(rows)
-        A = np.zeros((m_rows, n), dtype=np.float64)
-        b = np.zeros(m_rows, dtype=np.float64)
         var_idx = {v.name: i for i, v in enumerate(vars_)}
 
-        for ri, row in enumerate(rows):
+        rows_data = []
+        for con in scip.getConss():
             try:
-                lhs = row.getLhs()
-                rhs = row.getRhs()
-                # Use LHS (>=) side; if both finite use LHS
-                b[ri] = lhs if lhs > -1e19 else -rhs
-                cols, vals = scip.getRowVarsAndCoefs(row)
-                for v, coef in zip(cols, vals):
-                    j = var_idx.get(v.name, -1)
-                    if j >= 0:
-                        A[ri, j] = coef if lhs > -1e19 else -coef
+                lhs = scip.getLhs(con)
+                rhs = scip.getRhs(con)
+                coef_map = scip.getValsLinear(con)  # {var_obj: coef}
+                rows_data.append((lhs, rhs, coef_map))
             except Exception:
                 pass
 
-        return A, b, c
+        if not rows_data:
+            return None
+
+        m_rows = len(rows_data)
+        A = np.zeros((m_rows, n), dtype=np.float64)
+        b_vec = np.zeros(m_rows, dtype=np.float64)
+
+        for ri, (lhs, rhs, coef_map) in enumerate(rows_data):
+            if lhs > -1e19:
+                b_vec[ri] = lhs
+                for v, coef in coef_map.items():
+                    j = var_idx.get(v.name, -1)
+                    if j >= 0:
+                        A[ri, j] = coef
+            else:
+                # Convert <= rhs to >= -rhs
+                b_vec[ri] = -rhs
+                for v, coef in coef_map.items():
+                    j = var_idx.get(v.name, -1)
+                    if j >= 0:
+                        A[ri, j] = -coef
+
+        return A, b_vec, c
     except Exception:
         return None
 
@@ -678,33 +686,43 @@ def summarize(nodes, solved=None, times=None, cuts=None,
     NOTE: do NOT use this function to select which configuration to report in
     the paper. The evaluation set must be held out from model selection.
     """
-    scip = np.asarray(nodes["scip"], dtype=float)
-    n_inst = len(scip)
+    scip_nodes = np.asarray(nodes["scip"], dtype=float)
+    n_inst = len(scip_nodes)
     scip_opt = np.asarray(solved["scip"], dtype=bool) if solved is not None else None
 
-    # ---- PRIMARY: both-solved node comparison ----
+    # Unified table: all metrics side-by-side per method.
+    # Nodes column = both-solved subset (the only unconfounded comparison);
+    # everything else = all instances (median; timeouts count as not-solved).
     rows = []
-    print("\n" + "=" * 110)
-    print("PRIMARY METRIC — nodes on instances solved by BOTH method and SCIP "
-          "(unconfounded by timeouts)")
-    print(f"{'Method':<16}{'n_both':>7}{'SCIP_nodes':>12}{'Meth_nodes':>12}"
-          f"{'reduction':>11}{'p(Wilcoxon)':>13}{'%solved':>9}{'%timeout':>10}")
-    print("-" * 110)
+    W = 140
+    print("\n" + "=" * W)
+    print(f"RESULTS — {n_inst} instances   "
+          f"(nodes = median on instances solved by BOTH method & SCIP; "
+          f"other metrics = all instances)")
+    hdr = (f"{'Method':<18}{'%solved':>8}{'%timeout':>10}{'gap@end':>9}"
+           f"{'gap_clsd':>10}{'time(s)':>9}{'nodes(all)':>12}"
+           f"{'nodes(both)':>13}{'vs SCIP':>9}{'p':>9}")
+    print(hdr)
+    print("-" * W)
+
     for m, vals in nodes.items():
         v = np.asarray(vals, dtype=float)
-        pct_solved  = 100.0 * float(np.mean(solved[m])) if solved is not None else float("nan")
-        pct_timeout = 100.0 * float(np.mean(~np.asarray(solved[m], dtype=bool))) if solved is not None else float("nan")
+        pct_solved  = (100.0 * float(np.mean(solved[m]))
+                       if solved is not None else float("nan"))
+        pct_timeout = (100.0 * float(np.mean(~np.asarray(solved[m], dtype=bool)))
+                       if solved is not None else float("nan"))
 
+        # Both-solved node stats
         if m == "scip" or scip_opt is None:
-            nb, red, p, sv_mean, mv_mean = 0, 0.0, None, float("nan"), float("nan")
+            nb, red, p, sv_med, mv_med = 0, float("nan"), None, float("nan"), float("nan")
         else:
             mask = scip_opt & np.asarray(solved[m], dtype=bool)
             nb   = int(mask.sum())
-            sv   = scip[mask]
+            sv   = scip_nodes[mask]
             mv   = v[mask]
-            sv_mean = float(sv.mean()) if nb > 0 else float("nan")
-            mv_mean = float(mv.mean()) if nb > 0 else float("nan")
-            red = 100.0 * (sv_mean - mv_mean) / max(sv_mean, 1e-9) if nb > 0 else float("nan")
+            sv_med = float(np.median(sv)) if nb > 0 else float("nan")
+            mv_med = float(np.median(mv)) if nb > 0 else float("nan")
+            red = 100.0 * (sv_med - mv_med) / max(sv_med, 1e-9) if nb > 0 else float("nan")
             p = None
             if nb >= 2 and wilcoxon is not None and np.any(sv != mv):
                 try:
@@ -712,16 +730,9 @@ def summarize(nodes, solved=None, times=None, cuts=None,
                 except Exception:
                     pass
 
-        pstr = f"{p:.2e}" if p is not None else "--"
-        rstr = f"{red:+.1f}%" if not np.isnan(red) else "--"
-        print(f"{m:<16}{nb:>7}{sv_mean:>12.1f}{mv_mean:>12.1f}"
-              f"{rstr:>11}{pstr:>13}{pct_solved:>8.0f}%{pct_timeout:>9.0f}%")
-
-        # Also compute per-method summary stats for the rows dict
-        mean_time = _nanmean(times[m]) if times is not None else None
-        mean_cuts = _nanmean(cuts[m]) if cuts is not None else None
-        mean_gap  = _nanmean(gaps[m]) if gaps is not None else None
-        mean_gap_closed = None
+        # Gap metrics (all instances)
+        mean_gap = _nanmean(gaps[m]) if gaps is not None else float("nan")
+        mean_gap_closed = float("nan")
         if gaps is not None and root_lps is not None and obj_vals is not None:
             gc_vals = []
             for obj, root_lp, g in zip(obj_vals[m], root_lps[m], gaps[m]):
@@ -732,36 +743,40 @@ def summarize(nodes, solved=None, times=None, cuts=None,
                 if root_gap > 1e-8:
                     gc_vals.append((root_gap - g) / root_gap)
             mean_gap_closed = float(np.mean(gc_vals)) if gc_vals else float("nan")
-        mean_lp_solves = _nanmean(lp_solves[m]) if lp_solves is not None else None
-        mean_lp_time   = _nanmean(lp_times[m])  if lp_times  is not None else None
+
+        mean_time      = _nanmean(times[m])      if times      is not None else float("nan")
+        mean_lp_solves = _nanmean(lp_solves[m])  if lp_solves  is not None else None
+        mean_lp_time   = _nanmean(lp_times[m])   if lp_times   is not None else None
+        mean_cuts      = _nanmean(cuts[m])        if cuts       is not None else None
+
+        gstr   = f"{mean_gap*100:.1f}%"     if not np.isnan(mean_gap)        else "--"
+        gcstr  = f"{mean_gap_closed*100:.1f}%" if not np.isnan(mean_gap_closed) else "--"
+        tstr   = f"{mean_time:.1f}"         if not np.isnan(mean_time)       else "--"
+        rstr   = f"{red:+.1f}%"             if not np.isnan(red)             else "--"
+        pstr   = f"{p:.2e}"                 if p is not None                 else "--"
+        sv_str = f"{sv_med:.0f}"            if not np.isnan(sv_med)          else "--"
+        mv_str = f"{mv_med:.0f}(n={nb})"   if not np.isnan(mv_med)          else "--"
+
+        print(f"{m:<18}{pct_solved:>7.0f}%{pct_timeout:>9.0f}%{gstr:>9}"
+              f"{gcstr:>10}{tstr:>9}{np.median(v):>12.0f}"
+              f"{mv_str:>13}{rstr:>9}{pstr:>9}")
+
         rows.append(dict(
             method=m,
             n_both_solved=nb,
-            scip_nodes_both=sv_mean, method_nodes_both=mv_mean,
+            scip_nodes_both=sv_med, method_nodes_both=mv_med,
             reduction_pct_both=red, wilcoxon_p_both=p,
             pct_solved=pct_solved, pct_timeout=pct_timeout,
-            all_mean=float(v.mean()), all_std=float(v.std()), all_median=float(np.median(v)),
+            all_median=float(np.median(v)),
             mean_gap=mean_gap, mean_gap_closed=mean_gap_closed,
             mean_time=mean_time, mean_cuts=mean_cuts,
             mean_lp_solves=mean_lp_solves, mean_lp_time=mean_lp_time,
         ))
-    print("=" * 110)
-    print(f"(N={n_inst} instances; p = Wilcoxon signed-rank on paired both-solved counts)")
-    print("(reduction > 0 means fewer nodes = better branching efficiency)")
 
-    # ---- SECONDARY: all-instance overview ----
-    print("\nSECONDARY — all instances (includes timeouts; interpret with caution)")
-    print(f"{'Method':<16}{'mean±std':>22}{'median':>9}"
-          f"{'gap@end':>10}{'gap_closed':>12}{'time(s)':>10}{'cuts':>8}")
-    print("-" * 90)
-    for r in rows:
-        m = r["method"]
-        gstr  = f"{r['mean_gap']*100:.2f}%" if r.get("mean_gap") is not None and not np.isnan(r["mean_gap"]) else "--"
-        gcstr = f"{r['mean_gap_closed']*100:.1f}%" if r.get("mean_gap_closed") is not None and not np.isnan(r["mean_gap_closed"]) else "--"
-        tstr  = f"{r['mean_time']:.2f}" if r.get("mean_time") is not None else "--"
-        cstr  = f"{r['mean_cuts']:.1f}" if r.get("mean_cuts") is not None else "--"
-        print(f"{m:<16}{r['all_mean']:8.1f} ± {r['all_std']:6.1f}    {r['all_median']:<9.0f}"
-              f"{gstr:>10}{gcstr:>12}{tstr:>10}{cstr:>8}")
+    print("=" * W)
+    print(f"nodes(both) = median nodes on subset solved by BOTH method and SCIP (n shown per row)")
+    print(f"vs SCIP     = (SCIP_med - method_med)/SCIP_med × 100  (positive = fewer nodes)")
+    print(f"p           = Wilcoxon signed-rank on paired both-solved node counts")
 
     if timings:
         _summarize_timings(timings)
