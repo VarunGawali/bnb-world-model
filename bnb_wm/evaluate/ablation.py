@@ -186,7 +186,7 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
 
 
 def _scip_metrics(scip, fallback_nodes):
-    """(nodes, solved_optimally, solve_time_s, cuts_applied) from a pyscipopt Model."""
+    """(nodes, solved, time_s, cuts, obj, dual, gap) from a pyscipopt Model."""
     try:
         n = int(scip.getNNodes())
     except Exception:
@@ -203,16 +203,37 @@ def _scip_metrics(scip, fallback_nodes):
         c = int(scip.getNCutsApplied())
     except Exception:
         c = -1
-    return n, solved, t, c
+    try:
+        obj = float(scip.getObjVal())
+    except Exception:
+        obj = float("nan")
+    try:
+        dual = float(scip.getDualbound())
+    except Exception:
+        dual = float("nan")
+    if not (np.isnan(obj) or np.isnan(dual)):
+        denom = max(abs(obj), abs(dual), 1e-8)
+        gap = abs(obj - dual) / denom
+    else:
+        gap = float("nan")
+    return n, solved, t, c, obj, dual, gap
+
+
+def _root_dual(env):
+    """Read the LP relaxation bound right after env.reset(), before branching."""
+    try:
+        return float(env.model.as_pyscipopt().getDualbound())
+    except Exception:
+        return float("nan")
 
 
 def _episode_stats(env, fallback_steps):
-    """(nodes, solved_optimally, time_s, cuts) for the just-finished Ecole episode."""
+    """(nodes, solved, time_s, cuts, obj, dual, gap) for the just-finished episode."""
     try:
         scip = env.model.as_pyscipopt()
         return _scip_metrics(scip, fallback_steps)
     except Exception:
-        return fallback_steps, False, float("nan"), -1
+        return fallback_steps, False, float("nan"), -1, float("nan"), float("nan"), float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -257,16 +278,30 @@ def run(model, device, configs, n_instances, generator_kwargs,
     extra = (["strong_branching"] if strong_branching else []) \
             + (["pseudocost"] if pseudocost else [])
     methods = ["scip"] + extra + list(configs.keys())
-    nodes = {m: [] for m in methods}
-    solved = {m: [] for m in methods}          # solved-to-optimality flags
-    times = {m: [] for m in methods}           # SCIP solving time (seconds)
-    cuts = {m: [] for m in methods}            # cutting planes applied
+    nodes    = {m: [] for m in methods}
+    solved   = {m: [] for m in methods}   # solved-to-optimality flags
+    times    = {m: [] for m in methods}   # SCIP solving time (seconds)
+    cuts     = {m: [] for m in methods}   # cutting planes applied
+    gaps     = {m: [] for m in methods}   # primal gap at termination
+    obj_vals = {m: [] for m in methods}   # best incumbent value
+    dual_vals= {m: [] for m in methods}   # best dual bound at termination
+    root_lps = {m: [] for m in methods}   # LP relaxation at root (before branching)
     model.eval()
 
     print(f"Evaluating {n_instances} instances | methods: {methods}\n")
     try:
       for i in range(n_instances):
         instance = next(generator)
+
+        def _append(key, n, opt, t, c, obj, dual, gap, root_lp=float("nan")):
+            nodes[key].append(n)
+            solved[key].append(opt)
+            times[key].append(t)
+            cuts[key].append(c)
+            gaps[key].append(gap)
+            obj_vals[key].append(obj)
+            dual_vals[key].append(dual)
+            root_lps[key].append(root_lp)
 
         # ---- SCIP default (pseudocost) ----
         m = instance.copy_orig().as_pyscipopt()
@@ -275,11 +310,7 @@ def run(model, device, configs, n_instances, generator_kwargs,
         m.setParam("separating/maxrounds", sep_rounds)
         m.setParam("presolving/maxrounds", 0)
         m.optimize()
-        n, opt, t, c = _scip_metrics(m, 0)
-        nodes["scip"].append(n)
-        solved["scip"].append(opt)
-        times["scip"].append(t)
-        cuts["scip"].append(c)
+        _append("scip", *_scip_metrics(m, 0))
 
         # ---- full strong branching (the oracle the policy imitates) ----
         if strong_branching:
@@ -288,14 +319,9 @@ def run(model, device, configs, n_instances, generator_kwargs,
             ms.setParam("limits/time", time_limit)
             ms.setParam("separating/maxrounds", sep_rounds)
             ms.setParam("presolving/maxrounds", 0)
-            # Force full strong branching by giving it top rule priority.
             ms.setParam("branching/fullstrong/priority", 536870911)
             ms.optimize()
-            n, opt, t, c = _scip_metrics(ms, 0)
-            nodes["strong_branching"].append(n)
-            solved["strong_branching"].append(opt)
-            times["strong_branching"].append(t)
-            cuts["strong_branching"].append(c)
+            _append("strong_branching", *_scip_metrics(ms, 0))
 
         # ---- pure pseudocost branching (classical standard rule) ----
         if pseudocost:
@@ -306,15 +332,12 @@ def run(model, device, configs, n_instances, generator_kwargs,
             mp.setParam("presolving/maxrounds", 0)
             mp.setParam("branching/pscost/priority", 536870911)
             mp.optimize()
-            n, opt, t, c = _scip_metrics(mp, 0)
-            nodes["pseudocost"].append(n)
-            solved["pseudocost"].append(opt)
-            times["pseudocost"].append(t)
-            cuts["pseudocost"].append(c)
+            _append("pseudocost", *_scip_metrics(mp, 0))
 
         # ---- each learned config ----
         for name, cfg in configs.items():
             obs, action_set, _, done, info = env.reset(instance.copy_orig())
+            root_lp = _root_dual(env)   # LP relaxation before first branch
             steps, past = 0, None
             with torch.no_grad():
                 while not done and action_set is not None and len(action_set) > 0:
@@ -325,11 +348,7 @@ def run(model, device, configs, n_instances, generator_kwargs,
                     )
                     obs, action_set, _, done, info = env.step(action)
                     steps += 1
-            n, opt, t, c = _episode_stats(env, steps)
-            nodes[name].append(n)
-            solved[name].append(opt)
-            times[name].append(t)
-            cuts[name].append(c)
+            _append(name, *_episode_stats(env, steps), root_lp=root_lp)
 
         row = " | ".join(
             f"{m}:{nodes[m][-1]}{'' if solved[m][-1] else '*'}" for m in methods
@@ -342,13 +361,17 @@ def run(model, device, configs, n_instances, generator_kwargs,
     # mid-instance interrupt leaves aligned, valid arrays.
     done_n = min(len(nodes[m]) for m in methods)
     for m in methods:
-        nodes[m] = nodes[m][:done_n]
-        solved[m] = solved[m][:done_n]
-        times[m] = times[m][:done_n]
-        cuts[m] = cuts[m][:done_n]
+        nodes[m]     = nodes[m][:done_n]
+        solved[m]    = solved[m][:done_n]
+        times[m]     = times[m][:done_n]
+        cuts[m]      = cuts[m][:done_n]
+        gaps[m]      = gaps[m][:done_n]
+        obj_vals[m]  = obj_vals[m][:done_n]
+        dual_vals[m] = dual_vals[m][:done_n]
+        root_lps[m]  = root_lps[m][:done_n]
     print(f"  (* = hit time/node limit, NOT solved to optimality) "
           f"[{done_n} instances completed]")
-    return nodes, solved, times, cuts
+    return nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps
 
 
 def _nanmean(x):
@@ -357,18 +380,19 @@ def _nanmean(x):
     return float(x.mean()) if x.size else float("nan")
 
 
-def summarize(nodes, solved=None, times=None, cuts=None):
+def summarize(nodes, solved=None, times=None, cuts=None,
+              gaps=None, obj_vals=None, dual_vals=None, root_lps=None):
     """Print and return a per-method summary vs. SCIP with Wilcoxon significance.
 
-    Reports the four metrics the evaluation requires per method:
-    optimality (%solved), nodes explored, solve time, and cuts applied.
+    Reports: nodes, node reduction vs SCIP, % solved, mean gap at termination,
+    mean gap closed vs root LP, solve time, cuts applied.
     """
     scip = np.asarray(nodes["scip"], dtype=float)
     rows = []
-    print("\n" + "=" * 104)
-    print(f"{'Method':<16}{'nodes(mean±std)':<22}{'median':<9}"
-          f"{'vs SCIP':<9}{'p':<10}{'%solved':<9}{'time(s)':<10}{'cuts':<8}")
-    print("-" * 104)
+    print("\n" + "=" * 120)
+    print(f"{'Method':<16}{'nodes(mean±std)':<22}{'median':<9}{'vs SCIP':<9}"
+          f"{'p':<10}{'%solved':<9}{'gap@end':<10}{'gap_closed':<12}{'time(s)':<10}{'cuts':<8}")
+    print("-" * 120)
     for m, vals in nodes.items():
         v = np.asarray(vals, dtype=float)
         mean, std, med = v.mean(), v.std(), np.median(v)
@@ -376,6 +400,21 @@ def summarize(nodes, solved=None, times=None, cuts=None):
                       if solved is not None else None)
         mean_time = _nanmean(times[m]) if times is not None else None
         mean_cuts = _nanmean(cuts[m]) if cuts is not None else None
+        mean_gap  = _nanmean(gaps[m]) if gaps is not None else None
+
+        # Gap closed = (root_lp_gap - final_gap) / root_lp_gap, per instance
+        mean_gap_closed = None
+        if gaps is not None and root_lps is not None and obj_vals is not None:
+            gc_vals = []
+            for obj, root_lp, g in zip(obj_vals[m], root_lps[m], gaps[m]):
+                if np.isnan(obj) or np.isnan(root_lp) or np.isnan(g):
+                    continue
+                denom = max(abs(obj), 1e-8)
+                root_gap = abs(obj - root_lp) / denom
+                if root_gap > 1e-8:
+                    gc_vals.append((root_gap - g) / root_gap)
+            mean_gap_closed = float(np.mean(gc_vals)) if gc_vals else float("nan")
+
         if m == "scip":
             red, p = 0.0, None
         else:
@@ -388,18 +427,22 @@ def summarize(nodes, solved=None, times=None, cuts=None):
                     p = None
         rows.append(dict(method=m, mean=mean, std=std, median=med,
                          reduction_pct=red, wilcoxon_p=p, pct_solved=pct_solved,
+                         mean_gap=mean_gap, mean_gap_closed=mean_gap_closed,
                          mean_time=mean_time, mean_cuts=mean_cuts))
-        pstr = f"{p:.2e}" if p is not None else "--"
-        sstr = f"{pct_solved:.0f}%" if pct_solved is not None else "--"
-        tstr = f"{mean_time:.2f}" if mean_time is not None else "--"
-        cstr = f"{mean_cuts:.1f}" if mean_cuts is not None else "--"
+        pstr  = f"{p:.2e}" if p is not None else "--"
+        sstr  = f"{pct_solved:.0f}%" if pct_solved is not None else "--"
+        gstr  = f"{mean_gap*100:.2f}%" if mean_gap is not None and not np.isnan(mean_gap) else "--"
+        gcstr = f"{mean_gap_closed*100:.1f}%" if mean_gap_closed is not None and not np.isnan(mean_gap_closed) else "--"
+        tstr  = f"{mean_time:.2f}" if mean_time is not None else "--"
+        cstr  = f"{mean_cuts:.1f}" if mean_cuts is not None else "--"
         print(f"{m:<16}{mean:8.1f} ± {std:6.1f}    {med:<9.0f}"
-              f"{red:>6.1f}%  {pstr:<10}{sstr:<9}{tstr:<10}{cstr:<8}")
-    print("=" * 104)
+              f"{red:>6.1f}%  {pstr:<10}{sstr:<9}{gstr:<10}{gcstr:<12}{tstr:<10}{cstr:<8}")
+    print("=" * 120)
     print("Reduction = mean node reduction vs SCIP (higher is better). "
           "p = Wilcoxon signed-rank on paired per-instance counts.")
-    print("%solved = fraction of instances closed to OPTIMALITY (not timed out) "
-          "-- a node reduction is only a real win at 100% solved.")
+    print("gap@end = mean primal gap at termination (lower is better).")
+    print("gap_closed = fraction of root LP gap closed by termination (higher is better).")
+    print("%solved = fraction of instances closed to OPTIMALITY.")
     print("time(s) = mean SCIP solving time; cuts = mean cutting planes applied.")
 
     # Fair comparison: nodes ONLY on instances BOTH scip and the method solved
@@ -529,7 +572,7 @@ def main():
                 if args.skip_confident is not None:
                     cfg["skip_confident"] = args.skip_confident
 
-    nodes, solved, times, cuts = run(
+    nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps = run(
         model, device, configs,
         n_instances=args.n_instances,
         generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
@@ -537,12 +580,14 @@ def main():
         time_limit=args.time_limit, seed=args.seed, separate=args.separate,
         strong_branching=args.strong_branching, pseudocost=args.pseudocost,
     )
-    summary = summarize(nodes, solved, times, cuts)
+    summary = summarize(nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     json.dump({"per_instance": nodes, "solved": solved, "times": times,
-               "cuts": cuts, "summary": summary, "config": vars(args)},
+               "cuts": cuts, "gaps": gaps, "obj_vals": obj_vals,
+               "dual_vals": dual_vals, "root_lps": root_lps,
+               "summary": summary, "config": vars(args)},
               open(out, "w"), indent=2)
     print(f"\nSaved raw counts + summary to {out}")
 
