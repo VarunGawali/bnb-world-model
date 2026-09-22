@@ -166,7 +166,10 @@ class BnBSolver:
             self._highs = highspy
         except ImportError:
             self._highs = None
-        self._use_highs_direct = False
+        # Enable HiGHS-direct LP path (with warm-starting) when highspy is present.
+        # The old default of False silently disabled warm-starting even when highspy
+        # was installed, costing ~5-10x more simplex pivots per node.
+        self._use_highs_direct = self._highs is not None
 
         # P2.1: cut generation needs HiGHS (for the LP basis). If cuts are
         # requested but HiGHS is missing, fail loud rather than silently solving
@@ -361,6 +364,24 @@ class BnBSolver:
                 if np.any(vlb > vub + 1e-9):
                     continue
 
+                # Solve the child LP immediately so we get the actual lower bound
+                # rather than inheriting the parent's (looser) bound. This is what
+                # SCIP does: without it, best-bound node selection orders children
+                # by the parent LP value, defeating the purpose of the ordering.
+                c_lp_obj, c_x_lp, c_dual, c_feas, c_basis = self._solve_lp(
+                    A, b, c, vlb, vub, child_cuts, warm_basis=node_basis
+                )
+                n_nodes += 1  # count child LP as a node processed
+                if not c_feas or c_lp_obj >= global_ub - 1e-6:
+                    continue  # prune infeasible / bound-dominated children immediately
+
+                if self._is_integral(c_x_lp):
+                    if c_lp_obj < global_ub:
+                        global_ub = c_lp_obj
+                        best_sol  = np.round(c_x_lp)
+                        status    = "feasible"
+                    continue
+
                 # P1.6: score EACH child separately (the old code shared one
                 # priority for both). The down branch (x<=0) and up branch (x>=1)
                 # are distinct states, so we roll the dynamics forward in the
@@ -368,48 +389,32 @@ class BnBSolver:
                 # transition the model was trained on (P0.12).
                 direction = 1.0 if fix_val == 1.0 else -1.0
                 with torch.no_grad():
-                    # One direction-conditioned dynamics step from parent->child.
-                    # Its updated token buffer is written onto the child (P0.9) so
-                    # that when the child later branches, its latent lookahead has
-                    # the true history that led to it — not an empty buffer.
                     a_emb = h_vars[branch_var].unsqueeze(0)
                     z_child, h_child, child_tokens = self.model.dynamics_step_full(
                         z, a_emb, h_vars, node.past_tokens, direction
                     )
-                    # P1.6/P1.1: both selection modes score the PREDICTED child
-                    # state (z_child/h_child), which differs per child via the
-                    # branch direction — not the shared parent state. The child's
-                    # fractional set is unknown (imagined), so frac_mask=None
-                    # rather than the stale parent mask.
                     if self.node_selection == "cost_to_go":
-                        # Gap 5: learned best-first search. Order the frontier by
-                        # this child's predicted cost-to-go. Node order never
-                        # affects correctness, only efficiency, so exactness holds.
                         ctg = self.model.cost_to_go_pred(
                             z_child, h_child, bvec, None
                         ).item()
-                        # Node.__lt__ is a MAX-heap on priority (higher popped
-                        # first), so negate: the SMALLEST predicted remaining
-                        # work gets the highest priority and is explored first.
                         child_priority = -ctg
                     else:
-                        # Best-bound (default): both children inherit this node's
-                        # LP bound, so the value head on the predicted child state
-                        # is what distinguishes the up vs down child here.
+                        # Best-bound: use the ACTUAL child LP bound (c_lp_obj),
+                        # not the parent's. Value score breaks ties.
                         v_score = self.model.value_pred(
                             z_child, h_child, bvec, None).item()
-                        child_priority = -lp_obj + 0.01 * v_score
+                        child_priority = -c_lp_obj + 0.01 * v_score
 
                 child = Node(
-                    lb=lp_obj,
+                    lb=c_lp_obj,              # actual child LP bound
                     depth=node.depth + 1,
                     var_lb=vlb, var_ub=vub,
                     parent_id=node.node_id,
                     node_id=n_nodes * 2 + int(fix_val),
                     priority=child_priority,
                     inherited_cuts=child_cuts,
-                    warm_basis=node_basis,   # child warmstarts from current node's basis
-                    past_tokens=child_tokens,   # P0.9: propagate updated history
+                    warm_basis=c_basis,        # child warmstarts from its own LP solve
+                    past_tokens=child_tokens,
                 )
                 heapq.heappush(heap, child)
 
@@ -646,6 +651,17 @@ class BnBSolver:
             1  : A_{ij} / (|b_i| + 1e-8)
             2  : sign(A_{ij})
         """
+        # Include inherited cut constraints in the bipartite graph so the GNN
+        # sees the ACTUAL feasible region at this node, not just the original A.
+        # Without this the encoder sees a different constraint set than the LP
+        # actually solved, breaking the correspondence between graph state and
+        # LP solution (x_lp, dual) that the node features encode.
+        if cuts:
+            cut_A = np.vstack([cut.lhs.reshape(1, A.shape[1]) for cut in cuts])
+            cut_b = np.array([cut.rhs for cut in cuts])
+            A = np.vstack([A, cut_A])
+            b = np.concatenate([b, cut_b])
+
         m, n = A.shape
         c_max = float(np.abs(c).max()) + 1e-8
         b_max = float(np.abs(b).max()) + 1e-8

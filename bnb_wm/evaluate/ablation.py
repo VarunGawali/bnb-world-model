@@ -58,6 +58,11 @@ from bnb_wm.solver.bnb_solver import BnBSolver
 # mode "policy" ignores the rollout; mode "rollout" calls model.rollout_candidate.
 ABLATIONS = {
     "policy_only":   dict(mode="policy"),
+    # random_topk: takes policy's top-k candidates, picks one uniformly at random.
+    # This isolates whether the dynamics rollout adds value BEYOND the policy's
+    # top-k shortlist. If reward_return beats random_topk, dynamics matters.
+    # If not, the policy's ranking is sufficient and rollout adds only overhead.
+    "random_topk":   dict(mode="random_topk", k=3),
     # depth=2, k=3 (was 3/5): ~2-3x faster per node so instances actually finish
     # within the time budget, making node-count comparisons valid (not timeouts).
     "value_rollout": dict(mode="rollout", depth=2, gamma=0.95, k=3,
@@ -157,6 +162,13 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0,
 
     if cfg["mode"] == "policy":
         return int(masked.argmax()), past_tokens
+
+    # random_topk: policy shortlists top-k, then picks uniformly at random.
+    # Isolates whether dynamics rollout adds value beyond the policy shortlist.
+    if cfg["mode"] == "random_topk":
+        k = min(cfg.get("k", 3), len(action_set))
+        top_k = masked.topk(k).indices
+        return int(top_k[np.random.randint(k)]), past_tokens
 
     # Integrality gate
     x_var = batch.x[var_mask]
@@ -647,25 +659,60 @@ def summarize(nodes, solved=None, times=None, cuts=None,
               timings=None, rollout_acc=None, lp_solves=None, lp_times=None):
     """Print and return a per-method summary vs. SCIP with Wilcoxon significance.
 
-    Reports: nodes, node reduction vs SCIP, % solved, mean gap at termination,
-    mean gap closed vs root LP, solve time, cuts applied.
+    PRIMARY metric: nodes on instances solved to optimality by BOTH this method
+    and SCIP (the only unconfounded node comparison; timeouts skew all-instance
+    means because a slow-per-node method can appear to use fewer nodes by timing
+    out before the tree is built).
+
+    Also reports: all-instance median nodes, solved %, timeout %, gap@end,
+    gap_closed vs root LP, solve time, cuts.
+
+    NOTE: do NOT use this function to select which configuration to report in
+    the paper. The evaluation set must be held out from model selection.
     """
     scip = np.asarray(nodes["scip"], dtype=float)
+    n_inst = len(scip)
+    scip_opt = np.asarray(solved["scip"], dtype=bool) if solved is not None else None
+
+    # ---- PRIMARY: both-solved node comparison ----
     rows = []
-    print("\n" + "=" * 120)
-    print(f"{'Method':<16}{'nodes(mean±std)':<22}{'median':<9}{'vs SCIP':<9}"
-          f"{'p':<10}{'%solved':<9}{'gap@end':<10}{'gap_closed':<12}{'time(s)':<10}{'cuts':<8}")
-    print("-" * 120)
+    print("\n" + "=" * 110)
+    print("PRIMARY METRIC — nodes on instances solved by BOTH method and SCIP "
+          "(unconfounded by timeouts)")
+    print(f"{'Method':<16}{'n_both':>7}{'SCIP_nodes':>12}{'Meth_nodes':>12}"
+          f"{'reduction':>11}{'p(Wilcoxon)':>13}{'%solved':>9}{'%timeout':>10}")
+    print("-" * 110)
     for m, vals in nodes.items():
         v = np.asarray(vals, dtype=float)
-        mean, std, med = v.mean(), v.std(), np.median(v)
-        pct_solved = (100.0 * float(np.mean(solved[m]))
-                      if solved is not None else None)
+        pct_solved  = 100.0 * float(np.mean(solved[m])) if solved is not None else float("nan")
+        pct_timeout = 100.0 * float(np.mean(~np.asarray(solved[m], dtype=bool))) if solved is not None else float("nan")
+
+        if m == "scip" or scip_opt is None:
+            nb, red, p, sv_mean, mv_mean = 0, 0.0, None, float("nan"), float("nan")
+        else:
+            mask = scip_opt & np.asarray(solved[m], dtype=bool)
+            nb   = int(mask.sum())
+            sv   = scip[mask]
+            mv   = v[mask]
+            sv_mean = float(sv.mean()) if nb > 0 else float("nan")
+            mv_mean = float(mv.mean()) if nb > 0 else float("nan")
+            red = 100.0 * (sv_mean - mv_mean) / max(sv_mean, 1e-9) if nb > 0 else float("nan")
+            p = None
+            if nb >= 2 and wilcoxon is not None and np.any(sv != mv):
+                try:
+                    p = float(wilcoxon(sv, mv).pvalue)
+                except Exception:
+                    pass
+
+        pstr = f"{p:.2e}" if p is not None else "--"
+        rstr = f"{red:+.1f}%" if not np.isnan(red) else "--"
+        print(f"{m:<16}{nb:>7}{sv_mean:>12.1f}{mv_mean:>12.1f}"
+              f"{rstr:>11}{pstr:>13}{pct_solved:>8.0f}%{pct_timeout:>9.0f}%")
+
+        # Also compute per-method summary stats for the rows dict
         mean_time = _nanmean(times[m]) if times is not None else None
         mean_cuts = _nanmean(cuts[m]) if cuts is not None else None
         mean_gap  = _nanmean(gaps[m]) if gaps is not None else None
-
-        # Gap closed = (root_lp_gap - final_gap) / root_lp_gap, per instance
         mean_gap_closed = None
         if gaps is not None and root_lps is not None and obj_vals is not None:
             gc_vals = []
@@ -677,81 +724,36 @@ def summarize(nodes, solved=None, times=None, cuts=None,
                 if root_gap > 1e-8:
                     gc_vals.append((root_gap - g) / root_gap)
             mean_gap_closed = float(np.mean(gc_vals)) if gc_vals else float("nan")
-
-        if m == "scip":
-            red, p = 0.0, None
-        else:
-            red = 100.0 * (scip.mean() - v.mean()) / max(scip.mean(), 1e-9)
-            p = None
-            if wilcoxon is not None and np.any(v != scip):
-                try:
-                    p = float(wilcoxon(scip, v).pvalue)
-                except Exception:
-                    p = None
         mean_lp_solves = _nanmean(lp_solves[m]) if lp_solves is not None else None
         mean_lp_time   = _nanmean(lp_times[m])  if lp_times  is not None else None
-        rows.append(dict(method=m, mean=mean, std=std, median=med,
-                         reduction_pct=red, wilcoxon_p=p, pct_solved=pct_solved,
-                         mean_gap=mean_gap, mean_gap_closed=mean_gap_closed,
-                         mean_time=mean_time, mean_cuts=mean_cuts,
-                         mean_lp_solves=mean_lp_solves, mean_lp_time=mean_lp_time))
-        pstr  = f"{p:.2e}" if p is not None else "--"
-        sstr  = f"{pct_solved:.0f}%" if pct_solved is not None else "--"
-        gstr  = f"{mean_gap*100:.2f}%" if mean_gap is not None and not np.isnan(mean_gap) else "--"
-        gcstr = f"{mean_gap_closed*100:.1f}%" if mean_gap_closed is not None and not np.isnan(mean_gap_closed) else "--"
-        tstr  = f"{mean_time:.2f}" if mean_time is not None else "--"
-        cstr  = f"{mean_cuts:.1f}" if mean_cuts is not None else "--"
-        print(f"{m:<16}{mean:8.1f} ± {std:6.1f}    {med:<9.0f}"
-              f"{red:>6.1f}%  {pstr:<10}{sstr:<9}{gstr:<10}{gcstr:<12}{tstr:<10}{cstr:<8}")
-    print("=" * 120)
-    print("Reduction = mean node reduction vs SCIP (higher is better). "
-          "p = Wilcoxon signed-rank on paired per-instance counts.")
-    print("gap@end = mean primal gap at termination (lower is better).")
-    print("gap_closed = fraction of root LP gap closed by termination (higher is better).")
-    print("%solved = fraction of instances closed to OPTIMALITY.")
-    print("time(s) = mean SCIP solving time; cuts = mean cutting planes applied.")
+        rows.append(dict(
+            method=m,
+            n_both_solved=nb,
+            scip_nodes_both=sv_mean, method_nodes_both=mv_mean,
+            reduction_pct_both=red, wilcoxon_p_both=p,
+            pct_solved=pct_solved, pct_timeout=pct_timeout,
+            all_mean=float(v.mean()), all_std=float(v.std()), all_median=float(np.median(v)),
+            mean_gap=mean_gap, mean_gap_closed=mean_gap_closed,
+            mean_time=mean_time, mean_cuts=mean_cuts,
+            mean_lp_solves=mean_lp_solves, mean_lp_time=mean_lp_time,
+        ))
+    print("=" * 110)
+    print(f"(N={n_inst} instances; p = Wilcoxon signed-rank on paired both-solved counts)")
+    print("(reduction > 0 means fewer nodes = better branching efficiency)")
 
-    # Fair comparison: nodes ONLY on instances BOTH scip and the method solved
-    # to optimality. This isolates branching quality from the timeout confound
-    # (a slow per-node method can show fewer nodes just by timing out).
-    if solved is not None:
-        scip_opt = np.asarray(solved["scip"], dtype=bool)
-        print("\nFAIR comparison -- nodes on instances solved to optimality by "
-              "BOTH method and SCIP (the only valid node-count claim):")
-        for m in nodes:
-            if m == "scip":
-                continue
-            mask = scip_opt & np.asarray(solved[m], dtype=bool)
-            nb = int(mask.sum())
-            if nb == 0:
-                print(f"  {m:<16}: no instances solved by both -- inconclusive")
-                continue
-            sv = np.asarray(nodes["scip"], dtype=float)[mask]
-            mv = np.asarray(nodes[m], dtype=float)[mask]
-            red = 100.0 * (sv.mean() - mv.mean()) / max(sv.mean(), 1e-9)
-            p = None
-            if wilcoxon is not None and nb >= 2 and np.any(sv != mv):
-                try:
-                    p = float(wilcoxon(sv, mv).pvalue)
-                except Exception:
-                    p = None
-            pstr = f"p={p:.2e}" if p is not None else ""
-            print(f"  {m:<16}: n={nb:2d}  SCIP {sv.mean():7.0f} vs "
-                  f"{mv.mean():7.0f}  -> {red:+6.1f}%  {pstr}")
-
-    # Headline: best learned config vs every baseline (surfaces the win over
-    # classical heuristics that the SCIP-only column hides).
-    learned = {m: np.mean(nodes[m]) for m in nodes if m in ABLATIONS}
-    if learned:
-        best = min(learned, key=learned.get)
-        bm = learned[best]
-        print(f"\nBest learned config: {best} (mean {bm:.1f} nodes)")
-        for base in ("scip", "random", "most_fractional"):
-            if base in nodes:
-                bmean = float(np.mean(nodes[base]))
-                red = 100.0 * (bmean - bm) / max(bmean, 1e-9)
-                tag = "fewer nodes (better)" if red > 0 else "MORE nodes (worse)"
-                print(f"  vs {base:<16}: {red:+6.1f}%   {tag}")
+    # ---- SECONDARY: all-instance overview ----
+    print("\nSECONDARY — all instances (includes timeouts; interpret with caution)")
+    print(f"{'Method':<16}{'mean±std':>22}{'median':>9}"
+          f"{'gap@end':>10}{'gap_closed':>12}{'time(s)':>10}{'cuts':>8}")
+    print("-" * 90)
+    for r in rows:
+        m = r["method"]
+        gstr  = f"{r['mean_gap']*100:.2f}%" if r.get("mean_gap") is not None and not np.isnan(r["mean_gap"]) else "--"
+        gcstr = f"{r['mean_gap_closed']*100:.1f}%" if r.get("mean_gap_closed") is not None and not np.isnan(r["mean_gap_closed"]) else "--"
+        tstr  = f"{r['mean_time']:.2f}" if r.get("mean_time") is not None else "--"
+        cstr  = f"{r['mean_cuts']:.1f}" if r.get("mean_cuts") is not None else "--"
+        print(f"{m:<16}{r['all_mean']:8.1f} ± {r['all_std']:6.1f}    {r['all_median']:<9.0f}"
+              f"{gstr:>10}{gcstr:>12}{tstr:>10}{cstr:>8}")
 
     if timings:
         _summarize_timings(timings)
