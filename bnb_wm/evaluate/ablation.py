@@ -373,7 +373,7 @@ def run(model, device, configs, n_instances, generator_kwargs,
 
     extra = (["strong_branching"] if strong_branching else []) \
             + (["pseudocost"] if pseudocost else []) \
-            + (["highs_mf"] if highs_baseline else [])
+            + (["highs_mf", "highs_policy", "highs_full_wm"] if highs_baseline else [])
     methods = ["scip"] + extra + list(configs.keys())
     nodes    = {m: [] for m in methods}
     solved   = {m: [] for m in methods}   # solved-to-optimality flags
@@ -383,6 +383,8 @@ def run(model, device, configs, n_instances, generator_kwargs,
     obj_vals = {m: [] for m in methods}   # best incumbent value
     dual_vals= {m: [] for m in methods}   # best dual bound at termination
     root_lps = {m: [] for m in methods}   # LP relaxation at root (before branching)
+    lp_solves= {m: [] for m in methods}   # total LP solves per instance (HiGHS methods only)
+    lp_times = {m: [] for m in methods}   # cumulative LP time per instance (HiGHS methods only)
 
     # Priority 1: per-episode component timing (learned methods only)
     # Each entry is a dict {encode, policy, rollout} in seconds for one instance.
@@ -401,7 +403,8 @@ def run(model, device, configs, n_instances, generator_kwargs,
       for i in range(n_instances):
         instance = next(generator)
 
-        def _append(key, n, opt, t, c, obj, dual, gap, root_lp=float("nan")):
+        def _append(key, n, opt, t, c, obj, dual, gap, root_lp=float("nan"),
+                    lp_s=float("nan"), lp_t=float("nan")):
             nodes[key].append(n)
             solved[key].append(opt)
             times[key].append(t)
@@ -410,6 +413,8 @@ def run(model, device, configs, n_instances, generator_kwargs,
             obj_vals[key].append(obj)
             dual_vals[key].append(dual)
             root_lps[key].append(root_lp)
+            lp_solves[key].append(lp_s)
+            lp_times[key].append(lp_t)
 
         # ---- SCIP default (pseudocost) ----
         m = instance.copy_orig().as_pyscipopt()
@@ -442,35 +447,41 @@ def run(model, device, configs, n_instances, generator_kwargs,
             mp.optimize()
             _append("pseudocost", *_scip_metrics(mp, 0))
 
-        # ---- HiGHS most-fractional baseline (same Python overhead as model) ----
+        # ---- HiGHS fair baselines (same Python+LP overhead as model) ----
+        # Three variants sharing the same BnBSolver Python loop:
+        #   highs_mf       : most-fractional branching (no model)  -- dumb baseline
+        #   highs_policy   : learned policy, no rollout             -- policy contribution
+        #   highs_full_wm  : full world model (policy + rollout)    -- full contribution
+        # All use cut_mode="none" to isolate branching; cuts are a separate axis.
         if highs_baseline:
             abc = _instance_to_abc(instance)
-            if abc is not None:
-                A, b, c = abc
-                mf_solver = BnBSolver(
-                    model, device,
-                    time_limit=time_limit,
-                    node_limit=500_000,
-                    cut_mode="none",
-                )
-                mf_solver.branch_mode = "most_fractional"
-                t0 = time.perf_counter()
-                try:
-                    res = mf_solver.solve(A, b, c)
-                    mf_t = time.perf_counter() - t0
-                    mf_opt = (res.status == "optimal")
-                    mf_obj = float(res.objective)
-                    mf_dual = float(res.objective) if mf_opt else float("nan")
-                    mf_gap = float(res.optimality_gap)
-                    _append("highs_mf", res.n_nodes, mf_opt, mf_t, -1,
-                            mf_obj, mf_dual, mf_gap)
-                except Exception as e:
-                    print(f"  [highs_mf] instance {i+1} failed: {e}")
-                    _append("highs_mf", 0, False, float("nan"), -1,
+            for hname, hmode in (("highs_mf",      "most_fractional"),
+                                  ("highs_policy",  "policy"),
+                                  ("highs_full_wm", "rollout")):
+                if abc is not None:
+                    A_h, b_h, c_h = abc
+                    hs = BnBSolver(
+                        model, device,
+                        time_limit=time_limit,
+                        node_limit=500_000,
+                        cut_mode="none",
+                    )
+                    hs.branch_mode = hmode
+                    try:
+                        res = hs.solve(A_h, b_h, c_h)
+                        h_opt = (res.status == "optimal")
+                        h_obj = float(res.objective)
+                        h_dual = h_obj if h_opt else float("nan")
+                        _append(hname, res.n_nodes, h_opt, res.solve_time, -1,
+                                h_obj, h_dual, float(res.optimality_gap),
+                                lp_s=res.lp_solves, lp_t=res.lp_time)
+                    except Exception as e:
+                        print(f"  [{hname}] instance {i+1} failed: {e}")
+                        _append(hname, 0, False, float("nan"), -1,
+                                float("nan"), float("nan"), float("nan"))
+                else:
+                    _append(hname, 0, False, float("nan"), -1,
                             float("nan"), float("nan"), float("nan"))
-            else:
-                _append("highs_mf", 0, False, float("nan"), -1,
-                        float("nan"), float("nan"), float("nan"))
 
         # ---- each learned config ----
         for name, cfg in configs.items():
@@ -550,13 +561,15 @@ def run(model, device, configs, n_instances, generator_kwargs,
         obj_vals[m]  = obj_vals[m][:done_n]
         dual_vals[m] = dual_vals[m][:done_n]
         root_lps[m]  = root_lps[m][:done_n]
+        lp_solves[m] = lp_solves[m][:done_n]
+        lp_times[m]  = lp_times[m][:done_n]
     for m in timings:
         timings[m] = timings[m][:done_n]
     for m in rollout_acc:
         rollout_acc[m] = rollout_acc[m][:done_n]
     print(f"  (* = hit time/node limit, NOT solved to optimality) "
           f"[{done_n} instances completed]")
-    return nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps, timings, rollout_acc
+    return nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps, timings, rollout_acc, lp_solves, lp_times
 
 
 def _nanmean(x):
@@ -593,7 +606,7 @@ def _summarize_rollout_accuracy(rollout_acc):
         return
     print("\n--- Rollout prediction accuracy (predicted score vs actual ΔLB) ---")
     print(f"{'Method':<20}{'n_pairs':<10}{'mean|err|':<12}{'spearman':<12}"
-          f"{'top1_rate':<12}")
+          f"{'sign_agree':<12}")
     print("-" * 65)
 
     try:
@@ -622,16 +635,16 @@ def _summarize_rollout_accuracy(rollout_acc):
         # We only have the chosen candidate per node, so instead check if
         # predicted_score > 0 correlates with actual_delta_lb > 0.
         pos_agree = int(np.sum((preds > 0) == (actual > 0)))
-        top1_rate = pos_agree / len(preds) if len(preds) > 0 else float("nan")
+        sign_agree = pos_agree / len(preds) if len(preds) > 0 else float("nan")
 
-        print(f"{name:<20}{len(preds):<10}{mae:<12.4f}{rho:<12.4f}{top1_rate:<12.3f}")
+        print(f"{name:<20}{len(preds):<10}{mae:<12.4f}{rho:<12.4f}{sign_agree:<12.3f}")
     print("(mae = mean absolute error between predicted rollout score and actual ΔLB)")
-    print("(top1_rate = fraction where sign(predicted) == sign(actual ΔLB))")
+    print("(sign_agree = fraction where sign(predicted_score) == sign(actual ΔLB))")
 
 
 def summarize(nodes, solved=None, times=None, cuts=None,
               gaps=None, obj_vals=None, dual_vals=None, root_lps=None,
-              timings=None, rollout_acc=None):
+              timings=None, rollout_acc=None, lp_solves=None, lp_times=None):
     """Print and return a per-method summary vs. SCIP with Wilcoxon significance.
 
     Reports: nodes, node reduction vs SCIP, % solved, mean gap at termination,
@@ -675,10 +688,13 @@ def summarize(nodes, solved=None, times=None, cuts=None,
                     p = float(wilcoxon(scip, v).pvalue)
                 except Exception:
                     p = None
+        mean_lp_solves = _nanmean(lp_solves[m]) if lp_solves is not None else None
+        mean_lp_time   = _nanmean(lp_times[m])  if lp_times  is not None else None
         rows.append(dict(method=m, mean=mean, std=std, median=med,
                          reduction_pct=red, wilcoxon_p=p, pct_solved=pct_solved,
                          mean_gap=mean_gap, mean_gap_closed=mean_gap_closed,
-                         mean_time=mean_time, mean_cuts=mean_cuts))
+                         mean_time=mean_time, mean_cuts=mean_cuts,
+                         mean_lp_solves=mean_lp_solves, mean_lp_time=mean_lp_time))
         pstr  = f"{p:.2e}" if p is not None else "--"
         sstr  = f"{pct_solved:.0f}%" if pct_solved is not None else "--"
         gstr  = f"{mean_gap*100:.2f}%" if mean_gap is not None and not np.isnan(mean_gap) else "--"
@@ -832,7 +848,8 @@ def main():
                 if args.skip_confident is not None:
                     cfg["skip_confident"] = args.skip_confident
 
-    nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps, timings, rollout_acc = run(
+    nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps, \
+        timings, rollout_acc, lp_solves, lp_times = run(
         model, device, configs,
         n_instances=args.n_instances,
         generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
@@ -842,7 +859,8 @@ def main():
         highs_baseline=args.highs_baseline,
     )
     summary = summarize(nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps,
-                        timings=timings, rollout_acc=rollout_acc)
+                        timings=timings, rollout_acc=rollout_acc,
+                        lp_solves=lp_solves, lp_times=lp_times)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -850,6 +868,7 @@ def main():
                "cuts": cuts, "gaps": gaps, "obj_vals": obj_vals,
                "dual_vals": dual_vals, "root_lps": root_lps,
                "timings": timings, "rollout_acc": rollout_acc,
+               "lp_solves": lp_solves, "lp_times": lp_times,
                "summary": summary, "config": vars(args)},
               open(out, "w"), indent=2)
     print(f"\nSaved raw counts + summary to {out}")

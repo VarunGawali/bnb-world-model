@@ -78,6 +78,8 @@ class SolveResult:
     n_nodes: int
     solve_time: float
     optimality_gap: float
+    lp_solves: int = 0    # total LP relaxations solved (root + one per node + cut re-solves)
+    lp_time: float = 0.0  # cumulative wall time inside _solve_lp (seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +203,8 @@ class BnBSolver:
         # solver object over many instances).
         self._gomory_pool = None
         self._cuts_added = 0
+        self._lp_count = 0
+        self._lp_time = 0.0
 
         # Root LP
         root_lb_arr = np.zeros(n, dtype=np.float64)
@@ -211,7 +215,8 @@ class BnBSolver:
 
         if not feasible:
             return SolveResult("infeasible", np.inf, None, 0,
-                               time.perf_counter() - t_start, np.inf)
+                               time.perf_counter() - t_start, np.inf,
+                               lp_solves=self._lp_count, lp_time=self._lp_time)
 
         # Encode root node
         h_vars, z = self._encode_node(A, b, c, x_lp, dual, root_lb_arr, root_ub_arr, [])
@@ -232,7 +237,8 @@ class BnBSolver:
         if self._is_integral(x_lp):
             sol = np.round(x_lp)
             return SolveResult("optimal", lp_obj, sol, 1,
-                               time.perf_counter() - t_start, 0.0)
+                               time.perf_counter() - t_start, 0.0,
+                               lp_solves=self._lp_count, lp_time=self._lp_time)
 
         # Initialise tree
         root_node = Node(
@@ -425,6 +431,8 @@ class BnBSolver:
             n_nodes=n_nodes,
             solve_time=time.perf_counter() - t_start,
             optimality_gap=gap,
+            lp_solves=self._lp_count,
+            lp_time=self._lp_time,
         )
 
     # ------------------------------------------------------------------
@@ -470,14 +478,18 @@ class BnBSolver:
         b_all  = np.concatenate(b_rows).astype(np.float64)
         m_all  = len(b_all)
 
+        _t0 = time.perf_counter()
         if self._use_highs_direct:
-            return self._solve_lp_highs(
+            result = self._solve_lp_highs(
                 c, A_all, b_all, var_lb, var_ub, m_orig, warm_basis
             )
         else:
-            return self._solve_lp_scipy(
+            result = self._solve_lp_scipy(
                 c, A_all, b_all, var_lb, var_ub, m_orig
             )
+        self._lp_count += 1
+        self._lp_time += time.perf_counter() - _t0
+        return result
 
     def _solve_lp_highs(
         self,
