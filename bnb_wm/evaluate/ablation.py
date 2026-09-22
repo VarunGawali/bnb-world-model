@@ -246,7 +246,7 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0,
         })
 
     a_emb = h_vars[best_action].unsqueeze(0)
-    _, past_tokens = model.dynamics_step(z, a_emb, past_tokens)
+    past_tokens = model.dynamics_step(z, a_emb, past_tokens)[1]
     return best_action, past_tokens
 
 
