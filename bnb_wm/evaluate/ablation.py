@@ -27,7 +27,9 @@ Usage:
 import argparse
 import json
 import time
+from collections import defaultdict
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -95,8 +97,19 @@ class _NodeDepth:
             return 0
 
 
-def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
-    """Pick a branching variable under one ablation config; returns (action, tokens)."""
+def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0,
+                 timing_acc=None, rollout_preds=None):
+    """Pick a branching variable under one ablation config.
+
+    Args:
+        timing_acc   : dict accumulator for component times (seconds); mutated in place.
+                       Keys: 'encode', 'policy', 'rollout'.  Pass None to skip timing.
+        rollout_preds: list accumulator for (predicted_score, chosen_var_idx) tuples
+                       used later to compare against actual child LP bounds.
+
+    Returns:
+        (action, past_tokens)
+    """
     mode = cfg["mode"]
 
     # --- classical baselines: no model needed, short-circuit before encoding ---
@@ -104,29 +117,47 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
         return int(np.random.choice(action_set)), past_tokens
     if mode == "most_fractional":
         var_mask = batch.node_type == 0
-        vf = batch.x[var_mask]                       # [n_vars, 19]
-        # Ecole layout: column 14 = sol_frac = |x - round(x)| in [0, 0.5];
-        # most-fractional = largest sol_frac among the candidates.
+        vf = batch.x[var_mask]
         frac = vf[:, 14] if vf.size(1) > 14 else torch.zeros(vf.size(0), device=device)
         aset_t = torch.tensor(action_set, dtype=torch.long, device=device)
         best = int(aset_t[int(frac[aset_t].argmax())])
         return best, past_tokens
 
     # --- learned policy / rollout ---
+    # Priority 1: time GNN encode
+    if timing_acc is not None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t0 = perf_counter()
+
     h_vars, z = model.encode(batch)
+
+    if timing_acc is not None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timing_acc["encode"] += perf_counter() - t0
+
     var_mask  = batch.node_type == 0
     var_batch = batch.batch[var_mask]
+
+    # Priority 1: time policy head
+    if timing_acc is not None:
+        t0 = perf_counter()
 
     scores_all = model.policy_scores(h_vars, z, var_batch)
     aset_t = torch.tensor(action_set, dtype=torch.long, device=device)
     masked = torch.full_like(scores_all, -1e4)
     masked[aset_t] = scores_all[aset_t]
 
-    # Policy-only, or near-leaf shortcut: take the top policy score.
+    if timing_acc is not None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timing_acc["policy"] += perf_counter() - t0
+
     if cfg["mode"] == "policy":
         return int(masked.argmax()), past_tokens
 
-    # Real depth + n_frac for the integrality gate (match Phase-4 training inputs).
+    # Integrality gate
     x_var = batch.x[var_mask]
     n_frac_val = float((x_var[:, 14] > 0.05).sum()) if x_var.size(1) > 14 else 0.0
     depth_t = torch.tensor([float(depth)], device=device)
@@ -135,15 +166,18 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
     if leaf_prob > _LEAF_SKIP:
         return int(masked.argmax()), past_tokens
 
-    # Confidence gate: skip the (expensive) rollout when the policy is already
-    # confident. If the softmax mass on the top candidate exceeds the threshold,
-    # the lookahead almost always agrees, so take the policy pick directly. This
-    # removes the rollout on the majority of nodes -> large per-node speedup.
+    # Confidence gate
     conf = cfg.get("skip_confident")
     if conf is not None:
         p_top = float(torch.softmax(scores_all[aset_t], dim=0).max())
         if p_top >= conf:
             return int(masked.argmax()), past_tokens
+
+    # Priority 1: time rollout
+    if timing_acc is not None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t0 = perf_counter()
 
     k = min(cfg["k"], len(action_set))
     top_k = masked.topk(k).indices
@@ -161,15 +195,16 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
             use_reward_return=cfg["use_reward_return"],
         ))
 
+    if timing_acc is not None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timing_acc["rollout"] += perf_counter() - t0
+
     lam = cfg.get("anchor_lambda")
     if lam is None:
-        # Original behaviour: branch on the max-return candidate.
-        best_action = int(top_k[int(np.argmax(rets))])
+        best_idx = int(np.argmax(rets))
+        best_action = int(top_k[best_idx])
     else:
-        # Policy-anchored selection: blend the policy's prior with the rollout
-        # return so the latent lookahead REFINES rather than overrides the
-        # policy. Both signals are standardized across the candidate set so
-        # lambda is scale-invariant (lambda=0 recovers the pure policy order).
         pol = np.array([masked[int(c)].item() for c in top_k], dtype=float)
         ret = np.array(rets, dtype=float)
 
@@ -178,7 +213,16 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0):
             return (x - x.mean()) / s if s > 1e-8 else np.zeros_like(x)
 
         final = _z(pol) + lam * _z(ret)
-        best_action = int(top_k[int(np.argmax(final))])
+        best_idx = int(np.argmax(final))
+        best_action = int(top_k[best_idx])
+
+    # Priority 2: record predicted rollout score for chosen action
+    if rollout_preds is not None:
+        rollout_preds.append({
+            "chosen_var": best_action,
+            "predicted_score": float(rets[best_idx]),
+            "n_candidates": k,
+        })
 
     a_emb = h_vars[best_action].unsqueeze(0)
     _, past_tokens = model.dynamics_step(z, a_emb, past_tokens)
@@ -286,6 +330,17 @@ def run(model, device, configs, n_instances, generator_kwargs,
     obj_vals = {m: [] for m in methods}   # best incumbent value
     dual_vals= {m: [] for m in methods}   # best dual bound at termination
     root_lps = {m: [] for m in methods}   # LP relaxation at root (before branching)
+
+    # Priority 1: per-episode component timing (learned methods only)
+    # Each entry is a dict {encode, policy, rollout} in seconds for one instance.
+    timings  = {m: [] for m in methods if m not in ("scip", "strong_branching",
+                                                      "pseudocost", "random",
+                                                      "most_fractional")}
+
+    # Priority 2: rollout prediction accuracy
+    # List of dicts per instance: predicted_score, actual_child_dual, error
+    rollout_acc = {m: [] for m in timings}
+
     model.eval()
 
     print(f"Evaluating {n_instances} instances | methods: {methods}\n")
@@ -338,17 +393,60 @@ def run(model, device, configs, n_instances, generator_kwargs,
         for name, cfg in configs.items():
             obs, action_set, _, done, info = env.reset(instance.copy_orig())
             root_lp = _root_dual(env)   # LP relaxation before first branch
+
+            # Priority 1: initialise per-episode timing accumulator
+            ep_timing = {"encode": 0.0, "policy": 0.0, "rollout": 0.0}
+            use_timing = name in timings
+
+            # Priority 2: rollout prediction store
+            ep_rollout_preds = [] if name in rollout_acc else None
+            ep_rollout_pairs = []   # (predicted_score, actual_child_dual)
+
             steps, past = 0, None
             with torch.no_grad():
                 while not done and action_set is not None and len(action_set) > 0:
                     batch = _format_obs(obs, device)
                     depth = int(info.get("depth", 0)) if isinstance(info, dict) else 0
+
+                    # Pre-step dual bound (= current LP bound before branching)
+                    pre_dual = float("nan")
+                    if ep_rollout_preds is not None and cfg.get("mode") == "rollout":
+                        try:
+                            pre_dual = float(env.model.as_pyscipopt().getDualbound())
+                        except Exception:
+                            pass
+
                     action, past = _pick_action(
-                        model, batch, action_set, device, cfg, past, depth=depth
+                        model, batch, action_set, device, cfg, past, depth=depth,
+                        timing_acc=ep_timing if use_timing else None,
+                        rollout_preds=ep_rollout_preds,
                     )
                     obs, action_set, _, done, info = env.step(action)
                     steps += 1
+
+                    # Priority 2: post-step dual = actual child LP bound
+                    if ep_rollout_preds and not np.isnan(pre_dual):
+                        pred = ep_rollout_preds[-1]
+                        try:
+                            post_dual = float(env.model.as_pyscipopt().getDualbound())
+                            actual_delta = post_dual - pre_dual
+                            ep_rollout_pairs.append({
+                                "predicted_score": pred["predicted_score"],
+                                "actual_delta_lb": actual_delta,
+                                "n_candidates": pred["n_candidates"],
+                            })
+                        except Exception:
+                            pass
+
             _append(name, *_episode_stats(env, steps), root_lp=root_lp)
+
+            # Priority 1: store per-episode timing summary
+            if use_timing:
+                timings[name].append(ep_timing)
+
+            # Priority 2: store rollout accuracy pairs for this instance
+            if name in rollout_acc:
+                rollout_acc[name].append(ep_rollout_pairs)
 
         row = " | ".join(
             f"{m}:{nodes[m][-1]}{'' if solved[m][-1] else '*'}" for m in methods
@@ -369,9 +467,13 @@ def run(model, device, configs, n_instances, generator_kwargs,
         obj_vals[m]  = obj_vals[m][:done_n]
         dual_vals[m] = dual_vals[m][:done_n]
         root_lps[m]  = root_lps[m][:done_n]
+    for m in timings:
+        timings[m] = timings[m][:done_n]
+    for m in rollout_acc:
+        rollout_acc[m] = rollout_acc[m][:done_n]
     print(f"  (* = hit time/node limit, NOT solved to optimality) "
           f"[{done_n} instances completed]")
-    return nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps
+    return nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps, timings, rollout_acc
 
 
 def _nanmean(x):
@@ -380,8 +482,73 @@ def _nanmean(x):
     return float(x.mean()) if x.size else float("nan")
 
 
+def _summarize_timings(timings):
+    """Print component timing breakdown for learned methods."""
+    if not timings:
+        return
+    print("\n--- Component timing breakdown (learned methods) ---")
+    print(f"{'Method':<20}{'encode(s)':<12}{'policy(s)':<12}{'rollout(s)':<12}"
+          f"{'model_total(s)':<16}{'encode%':<10}{'rollout%':<10}")
+    print("-" * 90)
+    for name, eps in timings.items():
+        if not eps:
+            continue
+        enc = np.mean([e["encode"]  for e in eps])
+        pol = np.mean([e["policy"]  for e in eps])
+        rol = np.mean([e["rollout"] for e in eps])
+        tot = enc + pol + rol
+        enc_pct = 100 * enc / tot if tot > 0 else 0
+        rol_pct = 100 * rol / tot if tot > 0 else 0
+        print(f"{name:<20}{enc:<12.3f}{pol:<12.3f}{rol:<12.3f}"
+              f"{tot:<16.3f}{enc_pct:<10.1f}{rol_pct:<10.1f}")
+    print("(times are mean per-instance totals across all branching nodes)")
+
+
+def _summarize_rollout_accuracy(rollout_acc):
+    """Print world-model prediction accuracy vs actual child LP bound."""
+    if not rollout_acc:
+        return
+    print("\n--- Rollout prediction accuracy (predicted score vs actual ΔLB) ---")
+    print(f"{'Method':<20}{'n_pairs':<10}{'mean|err|':<12}{'spearman':<12}"
+          f"{'top1_rate':<12}")
+    print("-" * 65)
+
+    try:
+        from scipy.stats import spearmanr
+    except ImportError:
+        spearmanr = None
+
+    for name, instances in rollout_acc.items():
+        pairs = [p for ep in instances for p in ep]
+        if not pairs:
+            print(f"{name:<20}{'no data'}")
+            continue
+        preds  = np.array([p["predicted_score"] for p in pairs])
+        actual = np.array([p["actual_delta_lb"]  for p in pairs])
+        mae = float(np.mean(np.abs(preds - actual)))
+
+        rho = float("nan")
+        if spearmanr is not None and len(preds) >= 4:
+            try:
+                rho = float(spearmanr(preds, actual).statistic)
+            except Exception:
+                pass
+
+        # top-1 rate: among pairs where n_candidates > 1, was the chosen
+        # (max-score) candidate also the one with the highest actual ΔLB?
+        # We only have the chosen candidate per node, so instead check if
+        # predicted_score > 0 correlates with actual_delta_lb > 0.
+        pos_agree = int(np.sum((preds > 0) == (actual > 0)))
+        top1_rate = pos_agree / len(preds) if len(preds) > 0 else float("nan")
+
+        print(f"{name:<20}{len(preds):<10}{mae:<12.4f}{rho:<12.4f}{top1_rate:<12.3f}")
+    print("(mae = mean absolute error between predicted rollout score and actual ΔLB)")
+    print("(top1_rate = fraction where sign(predicted) == sign(actual ΔLB))")
+
+
 def summarize(nodes, solved=None, times=None, cuts=None,
-              gaps=None, obj_vals=None, dual_vals=None, root_lps=None):
+              gaps=None, obj_vals=None, dual_vals=None, root_lps=None,
+              timings=None, rollout_acc=None):
     """Print and return a per-method summary vs. SCIP with Wilcoxon significance.
 
     Reports: nodes, node reduction vs SCIP, % solved, mean gap at termination,
@@ -486,6 +653,12 @@ def summarize(nodes, solved=None, times=None, cuts=None,
                 red = 100.0 * (bmean - bm) / max(bmean, 1e-9)
                 tag = "fewer nodes (better)" if red > 0 else "MORE nodes (worse)"
                 print(f"  vs {base:<16}: {red:+6.1f}%   {tag}")
+
+    if timings:
+        _summarize_timings(timings)
+    if rollout_acc:
+        _summarize_rollout_accuracy(rollout_acc)
+
     return rows
 
 
@@ -572,7 +745,7 @@ def main():
                 if args.skip_confident is not None:
                     cfg["skip_confident"] = args.skip_confident
 
-    nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps = run(
+    nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps, timings, rollout_acc = run(
         model, device, configs,
         n_instances=args.n_instances,
         generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
@@ -580,13 +753,15 @@ def main():
         time_limit=args.time_limit, seed=args.seed, separate=args.separate,
         strong_branching=args.strong_branching, pseudocost=args.pseudocost,
     )
-    summary = summarize(nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps)
+    summary = summarize(nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps,
+                        timings=timings, rollout_acc=rollout_acc)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     json.dump({"per_instance": nodes, "solved": solved, "times": times,
                "cuts": cuts, "gaps": gaps, "obj_vals": obj_vals,
                "dual_vals": dual_vals, "root_lps": root_lps,
+               "timings": timings, "rollout_acc": rollout_acc,
                "summary": summary, "config": vars(args)},
               open(out, "w"), indent=2)
     print(f"\nSaved raw counts + summary to {out}")
