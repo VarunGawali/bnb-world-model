@@ -166,9 +166,9 @@ class BnBSolver:
             self._highs = highspy
         except ImportError:
             self._highs = None
-        # Enable HiGHS-direct LP path (with warm-starting) when highspy is present.
-        # The old default of False silently disabled warm-starting even when highspy
-        # was installed, costing ~5-10x more simplex pivots per node.
+        # Attempt HiGHS-direct path (warm-starting). Falls back to scipy
+        # automatically on the first LP call if the installed version's API
+        # differs (see _solve_lp).
         self._use_highs_direct = self._highs is not None
 
         # P2.1: cut generation needs HiGHS (for the LP basis). If cuts are
@@ -485,9 +485,17 @@ class BnBSolver:
 
         _t0 = time.perf_counter()
         if self._use_highs_direct:
-            result = self._solve_lp_highs(
-                c, A_all, b_all, var_lb, var_ub, m_orig, warm_basis
-            )
+            try:
+                result = self._solve_lp_highs(
+                    c, A_all, b_all, var_lb, var_ub, m_orig, warm_basis
+                )
+            except Exception:
+                # HiGHS API mismatch (e.g. changeColsCostByRange missing in this
+                # version) — fall back to scipy for the rest of this solve.
+                self._use_highs_direct = False
+                result = self._solve_lp_scipy(
+                    c, A_all, b_all, var_lb, var_ub, m_orig
+                )
         else:
             result = self._solve_lp_scipy(
                 c, A_all, b_all, var_lb, var_ub, m_orig

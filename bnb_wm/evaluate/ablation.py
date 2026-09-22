@@ -205,14 +205,16 @@ def _pick_action(model, batch, action_set, device, cfg, past_tokens, depth=0,
 
     rets = []
     for cand in top_k:
-        rets.append(model.rollout_candidate_batched(
+        r = model.rollout_candidate_batched(
             z, h_vars, int(cand),
             depth=cfg["depth"], gamma=cfg["gamma"],
             valid_mask=valid_mask, past_tokens=past_tokens,
             size_weight=0.0, ctg_weight=cfg["ctg_weight"],
             branch_factor=cfg["branch_factor"],
             use_reward_return=cfg["use_reward_return"],
-        ))
+        )
+        # Ensure scalar float so np.argmax works on CPU and CUDA alike
+        rets.append(float(r) if not isinstance(r, float) else r)
 
     if timing_acc is not None:
         if device.type == "cuda":
