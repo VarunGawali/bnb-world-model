@@ -83,6 +83,12 @@ BASELINES = {
 }
 _LEAF_SKIP = 0.8
 
+# Instance size tiers.  --tiers medium hard  runs both in one invocation.
+TIERS = {
+    "medium": dict(n_rows=500,  n_cols=1000, time_limit=60),
+    "hard":   dict(n_rows=1000, n_cols=2000, time_limit=120),
+}
+
 
 # ---------------------------------------------------------------------------
 # Parameterized branching-variable selection
@@ -767,7 +773,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--config", default="configs/default.yaml")
-    ap.add_argument("--n_instances", type=int, default=100)
+    ap.add_argument("--tiers", nargs="+", default=None,
+                    choices=list(TIERS), metavar="TIER",
+                    help="run one or more named instance tiers in a single invocation "
+                         f"({', '.join(TIERS)}). Each tier saves its own JSON and "
+                         "prints its own summary. Overrides --n_rows/--n_cols/--time_limit.")
+    ap.add_argument("--n_instances", type=int, default=50)
     ap.add_argument("--n_rows", type=int, default=500)
     ap.add_argument("--n_cols", type=int, default=1000)
     ap.add_argument("--density", type=float, default=0.05)
@@ -850,30 +861,66 @@ def main():
                 if args.skip_confident is not None:
                     cfg["skip_confident"] = args.skip_confident
 
-    nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps, \
-        timings, rollout_acc, lp_solves, lp_times = run(
-        model, device, configs,
-        n_instances=args.n_instances,
-        generator_kwargs=dict(n_rows=args.n_rows, n_cols=args.n_cols,
-                              density=args.density),
-        time_limit=args.time_limit, seed=args.seed, separate=args.separate,
-        strong_branching=args.strong_branching, pseudocost=args.pseudocost,
-        highs_baseline=args.highs_baseline,
-    )
-    summary = summarize(nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps,
-                        timings=timings, rollout_acc=rollout_acc,
-                        lp_solves=lp_solves, lp_times=lp_times)
+    # Build tier list: explicit --tiers wins; otherwise a single tier from
+    # --n_rows/--n_cols/--time_limit (named "custom").
+    if args.tiers:
+        tier_cfgs = {t: dict(TIERS[t], density=args.density) for t in args.tiers}
+    else:
+        tier_cfgs = {"custom": dict(n_rows=args.n_rows, n_cols=args.n_cols,
+                                    time_limit=args.time_limit, density=args.density)}
 
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    json.dump({"per_instance": nodes, "solved": solved, "times": times,
-               "cuts": cuts, "gaps": gaps, "obj_vals": obj_vals,
-               "dual_vals": dual_vals, "root_lps": root_lps,
-               "timings": timings, "rollout_acc": rollout_acc,
-               "lp_solves": lp_solves, "lp_times": lp_times,
-               "summary": summary, "config": vars(args)},
-              open(out, "w"), indent=2)
-    print(f"\nSaved raw counts + summary to {out}")
+    out_base = Path(args.out)
+    all_results = {}
+
+    for tier_name, tier_kw in tier_cfgs.items():
+        t_limit    = tier_kw.pop("time_limit", args.time_limit)
+        t_density  = tier_kw.pop("density", args.density)
+        gkw        = dict(n_rows=tier_kw["n_rows"], n_cols=tier_kw["n_cols"],
+                          density=t_density)
+
+        print(f"\n{'='*60}")
+        print(f"TIER: {tier_name.upper()}  "
+              f"({gkw['n_rows']}×{gkw['n_cols']}, time_limit={t_limit}s, "
+              f"n={args.n_instances})")
+        print(f"{'='*60}")
+
+        nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps, \
+            timings, rollout_acc, lp_solves, lp_times = run(
+            model, device, configs,
+            n_instances=args.n_instances,
+            generator_kwargs=gkw,
+            time_limit=t_limit, seed=args.seed, separate=args.separate,
+            strong_branching=args.strong_branching, pseudocost=args.pseudocost,
+            highs_baseline=args.highs_baseline,
+        )
+        summary = summarize(nodes, solved, times, cuts, gaps, obj_vals, dual_vals, root_lps,
+                            timings=timings, rollout_acc=rollout_acc,
+                            lp_solves=lp_solves, lp_times=lp_times)
+
+        # Save per-tier JSON alongside the base output path.
+        # e.g. --out results/final.json → results/final_medium.json
+        if tier_name == "custom":
+            out_path = out_base
+        else:
+            out_path = out_base.with_stem(out_base.stem + f"_{tier_name}")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tier_record = {
+            "tier": tier_name, "generator": gkw, "time_limit": t_limit,
+            "per_instance": nodes, "solved": solved, "times": times,
+            "cuts": cuts, "gaps": gaps, "obj_vals": obj_vals,
+            "dual_vals": dual_vals, "root_lps": root_lps,
+            "timings": timings, "rollout_acc": rollout_acc,
+            "lp_solves": lp_solves, "lp_times": lp_times,
+            "summary": summary, "config": vars(args),
+        }
+        json.dump(tier_record, open(out_path, "w"), indent=2)
+        print(f"\nSaved {tier_name} results → {out_path}")
+        all_results[tier_name] = tier_record
+
+    if len(tier_cfgs) > 1:
+        combined_path = out_base.with_stem(out_base.stem + "_all_tiers")
+        json.dump(all_results, open(combined_path, "w"), indent=2)
+        print(f"\nCombined all-tier results → {combined_path}")
 
 
 if __name__ == "__main__":
