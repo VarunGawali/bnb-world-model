@@ -98,4 +98,16 @@ def load_weights_only(model, path, device=None):
         raise RuntimeError(f"[load_weights_only] unexpected keys: {unexpected}")
     if missing:
         print(f"[load_weights_only] zero-init kept for: {missing}")
+
+    # Sanitize encoder std buffers: checkpoints saved before the clamp was
+    # added may contain literal zeros, which cause divide-by-zero in forward.
+    enc = model.encoder
+    n_zero_var = (enc.var_std == 0).sum().item()
+    n_zero_con = (enc.con_std == 0).sum().item()
+    if n_zero_var or n_zero_con:
+        enc.var_std.clamp_(min=1e-6)
+        enc.con_std.clamp_(min=1e-6)
+        print(f"[load_weights_only] clamped {n_zero_var} zero var_std "
+              f"and {n_zero_con} zero con_std entries to 1e-6")
+
     return model
