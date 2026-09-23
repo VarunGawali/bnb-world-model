@@ -74,8 +74,21 @@ def load_weights_only(model, path, device=None):
     Returns:
         model (in-place modified)
     """
+    from bnb_wm.model.dynamics import _VarDynamics
+
     ckpt = torch.load(path, map_location=device or "cpu", weights_only=False)
     state = ckpt["model"] if "model" in ckpt else ckpt
     state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
-    model.load_state_dict(state)
+
+    # Migrate legacy _VarDynamics checkpoint (net.0/net.3) to decomposed form.
+    if any("var_dynamics.net." in k for k in state):
+        _, state = _VarDynamics.from_legacy_state(
+            state, hidden_dim=model.dynamics.hidden_dim
+        )
+
+    missing, unexpected = model.load_state_dict(state, strict=True)
+    if missing:
+        raise RuntimeError(f"[load_weights_only] missing keys after migration: {missing}")
+    if unexpected:
+        raise RuntimeError(f"[load_weights_only] unexpected keys: {unexpected}")
     return model
