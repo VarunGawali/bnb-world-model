@@ -55,20 +55,18 @@ import numpy as np
 import torch
 
 from bnb_wm.features import (
-    var_features, con_features, edge_arrays, sol_from_highs,
+    var_features, con_features, edge_arrays,
 )
 from bnb_wm.solver.config import SolverConfig
+from bnb_wm.solver.lp_backend import LPBackend, CutRecord
 
 
 # ---------------------------------------------------------------------------
 # Records
 # ---------------------------------------------------------------------------
 
-@dataclass
-class CutData:
-    lhs: np.ndarray
-    rhs: float
-    cut_type: str = "gomory"
+# Alias so existing internal code (e.g. _cut_pool) still works unchanged.
+CutData = CutRecord
 
 
 @dataclass(order=False)
@@ -172,7 +170,7 @@ class NeuralBnBSolver:
         self._m0, self._n = A.shape
 
         self._reset_instance_state()
-        self._lp_init()
+        self._lp_init()  # creates self._lp
 
         root_lb = np.zeros(self._n)
         root_ub = np.ones(self._n)
@@ -352,17 +350,11 @@ class NeuralBnBSolver:
     # ==================================================================
 
     def _reset_instance_state(self):
-        self._lp_model = None
-        self._cur_lb = None
-        self._cur_ub = None
-        self._committed_cuts: list[CutData] = []
+        self._lp: Optional[LPBackend] = None
         self._gomory_pool: Optional[list[CutData]] = None
         self._struct_cache = None
-        self._struct_version = -1
         self._pending_root_lp = None
         self._last_cut_gain = float("inf")
-        self._lp_count = 0
-        self._lp_time = 0.0
         self._timing = {"encode": 0.0, "branch": 0.0, "rollout": 0.0,
                         "cutbeam": 0.0, "lp": 0.0}
         self._diag = {
@@ -377,126 +369,47 @@ class NeuralBnBSolver:
         }
 
     def _result(self, status, obj, sol, n_nodes, t0, gap) -> SolveResult:
+        lp = self._lp
         return SolveResult(
             status=status, objective=obj, solution=sol, n_nodes=n_nodes,
             solve_time=time.perf_counter() - t0, optimality_gap=gap,
-            lp_solves=self._lp_count, lp_time=self._lp_time,
+            lp_solves=lp.lp_count if lp else 0,
+            lp_time=lp.lp_time if lp else 0.0,
             model_time=sum(v for k, v in self._timing.items() if k != "lp"),
-            cuts_added=len(self._committed_cuts),
+            cuts_added=len(lp.committed_cuts) if lp else 0,
             is_exact=self.cfg.is_exact,
             diagnostics={**self._diag, "timing": dict(self._timing),
                          "config": self.cfg.to_dict()},
         )
 
     # ==================================================================
-    # LP layer
+    # LP layer  (delegated to LPBackend)
     # ==================================================================
 
     def _lp_init(self):
-        hs = self._highs
-        h = hs.Highs()
-        h.setOptionValue("output_flag", False)
-        h.setOptionValue("presolve", "off")
-
-        n, m = self._n, self._m0
-        lb = np.zeros(n, dtype=np.float64)
-        ub = np.ones(n, dtype=np.float64)
-        h.addVars(n, lb, ub)
-        col_idx = np.arange(n, dtype=np.int32)
-        h.changeColsCost(n, col_idx, self._c)
-
-        inf = hs.kHighsInf
-        for i in range(m):
-            idx = np.where(np.abs(self._A[i]) > 1e-12)[0]
-            if len(idx) == 0:
-                continue
-            h.addRow(float(self._b[i]), inf, len(idx),
-                     idx.astype(np.int32), self._A[i, idx].astype(np.float64))
-
-        self._lp_model = h
-        self._cur_lb = lb.copy()
-        self._cur_ub = ub.copy()
-        self._n_rows = m
-
-    def _lp_apply_bounds(self, vlb: np.ndarray, vub: np.ndarray):
-        h = self._lp_model
-        changed = np.where((self._cur_lb != vlb) | (self._cur_ub != vub))[0]
-        for j in changed:
-            h.changeColBounds(int(j), float(vlb[j]), float(vub[j]))
-        if len(changed):
-            self._cur_lb = vlb.copy()
-            self._cur_ub = vub.copy()
-
-    def _lp_commit_cuts(self, cuts: list[CutData]):
-        h = self._lp_model
-        inf = self._highs.kHighsInf
-        for cut in cuts:
-            idx = np.where(np.abs(cut.lhs) > 1e-12)[0]
-            if len(idx) == 0:
-                continue
-            h.addRow(float(cut.rhs), inf, len(idx),
-                     idx.astype(np.int32), cut.lhs[idx].astype(np.float64))
-            self._committed_cuts.append(cut)
-            self._n_rows += 1
-        self._struct_version += 1
-        self._diag["cuts_committed"] = len(self._committed_cuts)
+        self._lp = LPBackend(self._highs, self._A, self._b, self._c)
 
     def _lp_solve(self, vlb, vub, warm_basis) -> _LP:
-        t0 = time.perf_counter()
-        hs = self._highs
-        h = self._lp_model
-
-        self._lp_apply_bounds(vlb, vub)
-
-        if warm_basis is not None:
-            col_status, row_status = warm_basis
-            n_new = self._n_rows - len(row_status)
-            if n_new > 0:
-                row_status = list(row_status) + [1] * n_new
-            elif n_new < 0:
-                row_status = list(row_status)[:self._n_rows]
-            try:
-                h.setBasis(list(col_status), list(row_status))
-            except Exception:
-                pass
-
-        h.run()
-        self._lp_count += 1
-
-        try:
-            optimal = (h.getModelStatus() == hs.HighsModelStatus.kOptimal)
-        except Exception:
-            optimal = False
-
-        dt = time.perf_counter() - t0
-        self._lp_time += dt
-        self._timing["lp"] += dt
-
-        if not optimal:
+        res = self._lp.solve(vlb, vub, warm_basis)
+        self._timing["lp"] = self._lp.lp_time
+        if not res.feasible:
             return _LP(False)
+        return _LP(True, obj=res.obj, x=res.x, sol=res.sol, basis=res.basis)
 
-        sol = sol_from_highs(hs, h, self._n, self._n_rows)
-        return _LP(True, obj=sol["obj"], x=sol["x"], sol=sol,
-                   basis=(sol["col_status"], sol["row_status"]))
+    def _lp_commit_cuts(self, cuts: list[CutData]):
+        self._lp.commit_cuts(cuts)
+        self._diag["cuts_committed"] = len(self._lp.committed_cuts)
 
     # ==================================================================
     # Encoding
     # ==================================================================
 
-    def _augmented_A_b(self):
-        if not self._committed_cuts:
-            return self._A, self._b
-        cut_A = np.vstack([cut.lhs.reshape(1, self._n)
-                           for cut in self._committed_cuts])
-        cut_b = np.array([cut.rhs for cut in self._committed_cuts])
-        return np.vstack([self._A, cut_A]), np.concatenate([self._b, cut_b])
-
     def _structure(self):
-        if (self._struct_cache is not None
-                and self._struct_cache[0] == self._struct_version):
+        sv = self._lp.struct_version
+        if self._struct_cache is not None and self._struct_cache[0] == sv:
             return self._struct_cache[1]
 
-        A, b = self._augmented_A_b()
+        A, b = self._lp.augmented_A_b()
         m, n = A.shape
         ei, ev = edge_arrays(A)
 
@@ -522,7 +435,7 @@ class NeuralBnBSolver:
             n_rows_per_var=(A != 0).sum(axis=0).astype(np.float32),
             A=A, b=b,
         )
-        self._struct_cache = (self._struct_version, struct)
+        self._struct_cache = (sv, struct)
         return struct
 
     def _encode(self, sol, vlb, vub):
@@ -651,7 +564,7 @@ class NeuralBnBSolver:
         return self._gomory_pool
 
     def _violated_cuts(self, x_lp: np.ndarray) -> list[CutData]:
-        committed = {self._fingerprint(cut) for cut in self._committed_cuts}
+        committed = {self._fingerprint(cut) for cut in self._lp.committed_cuts}
         out = []
         for cut in self._cut_pool():
             if self._fingerprint(cut) in committed:
