@@ -518,7 +518,7 @@ class NeuralBnBSolver:
         if cfg.cut_mode == "none":
             return False, "mode_none"
         if node.depth == 0 and cfg.force_root_cuts:
-            if len(self._committed_cuts) >= cfg.cut_budget_cap:
+            if len(self._lp.committed_cuts) >= cfg.cut_budget_cap:
                 return False, "budget"
             return True, "root_forced"
         if leaf_prob >= cfg.cut_integrality_thresh:
@@ -527,7 +527,7 @@ class NeuralBnBSolver:
             return False, "few_frac"
         if node.depth > cfg.cut_depth_max:
             return False, "too_deep"
-        if len(self._committed_cuts) >= cfg.cut_budget_cap:
+        if len(self._lp.committed_cuts) >= cfg.cut_budget_cap:
             return False, "budget"
         if self._last_cut_gain < cfg.cut_min_gain:
             return False, "gain_vanished"
