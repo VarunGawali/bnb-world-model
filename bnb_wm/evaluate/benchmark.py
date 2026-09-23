@@ -99,26 +99,34 @@ def _format_obs(obs, device):
         17  lb                CONSTANT 0
         18  ub                CONSTANT 1
 
-        Ecole NodeBipartite empirical column layout (identified via
-        check_feature_layout.py; basis one-hot group confirmed at 15,16,17):
-         0  obj_coef          normalised by Ecole (different scale from training)
+        Ecole NodeBipartite confirmed column layout (check_feature_layout.py,
+        action_set=112, 888+112=1000 variables):
+         0  obj_coef          normalised by Ecole ‖c‖ (different scale from training)
          1  type_binary       CONSTANT 1
-         2-4 other type flags CONSTANT 0
+         2  type_integer      CONSTANT 0
+         3  type_implicit     CONSTANT 0
+         4  type_continuous   CONSTANT 0
          5  has_lb            CONSTANT 1
          6  has_ub            CONSTANT 1
-         7  reduced_cost      signed, Ecole-normalised
-         8  sol_val           LP solution value
-         9  incumbent_val     = sol_val at root when no incumbent found
-        10  sol_is_at_lb      binary flag
-        11  (other flag)
-        12  (other feature)
-        13  (other flag)
-        14  lp_obj or similar (NOT sol_frac — max > 0.5 observed)
-        15  basis_lower       1 when at lower bound (non-basic)
-        16  basis_basic       1 when basic
-        17  basis_upper       1 when at upper bound (non-basic)
-        18  age / constant    CONSTANT 0
+         7  normed_reduced_cost signed, Ecole-normalised
+         8  solution_value    LP solution value  [0, 1]
+         9  solution_frac     x − floor(x)  [0, 1)  (Ecole's def, NOT |x−round(x)|)
+        10  is_at_lower_bound binary mean=0.888  <- sol_is_at_lb
+        11  (other binary)    mean=0.686
+        12  scaled_age        5 unique values, [0, 0.157]
+        13  incumbent_value   binary, mean=0.047
+        14  avg_incumbent_value continuous mean=0.070  (NOT sol_frac)
+        15  is_basis_lower    sum(15,16)=1.0  mean=0.888
+        16  is_basis_basic    mean=0.112  (= #fractional / n_vars)
+        17  is_basis_upper    CONSTANT 0 for binary vars
+        18  is_basis_zero     CONSTANT 0
+
+        NOTE: Ecole col 9 is x−floor(x); training col 14 needs |x−round(x)|.
+        For x=0.94: Ecole gives 0.94, training needs 0.06.  Must recompute.
     """
+    from bnb_wm.features import ecole_to_train_layout
+    from bnb_wm.data.datasets import FEATURE_CLIP as _FC
+
     vf_raw = np.array(
         obs.variable_features if hasattr(obs, "variable_features")
         else obs.column_features, dtype=np.float32)
@@ -134,98 +142,16 @@ def _format_obs(obs, device):
     vf_raw = np.nan_to_num(vf_raw, nan=0.0, posinf=1e4, neginf=-1e4)
     cf_ecole = np.nan_to_num(cf_ecole, nan=0.0, posinf=1e4, neginf=-1e4)
 
-    n_vars = vf_raw.shape[0]
-    n_cons = cf_ecole.shape[0]
-
-    # --- Extract features from Ecole columns (empirically identified) ---
-
-    # obj_coef: Ecole col 0 normalised by Ecole's own scale; re-normalise to
-    # match training collector (c / max|c|) so scale matches learned weights.
-    obj_raw = vf_raw[:, 0]
-    obj_max = float(np.abs(obj_raw).max()) + 1e-8
-    obj_coef_norm = (obj_raw / obj_max).astype(np.float32)
-
-    # sol_val: Ecole col 8 (continuous, range [0,1], #unique ≈ #fractional_vars)
-    sol_val = np.clip(vf_raw[:, 8], 0.0, 1.0)
-
-    # sol_frac: Ecole does not store this separately in this version — compute.
-    sol_frac = np.abs(sol_val - np.round(sol_val)).astype(np.float32)
-
-    # basis status: Ecole one-hot group confirmed at (15=lower, 16=basic, 17=upper)
-    basis_lower = vf_raw[:, 15]
-    basis_basic = vf_raw[:, 16]
-    basis_upper = vf_raw[:, 17]
-    # encode: 0=lower, 1=basic, 2=upper  (matches collect_highs.py)
-    basis_status = (basis_basic * 1.0 + basis_upper * 2.0).astype(np.float32)
-
-    # sol_is_at_lb: use basis_lower (= 1 when non-basic at lb=0, same as at_lb)
-    sol_is_at_lb = basis_lower.astype(np.float32)
-
-    # reduced_cost: Ecole col 7; re-normalise to match collect_highs.py rc/max|rc|
-    rc_raw = vf_raw[:, 7]
-    rc_max = float(np.abs(rc_raw).max()) + 1e-8
-    rc_norm = (rc_raw / rc_max).astype(np.float32)
-
-    # n_rows_norm: degree of each variable / n_cons  (from bipartite edge_index)
-    # ei[0] = constraint index, ei[1] = variable index
-    n_rows_per_var = np.bincount(ei[1], minlength=n_vars).astype(np.float32)
-    n_rows_norm = n_rows_per_var / max(n_cons, 1)
-
-    # n_rows_tight_norm: for each variable j, count tight constraints it appears in
-    # Ecole constraint features col 2 = is_tight (confirmed from fingerprint)
-    is_tight = cf_ecole[:, 2] if cf_ecole.shape[1] > 2 else np.zeros(n_cons, np.float32)
-    tight_per_var = np.zeros(n_vars, dtype=np.float32)
-    np.add.at(tight_per_var, ei[1], is_tight[ei[0]])
-    n_rows_tight_norm = tight_per_var / max(n_cons, 1)
-
-    # --- Assemble 19-dim training-layout feature matrix ---
-    vf = np.zeros((n_vars, 19), dtype=np.float32)
-    vf[:, 0]  = obj_coef_norm          # obj_coef_norm
-    vf[:, 1]  = 1.0                    # has_lb  = 1
-    vf[:, 2]  = 1.0                    # has_ub  = 1
-    vf[:, 3]  = sol_is_at_lb           # sol_is_at_lb
-    # col 4 sol_is_at_ub ≈ 0 at root for set-cover (left as 0)
-    vf[:, 5]  = basis_status           # basis_status 0/1/2
-    vf[:, 6]  = rc_norm                # reduced_cost_norm
-    # col 7 zero (left as 0)
-    vf[:, 8]  = n_rows_norm            # n_rows_norm
-    # cols 9-12 zeros (left as 0)
-    vf[:, 13] = sol_val                # sol_val
-    vf[:, 14] = sol_frac               # sol_frac  <- CRITICAL
-    vf[:, 15] = 1.0                    # lp_obj_norm = 1 (set-cover minimisation)
-    vf[:, 16] = n_rows_tight_norm      # n_rows_tight_norm
-    # col 17 lb = 0 (left as 0)
-    vf[:, 18] = 1.0                    # ub = 1
-
-    # --- Constraint features: remap to training layout ---
-    # Training layout (collect_highs.py._con_features):
-    #   0: obj_cos  1: rhs (raw, =1 for set-cover)  2: is_tight
-    #   3: dual_value_norm   4: n_vars_norm
-    # Ecole layout:
-    #   0: obj_cos (Ecole-normalised)  1: normalised_RHS (≠ raw b)
-    #   2: is_tight  3: dual_value  4: n_vars_per_row / n_vars
-    cf = np.zeros((n_cons, 5), dtype=np.float32)
-    if cf_ecole.shape[1] >= 1:
-        cf[:, 0] = cf_ecole[:, 0]          # obj_cos (Ecole and training both normalise)
-    cf[:, 1] = 1.0                          # raw RHS = 1 for set-cover (CONSTANT)
-    if cf_ecole.shape[1] >= 3:
-        cf[:, 2] = cf_ecole[:, 2]           # is_tight (same in both)
-    if cf_ecole.shape[1] >= 4:
-        # Ecole dual values are small-magnitude; re-normalise to match training
-        y_raw = cf_ecole[:, 3]
-        y_max = float(np.abs(y_raw).max()) + 1e-8
-        cf[:, 3] = (y_raw / y_max).astype(np.float32)
-    if cf_ecole.shape[1] >= 5:
-        cf[:, 4] = cf_ecole[:, 4]           # n_vars_norm
-
-    from bnb_wm.data.datasets import FEATURE_CLIP as _FC
+    vf, cf = ecole_to_train_layout(vf_raw, cf_ecole, ei)
     vf = np.clip(vf, -_FC, _FC)
     cf = np.clip(cf, -_FC, _FC)
 
+    n_vars = vf.shape[0]
+    n_cons = cf.shape[0]
+
     # --- Edge features: [coeff, coeff/|RHS|, sign(coeff)] ---
-    # Training collector normalises by raw RHS = 1 → norm_ev = ev_raw / 1 = ev_raw.
+    # cf[:,1] = 1.0 (set-cover RHS), so norm_ev = ev_raw (matches training).
     con_src = ei[0]
-    # cf[:, 1] = 1.0 so norm_ev = ev_raw (consistent with training).
     rhs_src = cf[con_src, 1]
     norm_ev = ev_raw / (np.abs(rhs_src) + 1e-8)
     sign_ev = np.sign(ev_raw)
