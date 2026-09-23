@@ -393,11 +393,27 @@ def run(model, device, configs, n_instances, generator_kwargs,
         "separating/maxrounds":     sep_rounds,
         "presolving/maxrounds":     0,
     }
-    env = ecole.environment.Branching(
-        observation_function=ecole.observation.NodeBipartite(),
-        information_function={"depth": _NodeDepth()},
-        scip_params=scip_params,
-    )
+    # Use a tuple observation: (NodeBipartite for the model, StrongBranching for
+    # ranking ground truth).  SB scores are expensive so we subsample them to
+    # at most SB_NODES_PER_INSTANCE per instance.  When no rollout method is
+    # active, use single NodeBipartite observation to avoid SB overhead.
+    need_sb = bool(rollout_acc)
+    SB_NODES_PER_INSTANCE = 20
+    if need_sb:
+        env = ecole.environment.Branching(
+            observation_function=(
+                ecole.observation.NodeBipartite(),
+                ecole.observation.StrongBranchingScores(pseudo_candidates=False),
+            ),
+            information_function={"depth": _NodeDepth()},
+            scip_params=scip_params,
+        )
+    else:
+        env = ecole.environment.Branching(
+            observation_function=ecole.observation.NodeBipartite(),
+            information_function={"depth": _NodeDepth()},
+            scip_params=scip_params,
+        )
 
     extra = (["strong_branching"] if strong_branching else []) \
             + (["pseudocost"] if pseudocost else []) \
@@ -414,15 +430,18 @@ def run(model, device, configs, n_instances, generator_kwargs,
     lp_solves= {m: [] for m in methods}   # total LP solves per instance (HiGHS methods only)
     lp_times = {m: [] for m in methods}   # cumulative LP time per instance (HiGHS methods only)
 
-    # Priority 1: per-episode component timing (learned methods only)
-    # Each entry is a dict {encode, policy, rollout} in seconds for one instance.
+    # Per-episode component timing (learned methods only).
+    # Keys: 'obs' (format_obs + device transfer), 'encode', 'policy', 'rollout'.
     timings  = {m: [] for m in methods if m not in ("scip", "strong_branching",
                                                       "pseudocost", "random",
                                                       "most_fractional")}
 
-    # Priority 2: rollout prediction accuracy
-    # List of dicts per instance: predicted_score, actual_child_dual, error
-    rollout_acc = {m: [] for m in timings}
+    # Rollout ranking accuracy vs Strong Branching scores.
+    # Recorded only for rollout-mode configs. Per node: {policy_rank, rollout_rank,
+    # sb_rank, top1_policy, top1_rollout, n_cands} where *_rank is the model's
+    # top-1 variable's rank in the SB ordering (0 = best, higher = worse).
+    rollout_acc = {m: [] for m in timings
+                   if configs.get(m, {}).get("mode") == "rollout"}
 
     model.eval()
 
@@ -513,62 +532,81 @@ def run(model, device, configs, n_instances, generator_kwargs,
 
         # ---- each learned config ----
         for name, cfg in configs.items():
-            obs, action_set, _, done, info = env.reset(instance.copy_orig())
-            root_lp = _root_dual(env)   # LP relaxation before first branch
+            obs_raw, action_set, _, done, info = env.reset(instance.copy_orig())
+            root_lp = _root_dual(env)
 
-            # Priority 1: initialise per-episode timing accumulator
-            ep_timing = {"encode": 0.0, "policy": 0.0, "rollout": 0.0}
+            ep_timing = {"obs": 0.0, "encode": 0.0, "policy": 0.0, "rollout": 0.0}
             use_timing = name in timings
-
-            # Priority 2: rollout prediction store
-            ep_rollout_preds = [] if name in rollout_acc else None
-            ep_rollout_pairs = []   # (predicted_score, actual_child_dual)
+            use_sb     = name in rollout_acc  # SB-based ranking accuracy
+            ep_ranking = []   # per-node ranking records
+            sb_budget  = SB_NODES_PER_INSTANCE  # nodes left where we record SB
 
             steps, past = 0, None
             with torch.no_grad():
                 while not done and action_set is not None and len(action_set) > 0:
+                    # Unpack obs tuple when SB env is active
+                    if need_sb:
+                        obs, sb_scores = obs_raw   # NodeBipartite obs, array[n_vars]
+                    else:
+                        obs, sb_scores = obs_raw, None
+
+                    # Obs → PyG timing bucket (invisible in previous timing breakdown)
+                    if use_timing:
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                        t0 = perf_counter()
+
                     batch = _format_obs(obs, device)
+
+                    if use_timing:
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                        ep_timing["obs"] += perf_counter() - t0
+
                     depth = int(info.get("depth", 0)) if isinstance(info, dict) else 0
 
-                    # Pre-step dual bound (= current LP bound before branching)
-                    pre_dual = float("nan")
-                    if ep_rollout_preds is not None and cfg.get("mode") == "rollout":
-                        try:
-                            pre_dual = float(env.model.as_pyscipopt().getDualbound())
-                        except Exception:
-                            pass
+                    # For rollout methods, also pass policy scores before rollout
+                    # so we can compute policy_rank separately from rollout_rank.
+                    ep_rollout_preds = [] if use_sb else None
 
                     action, past = _pick_action(
                         model, batch, action_set, device, cfg, past, depth=depth,
                         timing_acc=ep_timing if use_timing else None,
                         rollout_preds=ep_rollout_preds,
                     )
-                    obs, action_set, _, done, info = env.step(action)
-                    steps += 1
 
-                    # Priority 2: post-step dual = actual child LP bound
-                    if ep_rollout_preds and not np.isnan(pre_dual):
-                        pred = ep_rollout_preds[-1]
+                    # SB-based ranking accuracy: compare model's choice against SB
+                    if use_sb and sb_scores is not None and sb_budget > 0 and ep_rollout_preds:
                         try:
-                            post_dual = float(env.model.as_pyscipopt().getDualbound())
-                            actual_delta = post_dual - pre_dual
-                            ep_rollout_pairs.append({
-                                "predicted_score": pred["predicted_score"],
-                                "actual_delta_lb": actual_delta,
-                                "n_candidates": pred["n_candidates"],
-                            })
+                            aset = np.array(action_set)
+                            sb_sub = np.array([sb_scores[j] for j in aset], dtype=float)
+                            # SB rank of model's chosen variable (0 = best)
+                            chosen_local = np.where(aset == action)[0]
+                            if len(chosen_local) > 0:
+                                sb_order = np.argsort(-sb_sub)  # descending
+                                sb_rank_of_chosen = int(np.where(sb_order == chosen_local[0])[0][0])
+                                top1_sb_var = aset[sb_order[0]]
+                                pred = ep_rollout_preds[-1]
+                                ep_ranking.append({
+                                    "rollout_rank_in_sb": sb_rank_of_chosen,
+                                    "top1_correct":       int(action == top1_sb_var),
+                                    "n_cands":            len(aset),
+                                    "predicted_score":    pred["predicted_score"],
+                                })
+                                sb_budget -= 1
                         except Exception:
                             pass
 
+                    obs_raw, action_set, _, done, info = env.step(action)
+                    steps += 1
+
             _append(name, *_episode_stats(env, steps), root_lp=root_lp)
 
-            # Priority 1: store per-episode timing summary
             if use_timing:
                 timings[name].append(ep_timing)
 
-            # Priority 2: store rollout accuracy pairs for this instance
-            if name in rollout_acc:
-                rollout_acc[name].append(ep_rollout_pairs)
+            if use_sb:
+                rollout_acc[name].append(ep_ranking)
 
         row = " | ".join(
             f"{m}:{nodes[m][-1]}{'' if solved[m][-1] else '*'}" for m in methods
@@ -611,63 +649,65 @@ def _summarize_timings(timings):
     if not timings:
         return
     print("\n--- Component timing breakdown (learned methods) ---")
-    print(f"{'Method':<20}{'encode(s)':<12}{'policy(s)':<12}{'rollout(s)':<12}"
-          f"{'model_total(s)':<16}{'encode%':<10}{'rollout%':<10}")
-    print("-" * 90)
+    print(f"{'Method':<20}{'obs(s)':<10}{'encode(s)':<12}{'policy(s)':<12}"
+          f"{'rollout(s)':<12}{'total(s)':<12}{'obs%':<8}{'enc%':<8}{'rol%':<8}")
+    print("-" * 102)
     for name, eps in timings.items():
         if not eps:
             continue
+        obs = np.mean([e.get("obs", 0.0) for e in eps])
         enc = np.mean([e["encode"]  for e in eps])
         pol = np.mean([e["policy"]  for e in eps])
         rol = np.mean([e["rollout"] for e in eps])
-        tot = enc + pol + rol
+        tot = obs + enc + pol + rol
+        obs_pct = 100 * obs / tot if tot > 0 else 0
         enc_pct = 100 * enc / tot if tot > 0 else 0
         rol_pct = 100 * rol / tot if tot > 0 else 0
-        print(f"{name:<20}{enc:<12.3f}{pol:<12.3f}{rol:<12.3f}"
-              f"{tot:<16.3f}{enc_pct:<10.1f}{rol_pct:<10.1f}")
-    print("(times are mean per-instance totals across all branching nodes)")
+        print(f"{name:<20}{obs:<10.3f}{enc:<12.3f}{pol:<12.3f}"
+              f"{rol:<12.3f}{tot:<12.3f}{obs_pct:<8.1f}{enc_pct:<8.1f}{rol_pct:<8.1f}")
+    print("(mean per-instance totals; obs = format_obs + host-to-device transfer)")
 
 
 def _summarize_rollout_accuracy(rollout_acc):
-    """Print world-model prediction accuracy vs actual child LP bound."""
+    """Print rollout ranking quality vs Strong Branching ground truth.
+
+    Metrics (all compare model's chosen variable against SB-argmax):
+      top1_acc   : fraction of nodes where model chose the SB-best variable
+      top3_acc   : fraction where model's choice was in the SB top-3
+      mean_rank  : mean SB rank of model's chosen variable (0 = best)
+    Computed on the subsampled SB nodes (≤SB_NODES_PER_INSTANCE per instance).
+    """
     if not rollout_acc:
         return
-    print("\n--- Rollout prediction accuracy (predicted score vs actual ΔLB) ---")
-    print(f"{'Method':<20}{'n_pairs':<10}{'mean|err|':<12}{'spearman':<12}"
-          f"{'sign_agree':<12}")
-    print("-" * 65)
+    any_data = any(
+        any(ep for ep in instances)
+        for instances in rollout_acc.values()
+    )
+    if not any_data:
+        print("\n--- Rollout ranking accuracy: no SB data recorded ---")
+        return
 
-    try:
-        from scipy.stats import spearmanr
-    except ImportError:
-        spearmanr = None
+    print("\n--- Rollout ranking accuracy vs Strong Branching ---")
+    print(f"{'Method':<20}{'n_nodes':<10}{'top1_acc':<12}{'top3_acc':<12}"
+          f"{'mean_SB_rank':<14}{'n_cands(med)':<14}")
+    print("-" * 82)
 
     for name, instances in rollout_acc.items():
-        pairs = [p for ep in instances for p in ep]
-        if not pairs:
+        records = [r for ep in instances for r in ep]
+        if not records:
             print(f"{name:<20}{'no data'}")
             continue
-        preds  = np.array([p["predicted_score"] for p in pairs])
-        actual = np.array([p["actual_delta_lb"]  for p in pairs])
-        mae = float(np.mean(np.abs(preds - actual)))
+        n = len(records)
+        top1 = float(np.mean([r["top1_correct"] for r in records]))
+        mean_rank = float(np.mean([r["rollout_rank_in_sb"] for r in records]))
+        top3 = float(np.mean([r["rollout_rank_in_sb"] < 3 for r in records]))
+        med_cands = float(np.median([r["n_cands"] for r in records]))
+        print(f"{name:<20}{n:<10}{top1:<12.3f}{top3:<12.3f}"
+              f"{mean_rank:<14.2f}{med_cands:<14.0f}")
 
-        rho = float("nan")
-        if spearmanr is not None and len(preds) >= 4:
-            try:
-                rho = float(spearmanr(preds, actual).statistic)
-            except Exception:
-                pass
-
-        # top-1 rate: among pairs where n_candidates > 1, was the chosen
-        # (max-score) candidate also the one with the highest actual ΔLB?
-        # We only have the chosen candidate per node, so instead check if
-        # predicted_score > 0 correlates with actual_delta_lb > 0.
-        pos_agree = int(np.sum((preds > 0) == (actual > 0)))
-        sign_agree = pos_agree / len(preds) if len(preds) > 0 else float("nan")
-
-        print(f"{name:<20}{len(preds):<10}{mae:<12.4f}{rho:<12.4f}{sign_agree:<12.3f}")
-    print("(mae = mean absolute error between predicted rollout score and actual ΔLB)")
-    print("(sign_agree = fraction where sign(predicted_score) == sign(actual ΔLB))")
+    print("(top1_acc = fraction model chose SB-argmax variable)")
+    print("(top3_acc = fraction model's choice was in SB top-3)")
+    print("(mean_SB_rank = 0 is best; subsampled ≤20 nodes/instance to limit SB cost)")
 
 
 def summarize(nodes, solved=None, times=None, cuts=None,
@@ -690,18 +730,33 @@ def summarize(nodes, solved=None, times=None, cuts=None,
     n_inst = len(scip_nodes)
     scip_opt = np.asarray(solved["scip"], dtype=bool) if solved is not None else None
 
-    # Unified table: all metrics side-by-side per method.
-    # Nodes column = both-solved subset (the only unconfounded comparison);
-    # everything else = all instances (median; timeouts count as not-solved).
+    def _sgm(vals, shift=10.0):
+        """Shifted geometric mean: exp(mean(log(v + shift))) - shift."""
+        v = np.asarray(vals, dtype=float)
+        v = np.where(np.isnan(v), np.nanmax(v) if np.any(~np.isnan(v)) else shift, v)
+        return float(np.exp(np.mean(np.log(np.maximum(v + shift, 1e-9)))) - shift)
+
+    # All-methods-solved intersection: instances every method solved.
+    # Gap and time metrics are computed on this common subset so every method
+    # is scored on exactly the same instances (avoids survivor bias).
+    if solved is not None:
+        all_solved_mask = np.ones(n_inst, dtype=bool)
+        for m in nodes:
+            all_solved_mask &= np.asarray(solved[m][:n_inst], dtype=bool)
+        n_common = int(all_solved_mask.sum())
+    else:
+        all_solved_mask = np.ones(n_inst, dtype=bool)
+        n_common = n_inst
+
     rows = []
-    W = 140
+    W = 148
     print("\n" + "=" * W)
-    print(f"RESULTS — {n_inst} instances   "
-          f"(nodes = median on instances solved by BOTH method & SCIP; "
-          f"other metrics = all instances)")
+    print(f"RESULTS — {n_inst} instances  |  common-solved subset: n={n_common}")
+    print(f"  SGM = shifted geometric mean (shift=10) over all instances (timeouts at terminal value)")
+    print(f"  gap/time = on common-solved subset only (every method produced a value)")
     hdr = (f"{'Method':<18}{'%solved':>8}{'%timeout':>10}{'gap@end':>9}"
-           f"{'gap_clsd':>10}{'time(s)':>9}{'nodes(all)':>12}"
-           f"{'nodes(both)':>13}{'vs SCIP':>9}{'p':>9}")
+           f"{'gap_clsd':>10}{'time(s)':>9}{'SGM_nodes':>11}"
+           f"{'nodes(all-solved)':>18}{'vs SCIP':>9}{'p':>9}")
     print(hdr)
     print("-" * W)
 
@@ -712,17 +767,19 @@ def summarize(nodes, solved=None, times=None, cuts=None,
         pct_timeout = (100.0 * float(np.mean(~np.asarray(solved[m], dtype=bool)))
                        if solved is not None else float("nan"))
 
-        # Both-solved node stats
-        if m == "scip" or scip_opt is None:
-            nb, red, p, sv_med, mv_med = 0, float("nan"), None, float("nan"), float("nan")
+        # Shifted geometric mean over ALL instances (timeouts included at their node count)
+        sgm_nodes = _sgm(v)
+
+        # All-methods-solved subset: node comparison where every method finished
+        if m == "scip" or scip_opt is None or n_common == 0:
+            nb, red, p, sv_sgm, mv_sgm = n_common, float("nan"), None, float("nan"), float("nan")
         else:
-            mask = scip_opt & np.asarray(solved[m], dtype=bool)
-            nb   = int(mask.sum())
-            sv   = scip_nodes[mask]
-            mv   = v[mask]
-            sv_med = float(np.median(sv)) if nb > 0 else float("nan")
-            mv_med = float(np.median(mv)) if nb > 0 else float("nan")
-            red = 100.0 * (sv_med - mv_med) / max(sv_med, 1e-9) if nb > 0 else float("nan")
+            sv = scip_nodes[all_solved_mask]
+            mv = v[all_solved_mask]
+            nb = n_common
+            sv_sgm = _sgm(sv)
+            mv_sgm = _sgm(mv)
+            red = 100.0 * (sv_sgm - mv_sgm) / max(sv_sgm + 10, 1e-9) if nb > 0 else float("nan")
             p = None
             if nb >= 2 and wilcoxon is not None and np.any(sv != mv):
                 try:
@@ -730,53 +787,66 @@ def summarize(nodes, solved=None, times=None, cuts=None,
                 except Exception:
                     pass
 
-        # Gap metrics (all instances)
-        mean_gap = _nanmean(gaps[m]) if gaps is not None else float("nan")
+        # Gap metrics — common subset only
+        mean_gap = float("nan")
         mean_gap_closed = float("nan")
-        if gaps is not None and root_lps is not None and obj_vals is not None:
-            gc_vals = []
-            for obj, root_lp, g in zip(obj_vals[m], root_lps[m], gaps[m]):
-                if np.isnan(obj) or np.isnan(root_lp) or np.isnan(g):
-                    continue
-                denom = max(abs(obj), 1e-8)
-                root_gap = abs(obj - root_lp) / denom
-                if root_gap > 1e-8:
-                    gc_vals.append((root_gap - g) / root_gap)
-            mean_gap_closed = float(np.mean(gc_vals)) if gc_vals else float("nan")
+        if gaps is not None and n_common > 0:
+            g_sub = np.array([gaps[m][j] for j in range(n_inst) if all_solved_mask[j]], dtype=float)
+            mean_gap = float(np.nanmean(g_sub))
+            if root_lps is not None and obj_vals is not None:
+                gc_vals = []
+                for j in range(n_inst):
+                    if not all_solved_mask[j]:
+                        continue
+                    obj    = obj_vals[m][j]
+                    root_lp= root_lps[m][j]
+                    g      = gaps[m][j]
+                    if np.isnan(obj) or np.isnan(root_lp) or np.isnan(g):
+                        continue
+                    denom = max(abs(obj), 1e-8)
+                    root_gap = abs(obj - root_lp) / denom
+                    if root_gap > 1e-8:
+                        gc_vals.append((root_gap - g) / root_gap)
+                mean_gap_closed = float(np.mean(gc_vals)) if gc_vals else float("nan")
 
-        mean_time      = _nanmean(times[m])      if times      is not None else float("nan")
-        mean_lp_solves = _nanmean(lp_solves[m])  if lp_solves  is not None else None
-        mean_lp_time   = _nanmean(lp_times[m])   if lp_times   is not None else None
-        mean_cuts      = _nanmean(cuts[m])        if cuts       is not None else None
+        # Time — common subset
+        mean_time = float("nan")
+        if times is not None and n_common > 0:
+            t_sub = np.array([times[m][j] for j in range(n_inst) if all_solved_mask[j]], dtype=float)
+            mean_time = float(np.nanmean(t_sub))
 
-        gstr   = f"{mean_gap*100:.1f}%"     if not np.isnan(mean_gap)        else "--"
+        mean_lp_solves = _nanmean(lp_solves[m]) if lp_solves is not None else None
+        mean_lp_time   = _nanmean(lp_times[m])  if lp_times  is not None else None
+        mean_cuts      = _nanmean(cuts[m])       if cuts      is not None else None
+
+        gstr   = f"{mean_gap*100:.1f}%"        if not np.isnan(mean_gap)        else "--"
         gcstr  = f"{mean_gap_closed*100:.1f}%" if not np.isnan(mean_gap_closed) else "--"
-        tstr   = f"{mean_time:.1f}"         if not np.isnan(mean_time)       else "--"
-        rstr   = f"{red:+.1f}%"             if not np.isnan(red)             else "--"
-        pstr   = f"{p:.2e}"                 if p is not None                 else "--"
-        sv_str = f"{sv_med:.0f}"            if not np.isnan(sv_med)          else "--"
-        mv_str = f"{mv_med:.0f}(n={nb})"   if not np.isnan(mv_med)          else "--"
+        tstr   = f"{mean_time:.1f}"            if not np.isnan(mean_time)       else "--"
+        rstr   = f"{red:+.1f}%"               if not np.isnan(red)             else "--"
+        pstr   = f"{p:.2e}"                   if p is not None                 else "--"
+        mv_str = f"{mv_sgm:.1f}(n={nb})"      if not np.isnan(mv_sgm)          else f"--  (n={nb})"
 
         print(f"{m:<18}{pct_solved:>7.0f}%{pct_timeout:>9.0f}%{gstr:>9}"
-              f"{gcstr:>10}{tstr:>9}{np.median(v):>12.0f}"
-              f"{mv_str:>13}{rstr:>9}{pstr:>9}")
+              f"{gcstr:>10}{tstr:>9}{sgm_nodes:>11.1f}"
+              f"{mv_str:>18}{rstr:>9}{pstr:>9}")
 
         rows.append(dict(
             method=m,
-            n_both_solved=nb,
-            scip_nodes_both=sv_med, method_nodes_both=mv_med,
-            reduction_pct_both=red, wilcoxon_p_both=p,
+            n_common_solved=nb,
+            scip_sgm_common=sv_sgm, method_sgm_common=mv_sgm,
+            sgm_all=sgm_nodes,
+            reduction_pct_common=red, wilcoxon_p_common=p,
             pct_solved=pct_solved, pct_timeout=pct_timeout,
-            all_median=float(np.median(v)),
             mean_gap=mean_gap, mean_gap_closed=mean_gap_closed,
             mean_time=mean_time, mean_cuts=mean_cuts,
             mean_lp_solves=mean_lp_solves, mean_lp_time=mean_lp_time,
         ))
 
     print("=" * W)
-    print(f"nodes(both) = median nodes on subset solved by BOTH method and SCIP (n shown per row)")
-    print(f"vs SCIP     = (SCIP_med - method_med)/SCIP_med × 100  (positive = fewer nodes)")
-    print(f"p           = Wilcoxon signed-rank on paired both-solved node counts")
+    print(f"SGM_nodes   = shifted geometric mean (shift 10) over ALL instances")
+    print(f"nodes(all-solved) = SGM on the {n_common} instances ALL methods solved (same set, unbiased)")
+    print(f"vs SCIP     = (SCIP_sgm - method_sgm)/(SCIP_sgm+10) × 100  (positive = fewer nodes)")
+    print(f"p           = Wilcoxon signed-rank on paired all-methods-solved node counts")
 
     if timings:
         _summarize_timings(timings)
