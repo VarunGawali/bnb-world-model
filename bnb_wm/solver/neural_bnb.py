@@ -632,7 +632,7 @@ class NeuralBnBSolver:
                              if tok_cur is not None else None)
                     d_b = torch.zeros(B, device=self.device, dtype=z.dtype)
 
-                    z_next, tok_next = self.model.dynamics_step(
+                    z_next, tok_next, _ = self.model.dynamics_step(
                         z_b, a_b, tok_b, d_b)
                     h_flat = h_vars.unsqueeze(0).expand(B, -1, -1).reshape(
                         B * h_vars.size(0), -1)
@@ -725,7 +725,7 @@ class NeuralBnBSolver:
         def _advance(var):
             with torch.no_grad():
                 a = h_vars[var].unsqueeze(0)
-                _z, tok = self.model.dynamics_step(z, a, node.past_tokens, 0.0)
+                _z, tok, _ = self.model.dynamics_step(z, a, node.past_tokens, 0.0)
             return tok
 
         if cfg.branch_mode == "policy":
