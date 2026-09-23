@@ -56,7 +56,7 @@ def brute_force_optimal(A, b, c) -> float:
 # Instance generator (training distribution)
 # ---------------------------------------------------------------------------
 
-def gen_instance(n_rows, n_cols, rng, density=0.4):
+def gen_instance(n_rows, n_cols, rng, density=0.5):
     """
     Small dense instances so brute-force is tractable.
     density=0.4 ensures most are feasible with a few variables.
@@ -160,7 +160,7 @@ def main():
     ap.add_argument("--classical_only", action="store_true")
     ap.add_argument("--n_instances", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--sizes", default="8x15,10x20,12x25")
+    ap.add_argument("--sizes", default="6x12,7x14,8x15")
     ap.add_argument("--sb_variants", action="store_true")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
