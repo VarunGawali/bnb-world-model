@@ -77,7 +77,7 @@ def gen_instance(n_rows, n_cols, rng, density=0.5):
 
 def load_neural_solver(checkpoint_path, device_str):
     import torch
-    from bnb_wm.model.bnb_world_model import BnBWorldModel
+    from bnb_wm.model.world_model import BnBWorldModel
     from bnb_wm.solver.neural_bnb import NeuralBnBSolver
     from bnb_wm.solver.config import SolverConfig
     from bnb_wm.training.checkpoint import load_weights_only
