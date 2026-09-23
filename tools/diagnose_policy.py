@@ -105,6 +105,8 @@ def part_a(model, device, args):
     except ImportError:
         kendalltau = None
 
+    _debug_done = False
+
     for f in files:
         d = np.load(f, allow_pickle=True)
         T = int(d["n_steps"])
@@ -117,7 +119,11 @@ def part_a(model, device, args):
             ev = np.asarray(d["edge_values"][t], dtype=np.float32)
             aset = np.asarray(d["action_sets"][t], dtype=np.int64)
             label = int(d["local_branching_label"][t])      # index INTO aset
-            sb = np.asarray(d["sb_scores"][t], dtype=np.float64)
+
+            # sb_scores may be absent in older npz files
+            sb_raw = d["sb_scores"][t] if "sb_scores" in d else None
+            sb = np.asarray(sb_raw, dtype=np.float64) if sb_raw is not None else None
+
             if len(aset) < 2:
                 continue
 
@@ -130,7 +136,27 @@ def part_a(model, device, args):
                 var_mask = batch.node_type == 0
                 scores = model.policy_scores(h_vars, z, batch.batch[var_mask])
 
-            s = scores.detach().cpu().numpy()[aset]
+            raw = scores.detach().cpu().numpy()
+
+            # ---- one-time debug dump ----
+            if not _debug_done:
+                _debug_done = True
+                nan_count = int(np.isnan(raw).sum())
+                inf_count = int(np.isinf(raw).sum())
+                print(f"\n[DEBUG node 0]")
+                print(f"  scores shape={raw.shape}  NaN={nan_count}  Inf={inf_count}")
+                print(f"  scores[:5]       = {np.round(raw[:5], 4)}")
+                print(f"  scores[aset[:5]] = {np.round(raw[aset[:5]], 4)}")
+                print(f"  aset[:5]={aset[:5]}  label(local)={label}")
+                print(f"  sb_scores present: {'yes, len=' + str(len(sb)) if sb is not None else 'NO'}")
+                print(f"  vf shape={vf.shape}, ei shape={ei.shape}")
+                print(f"  vf[0,:6] = {np.round(vf[0,:6], 4)}")
+                if sb is not None:
+                    print(f"  sb[:5]={np.round(sb[:5], 4)}  len(sb)={len(sb)}  len(aset)={len(aset)}")
+                    print(f"  NOTE: sb aligned to {'aset' if len(sb)==len(aset) else 'full vars (n_cols)'}")
+                print()
+
+            s = raw[aset]
             order = np.argsort(-s)                      # local indices, best first
             top1 += int(order[0] == label)
             top3 += int(label in order[:3])
@@ -142,8 +168,10 @@ def part_a(model, device, args):
             rnd += 1.0 / len(aset)
             aset_sizes.append(len(aset))
 
-            if kendalltau is not None and len(aset) >= 4:
-                tau = kendalltau(s, sb).statistic
+            if kendalltau is not None and sb is not None and len(aset) >= 4:
+                # sb may be aligned to aset (len k) or to full vars (len n_cols)
+                sb_cand = sb[aset] if len(sb) != len(aset) else sb
+                tau = kendalltau(s, sb_cand).statistic
                 if np.isfinite(tau):
                     taus.append(float(tau))
             n += 1
