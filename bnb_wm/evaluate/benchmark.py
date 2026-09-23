@@ -86,7 +86,7 @@ def _format_obs(obs, device):
          1  has_lb            CONSTANT 1
          2  has_ub            CONSTANT 1
          3  sol_is_at_lb      LP value <= lb + eps  (lb=0 for binary)
-         4  sol_is_at_ub      LP value >= ub - eps  (ub=1 for binary, ~0 at root)
+         4  sol_is_at_ub      LP value >= ub - eps  (rare but nonzero at depth)
          5  basis_status      0=lower 1=basic 2=upper
          6  reduced_cost_norm rc / max|rc|
          7  (zero)            CONSTANT 0

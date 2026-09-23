@@ -11,7 +11,7 @@ Training layout (collect_highs.py._var_features):
   1  has_lb            CONSTANT 1
   2  has_ub            CONSTANT 1
   3  sol_is_at_lb      LP value <= lb + eps
-  4  sol_is_at_ub      LP value >= ub - eps  (≈ 0 at root for binary)
+  4  sol_is_at_ub      LP value >= ub - eps  (rare but nonzero at depth)
   5  basis_status      0=lower  1=basic  2=upper
   6  reduced_cost_norm rc / max|rc|
   7  (zero)            CONSTANT 0
@@ -89,6 +89,11 @@ def ecole_to_train_layout(
     # col 3: sol_is_at_lb  (Ecole col 10 = is_solution_at_lower_bound)
     sol_is_at_lb = vf_raw[:, 10].astype(np.float32)
 
+    # col 4: sol_is_at_ub — NOT constant across the tree (0.33% of training rows
+    # have value 1, at depth when a var is fixed to its upper bound).
+    # Compute from sol_val: for binary vars ub=1.0.
+    sol_is_at_ub = (sol_val >= 1.0 - 1e-6).astype(np.float32)
+
     # col 5: basis_status  0=lower 1=basic 2=upper
     # Ecole: col15=is_basis_lower, col16=is_basis_basic, col17=is_basis_upper
     basis_status = (
@@ -116,7 +121,7 @@ def ecole_to_train_layout(
     vf[:, 1]  = 1.0               # has_lb
     vf[:, 2]  = 1.0               # has_ub
     vf[:, 3]  = sol_is_at_lb
-    # col 4 sol_is_at_ub: constant 0 in all training data (binary vars at root)
+    vf[:, 4]  = sol_is_at_ub
     vf[:, 5]  = basis_status
     vf[:, 6]  = rc_norm
     # col 7 zero

@@ -212,8 +212,12 @@ def collect_eval_features(args):
         while not done and action_set is not None and len(action_set) > 0:
             if obs is None:
                 break
-            vf_raw = np.array(obs.variable_features, dtype=np.float32)
-            cf_ec = np.array(obs.constraint_features, dtype=np.float32)
+            vf_raw = np.array(
+                obs.variable_features if hasattr(obs, "variable_features")
+                else obs.column_features, dtype=np.float32)
+            cf_ec = np.array(
+                obs.constraint_features if hasattr(obs, "constraint_features")
+                else obs.row_features, dtype=np.float32)
             ei = np.array(obs.edge_features.indices, dtype=np.int64)
             ev = np.array(obs.edge_features.values, dtype=np.float32).flatten()
 
