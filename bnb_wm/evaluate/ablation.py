@@ -375,12 +375,14 @@ def run(model, device, configs, n_instances, generator_kwargs,
         raise ImportError("Ecole and PySCIPOpt are required for the benchmark.")
 
     gkw = generator_kwargs
-    generator = ecole.instance.SetCoverGenerator(
+    from bnb_wm.evaluate.collector_instances import make_generator
+    generator = make_generator(
+        source=gkw.get("instance_source", "ecole"),
         n_rows=gkw.get("n_rows", 500),
         n_cols=gkw.get("n_cols", 1000),
         density=gkw.get("density", 0.05),
+        seed=seed,
     )
-    generator.seed(seed)
     np.random.seed(seed)   # reproducible random-branching baseline
 
     # separate=False disables cutting planes to isolate BRANCHING quality (the
@@ -869,6 +871,11 @@ def main():
     ap.add_argument("--n_rows", type=int, default=500)
     ap.add_argument("--n_cols", type=int, default=1000)
     ap.add_argument("--density", type=float, default=0.05)
+    ap.add_argument("--instance_source", choices=["ecole", "collector"],
+                    default="ecole",
+                    help="Instance generator: 'ecole' uses SetCoverGenerator "
+                         "(community benchmark); 'collector' uses the same "
+                         "Bernoulli/U(1,10) distribution as the training data.")
     ap.add_argument("--time_limit", type=int, default=60)
     ap.add_argument("--separate", action="store_true",
                     help="leave SCIP's cutting planes ON (true branch-and-cut) "
@@ -963,7 +970,8 @@ def main():
         t_limit    = tier_kw.pop("time_limit", args.time_limit)
         t_density  = tier_kw.pop("density", args.density)
         gkw        = dict(n_rows=tier_kw["n_rows"], n_cols=tier_kw["n_cols"],
-                          density=t_density)
+                          density=t_density,
+                          instance_source=args.instance_source)
 
         print(f"\n{'='*60}")
         print(f"TIER: {tier_name.upper()}  "

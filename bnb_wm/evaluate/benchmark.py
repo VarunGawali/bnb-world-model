@@ -134,10 +134,16 @@ def _format_obs(obs, device):
         obs.constraint_features if hasattr(obs, "constraint_features")
         else obs.row_features, dtype=np.float32)
     ei = np.array(obs.edge_features.indices, dtype=np.int64)   # [2, E]
-    ev_raw = np.array(obs.edge_features.values, dtype=np.float32)
-    if ev_raw.ndim == 2:
-        ev_raw = ev_raw[:, 0]
-    ev_raw = np.nan_to_num(ev_raw.flatten(), nan=0.0, posinf=1e6, neginf=-1e6)
+    ev_ecole = np.array(obs.edge_features.values, dtype=np.float32)
+    if ev_ecole.ndim == 2:
+        ev_ecole = ev_ecole[:, 0]
+    ev_ecole = np.nan_to_num(ev_ecole.flatten(), nan=0.0, posinf=1e6, neginf=-1e6)
+
+    # Ecole row-normalises A and flips sign for >= constraints (stored as -Ax <= -b),
+    # so edge values come out as small negatives (~-0.17).  Training used raw A entries,
+    # which are exactly 1.0 for set cover (A ∈ {0,1}, Ecole only emits nonzero edges),
+    # giving edge_attr = [1, 1, 1] on every edge.  Reconstruct that.
+    ev_raw = np.ones(ev_ecole.shape[0], dtype=np.float32)
 
     vf_raw = np.nan_to_num(vf_raw, nan=0.0, posinf=1e4, neginf=-1e4)
     cf_ecole = np.nan_to_num(cf_ecole, nan=0.0, posinf=1e4, neginf=-1e4)
