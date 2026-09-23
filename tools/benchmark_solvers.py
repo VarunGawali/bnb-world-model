@@ -449,12 +449,17 @@ def main():
             else:
                 row = run_neural(solver, A, b, c, opt)
             results[m][i] = row
+            obj_s    = f"obj={row['obj']:.3f}" if row['obj'] is not None else "obj=   N/A"
+            gap_s    = f"gap={row['gap_at_end']*100:5.1f}%" if row['gap_at_end'] is not None else "gap=   N/A"
+            tlp_s    = f"tLPs={row['tree_lps']:>5}"
+            dlp_s    = f"dLPs={row['decision_lps']:>5}"
+            wt_s     = f"t={row['wall_time']:>6.2f}s"
+            cuts_s   = f"cuts={row['cuts_added']:>3}" if row['cuts_added'] else ""
+            dist_s   = (f"dist={row['dist_from_optimum']:.3f}"
+                        if row['dist_from_optimum'] is not None else "")
+            extras = "  ".join(x for x in [tlp_s, dlp_s, wt_s, cuts_s, dist_s] if x)
             print(f"  [{i+1:>3}/{args.n_instances}] {m:<22}  "
-                  f"nodes={row['nodes']:>6}  "
-                  f"status={row['status']:>8}  "
-                  f"obj={row['obj']:.3f}" if row['obj'] else
-                  f"  [{i+1:>3}/{args.n_instances}] {m:<22}  "
-                  f"nodes={row['nodes']:>6}  status={row['status']:>8}")
+                  f"nodes={row['nodes']:>6}  {gap_s}  {obj_s}  {extras}")
 
         if not args.no_scip:
             for m in methods_b:
@@ -464,7 +469,8 @@ def main():
                     row = _row("scip_unavailable", None, 0, 0, 0, 0, {}, 0, 0, 0, opt)
                 results[m][i] = row
                 print(f"  [{i+1:>3}/{args.n_instances}] {m:<22}  "
-                      f"nodes={row['nodes']:>6}  status={row['status']:>8}")
+                      f"nodes={row['nodes']:>6}  status={row['status']:>8}  "
+                      f"t={row['wall_time']:>6.2f}s")
 
     # ---- summary table ----
     print(f"\n{'='*75}")
