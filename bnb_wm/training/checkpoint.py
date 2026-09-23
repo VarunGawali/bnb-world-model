@@ -86,9 +86,16 @@ def load_weights_only(model, path, device=None):
             state, hidden_dim=model.dynamics.hidden_dim
         )
 
-    missing, unexpected = model.load_state_dict(state, strict=True)
-    if missing:
-        raise RuntimeError(f"[load_weights_only] missing keys after migration: {missing}")
+    # h_cons_proj is zero-initialised by design (no-op at load time).
+    # Allow it to be absent from old checkpoints.
+    _ZERO_INIT_OK = {"dynamics.h_cons_proj.weight"}
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing_bad = [k for k in missing if k not in _ZERO_INIT_OK]
+    if missing_bad:
+        raise RuntimeError(f"[load_weights_only] missing keys after migration: {missing_bad}")
     if unexpected:
         raise RuntimeError(f"[load_weights_only] unexpected keys: {unexpected}")
+    if missing:
+        print(f"[load_weights_only] zero-init kept for: {missing}")
     return model
