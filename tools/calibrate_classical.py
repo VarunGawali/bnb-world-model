@@ -63,7 +63,7 @@ def scip_solve(A, b, c, time_limit=120.0):
     m.setParam("presolving/maxrounds", 0)
     m.setParam("separating/maxrounds", 0)
     m.setParam("separating/maxroundsroot", 0)
-    m.setParam("branching/pscost/priority", 536870912)  # make pseudocost default
+    m.setParam("branching/pscost/priority", 536870911)  # make pseudocost default
 
     xs = [m.addVar(f"x{j}", vtype="B", obj=float(c[j])) for j in range(n_cols)]
     for i in range(m_rows):
