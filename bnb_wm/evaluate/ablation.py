@@ -397,7 +397,7 @@ def run(model, device, configs, n_instances, generator_kwargs,
     # ranking ground truth).  SB scores are expensive so we subsample them to
     # at most SB_NODES_PER_INSTANCE per instance.  When no rollout method is
     # active, use single NodeBipartite observation to avoid SB overhead.
-    need_sb = bool(rollout_acc)
+    need_sb = any(cfg.get("mode") == "rollout" for cfg in configs.values())
     SB_NODES_PER_INSTANCE = 20
     if need_sb:
         env = ecole.environment.Branching(
