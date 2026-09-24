@@ -54,9 +54,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from bnb_wm.features import (
-    var_features, con_features, edge_arrays,
-)
+from bnb_wm.features import edge_arrays
 from bnb_wm.solver.config import SolverConfig
 from bnb_wm.solver.lp_backend import LPBackend, CutRecord
 
@@ -434,6 +432,29 @@ class NeuralBnBSolver:
         edge_attr_np = np.concatenate([edge_attr_np, edge_attr_np], axis=0)
 
         dev = self.device
+        n_rows_per_var = (A != 0).sum(axis=0).astype(np.float32)
+        n_rows_f = max(m, 1)
+
+        # Cache constant parts of var_features / con_features (computed once per
+        # structure version instead of every node).
+        A_bin = (A != 0).astype(np.float32)          # for n_tight matmul
+        obj_max = max(float(np.abs(self._c).max()), 1e-8)
+        const_vf = np.zeros((n, 19), dtype=np.float32)
+        const_vf[:, 0] = (self._c / obj_max).astype(np.float32)
+        const_vf[:, 1] = 1.0          # has_lb
+        const_vf[:, 2] = 1.0          # has_ub
+        const_vf[:, 8] = n_rows_per_var / n_rows_f
+        const_vf[:, 18] = 1.0         # ub
+
+        obj_norm = self._c / (np.linalg.norm(self._c) + 1e-8)
+        row_norms = np.linalg.norm(A, axis=1) + 1e-8
+        obj_cos = ((A @ obj_norm) / row_norms).astype(np.float32)
+        n_vars_norm = (A_bin.sum(axis=1) / max(n, 1)).astype(np.float32)
+        const_cf = np.zeros((m, 5), dtype=np.float32)
+        const_cf[:, 0] = obj_cos
+        const_cf[:, 1] = b.astype(np.float32)
+        const_cf[:, 4] = n_vars_norm
+
         struct = dict(
             edge_index=torch.as_tensor(edge_index_np, dtype=torch.long, device=dev),
             edge_attr=torch.as_tensor(edge_attr_np, dtype=torch.float32, device=dev),
@@ -442,18 +463,42 @@ class NeuralBnBSolver:
                 torch.ones(m, dtype=torch.long, device=dev)]),
             batch=torch.zeros(n + m, dtype=torch.long, device=dev),
             n=n, m=m,
-            n_rows_per_var=(A != 0).sum(axis=0).astype(np.float32),
+            n_rows_per_var=n_rows_per_var,
             A=A, b=b,
+            A_bin=A_bin, const_vf=const_vf, const_cf=const_cf, n_rows_f=n_rows_f,
         )
         self._struct_cache = (sv, struct)
         return struct
 
     def _encode(self, sol, vlb, vub):
         st = self._structure()
-        A, b, n, m = st["A"], st["b"], st["n"], st["m"]
+        b, n, m = st["b"], st["n"], st["m"]
 
-        vf = var_features(A, b, self._c, sol, st["n_rows_per_var"])
-        cf = con_features(A, b, self._c, sol)
+        # Compute only dynamic feature columns; constant cols come from cache.
+        x_sol = np.asarray(sol["x"], dtype=np.float64)
+        rc = np.asarray(sol["rc"], dtype=np.float64)
+        rc_max = max(float(np.abs(rc).max()), 1e-8)
+        lp_obj = float(sol["obj"])
+        sol_frac = np.abs(x_sol - np.round(np.clip(x_sol, 0.0, 1.0)))
+        slack = np.asarray(sol["slack"], dtype=np.float64) - b
+        tight = (np.abs(slack) < 1e-4).astype(np.float32)
+        n_tight_per_var = tight @ st["A_bin"]   # [n] float32
+
+        vf = st["const_vf"].copy()
+        vf[:, 3] = np.asarray(sol["at_lb"], dtype=np.float32)
+        vf[:, 4] = np.asarray(sol["at_ub"], dtype=np.float32)
+        vf[:, 5] = np.asarray(sol["basis_status"], dtype=np.float32)
+        vf[:, 6] = (rc / rc_max).astype(np.float32)
+        vf[:, 13] = x_sol.astype(np.float32)
+        vf[:, 14] = sol_frac.astype(np.float32)
+        vf[:, 15] = lp_obj / (abs(lp_obj) + 1e-8)
+        vf[:, 16] = n_tight_per_var / st["n_rows_f"]
+
+        y = np.asarray(sol["y"], dtype=np.float64)
+        y_max = max(float(np.abs(y).max()), 1e-8)
+        cf = st["const_cf"].copy()
+        cf[:, 2] = tight
+        cf[:, 3] = (y / y_max).astype(np.float32)
 
         x_np = np.zeros((n + m, 19), dtype=np.float32)
         x_np[:n] = vf
@@ -824,12 +869,26 @@ class NeuralBnBSolver:
         cfg = self.cfg
         eps = cfg.dyn_pseudo_eps
         n = len(frac_idx)
+
+        # Slice h_vars to the fractional subset — VarDynamics is pointwise so
+        # the result is identical to passing all V variables, at n_frac/V cost.
+        frac_t = torch.as_tensor(frac_idx, dtype=torch.long, device=self.device)
+        h_frac = h_vars[frac_t]          # [n_frac, H]
+
+        tokens = node.past_tokens
+        s_cal, b_cal = self._dyn_calib_scale, self._dyn_calib_bias
         d_ups = np.zeros(n, dtype=np.float64)
         d_dns = np.zeros(n, dtype=np.float64)
-        for i, v in enumerate(frac_idx):
-            d_ups[i], d_dns[i] = self._dyn_bound_delta(
-                h_vars, z, node.past_tokens, v)
-        # Center across candidates so product rule can discriminate.
+        with torch.no_grad():
+            b_parent = float(self.model.dynamics_bound_pred(z))
+            h_frac_b = h_frac.unsqueeze(0)   # [1, n_frac, H] — reused each iter
+            for i in range(n):
+                a = h_frac[i].unsqueeze(0)
+                z_up, _, _ = self.model.dynamics_step_full(z, a, h_frac_b, tokens, 1.0)
+                z_dn, _, _ = self.model.dynamics_step_full(z, a, h_frac_b, tokens, -1.0)
+                d_ups[i] = s_cal * (float(self.model.dynamics_bound_pred(z_up)) - b_parent) + b_cal
+                d_dns[i] = s_cal * (float(self.model.dynamics_bound_pred(z_dn)) - b_parent) + b_cal
+
         d_ups -= d_ups.mean()
         d_dns -= d_dns.mean()
         scores = np.array([
