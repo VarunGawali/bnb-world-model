@@ -934,27 +934,37 @@ provided as supplementary material.
 % -----------------------------------------------------------------------
 \section{Conclusion}
 
-We have presented a latent dynamics model for Branch-and-Cut that plans the
-solver's discrete decisions --- branching, node selection, and the selection of
-globally valid cutting planes --- by imagining their consequences in latent space
-rather than computing them with LP solves, all while preserving the solver's
-optimality guarantee. The central empirical finding is a solve-rate
-discontinuity on medium-tier Set Cover: every neural variant proves optimality
-where every classical baseline times out, and even SCIP at $3\times$ the
-budget leaves a $16.7\%$ duality gap. Within the neural ablation, depth-1
-latent rollout reduces explored nodes by $44\%$ over imitation, while depth-3
-rollout degrades performance, mapping the boundary of current dynamics fidelity
-and pointing directly at multi-step accuracy as the key lever for future gain.
-We view this as the first realized instance of a broader agenda: learned
-dynamics models for optimization, in which a solver's decision dynamics are
-modeled so that its choices can be planned rather than guessed by fixed
-heuristics. Branch-and-Cut exercises the hardest version of that idea, planning
-inside an exact search tree under a strict correctness constraint, but the same
-machinery applies wherever a solver makes a sequence of discrete choices.
-Extending it to improvement search --- such as learned large neighborhood search
-where the latent dynamics model imagines the effect of re-optimizing a chosen
-subset of variables --- is a natural next step, and one where a forward model
-can be exploited without the exactness constraints of tree search.
+We have presented CutWorld, a latent dynamics model for Branch-and-Cut that
+plans branching, node selection, and root Gomory cut selection jointly in latent
+space, replacing the child LP solves that strong branching requires with a single
+cheap learned transition per candidate, all while preserving the solver's
+exactness guarantee. The empirical record across two difficulty tiers supports
+four conclusions. First, the solve-rate discontinuity is real and consistent:
+every neural variant closes all 10 medium-tier and all 5 hard-tier instances
+within budget; every classical rule exhausts it. The neural wall-time advantage
+of $7$--$41\%$ over most-fractional is not large in kind, but it reliably falls
+on the correct side of the budget cutoff. Second, depth-1 latent rollout is
+the dominant planning component, reducing explored nodes by $44\%$ over the
+imitation policy at medium tier and by $14\%$ at hard tier relative to
+rollout-only variants; at hard tier the depth-3 variant further reduces nodes by
+$5\%$, suggesting that the benefit of deeper search grows as trees scale and
+dynamics fidelity becomes the binding constraint rather than rollout depth
+\emph{per se}. Third, rollout does more than reduce nodes: it recovers solution
+quality lost by imitation. The imitation policy alone reaches $+4.3\%$ primal
+gap at medium tier and $+2.2\%$ at hard tier; the full model (rollout + cuts)
+closes this to $+1.9\%$ and $+1.4\%$ respectively, within $0.8$\,pp and
+$0.7$\,pp of classical methods that do not terminate. Fourth, the subtree-size
+head does not generalise beyond the training distribution, reversing its
+easy-tier gain at both medium and hard tier; expanding the training distribution
+is the most direct path to closing this gap. We view CutWorld as the first
+realized instance of a broader agenda: learned dynamics models for optimization,
+in which a solver's sequential decisions are planned in imagination rather than
+resolved by fixed heuristics. Branch-and-Cut is the hardest setting for this
+idea --- exact tree search under a strict correctness constraint --- yet the
+core pattern holds. The same machinery applies wherever a solver makes a
+sequence of discrete choices, and extending it to improvement search, where a
+forward model imagines the effect of re-optimizing a chosen neighborhood, is a
+natural next step that carries none of the exactness constraints of tree search.
 
 % -----------------------------------------------------------------------
 \subsubsection*{Reproducibility Statement}
