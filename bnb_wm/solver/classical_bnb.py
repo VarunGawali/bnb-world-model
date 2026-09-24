@@ -67,6 +67,11 @@ class Node:
     parent_id: Optional[int] = None
     priority: float = 0.0
     warm_basis: Optional[tuple] = None
+    # For pseudocost updates from actual child LP (not just SB evals)
+    parent_lb: Optional[float] = None  # LP obj of branching parent
+    branch_var: Optional[int] = None   # variable we branched on to reach this node
+    branch_dir: int = 0                # +1 = rounded up, -1 = rounded down
+    branch_frac: float = 0.0           # fractionality of branch_var at branch point
 
     def __lt__(self, other):
         return self.priority > other.priority
@@ -272,8 +277,22 @@ class ClassicalBnBSolver:
 
             # Gate 3: infeasible / dominated
             if not lp.feasible:
+                # Update pseudocost: infeasible child = large gain
+                if node.branch_var is not None and node.parent_lb is not None:
+                    gain = abs(self._c[node.branch_var]) * 10.0
+                    f = ((1.0 - node.branch_frac) if node.branch_dir > 0
+                         else node.branch_frac)
+                    self._pc.update(node.branch_var, node.branch_dir,
+                                    gain, max(f, 1e-9))
                 self._diag["g3_infeasible"] += 1
                 continue
+            # Update pseudocost from actual child LP objective.
+            if node.branch_var is not None and node.parent_lb is not None:
+                gain = max(lp.obj - node.parent_lb, 0.0)
+                f = ((1.0 - node.branch_frac) if node.branch_dir > 0
+                     else node.branch_frac)
+                self._pc.update(node.branch_var, node.branch_dir,
+                                gain, max(f, 1e-9))
             if lp.obj >= global_ub - 1e-6:
                 self._diag["g3_dominated"] += 1
                 continue
@@ -318,6 +337,8 @@ class ClassicalBnBSolver:
             branch_var = self._select_branch_var(
                 lp, frac_idx, node, global_ub)
 
+            bv_frac = float(lp.x[branch_var]) - np.floor(float(lp.x[branch_var]))
+
             # Children (lazy LPs)
             for direction, (new_lb_val, new_ub_val) in (
                 (+1, (1.0, 1.0)),
@@ -338,6 +359,10 @@ class ClassicalBnBSolver:
                     node_id=next_id, parent_id=node.node_id,
                     priority=-node.lb,
                     warm_basis=lp.basis,
+                    parent_lb=lp.obj,
+                    branch_var=branch_var,
+                    branch_dir=direction,
+                    branch_frac=bv_frac,
                 ))
                 next_id += 1
 

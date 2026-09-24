@@ -32,35 +32,17 @@ Usage
 Method matrix
 -------------
 Group A (our harness — wall-clock and nodes both comparable):
-  mf                most-fractional branching
-  classical_sb0     pure pseudocost (0 SB LPs)
-  classical_sb1     reliability branching, eta=1
-  classical_sb4     reliability branching, eta=4  ← primary baseline
-  classical_sb8     reliability branching, eta=8
-  classical_sbfull  full strong branching
-  mf_blend_20       rank-blend α=0.20 (optimum from sweep)  ← cheap headline
-  mf_blend_25       rank-blend α=0.25
-  mf_blend_30       rank-blend α=0.30
-  mf_blend_20_cuts  mf_blend_20 + heuristic cuts (no rollout overhead)
-  blend_rollout     mf_blend_20 + rollout lookahead (negative result: rollout doesn't help on good shortlist)
-  blend_rollout_cuts mf_blend_20 + rollout + heuristic cuts
-  dyn_pseudo        dynamics bound predictor replaces child LPs (world-model test)
-  dyn_pseudo_blend  dyn_pseudo + MF blend at α=0.20 as fallback ranker
-  policy            GNN policy argmax
-  rollout           + latent lookahead
-  rollout_size_05   rollout with SubtreeSizeHead weight=0.5, ctg_weight=0
-  rollout_size_10   rollout with SubtreeSizeHead weight=1.0, ctg_weight=0
-  rollout_size_20   rollout with SubtreeSizeHead weight=2.0, ctg_weight=0
-  rollout_cuts_heur + max-violation cuts
-  rollout_cuts_attn + attention-scored cuts (parameter-free)
-  neural_full       best rollout config: rollout + heuristic cuts + best-bound  ← rollout headline
-
-Leave-one-out ablation against neural_full:
-  neural_loo_no_rollout  policy + cuts (no lookahead)
-  neural_loo_no_cuts     rollout, no cuts
-  neural_loo_ors         neural_full + ORS cascade
-  neural_loo_katz        neural_full + Katz blend
-  neural_loo_ctg         neural_full + cost-to-go node selection
+  mf                    most-fractional branching
+  classical_sb1         reliability branching, eta=1
+  classical_sb4         reliability branching, eta=4  ← primary baseline
+  classical_sb8         reliability branching, eta=8
+  policy                GNN policy argmax (no rollout)
+  mf_blend_20           rank-blend α=0.20  ← cheap headline
+  mf_blend_20_cuts_attn mf_blend_20 + attention-scored cuts
+  rollout_d1            rollout depth=1, size_weight=0, ctg_weight=0
+  rollout_d1_size1      rollout depth=1, size_weight=1.0, ctg_weight=0
+  rollout_d2_size1      rollout depth=2, size_weight=1.0, ctg_weight=0  ← ablation axis
+  blend_rollout_d1_size1_cuts_attn   mf_blend_20 + rollout_d1 + size1 + attn cuts  ← candidate headline
 
 Group B (SCIP harness — node counts only, never wall-clock vs Group A):
   scip_default      SCIP defaults
@@ -202,7 +184,7 @@ def run_classical(solver, A, b, c, opt):
 
 def build_neural(model, device, branch_mode, cut_mode, ors_cascade,
                  katz_weight, node_selection, time_limit, node_limit,
-                 size_weight=0.0, ctg_weight=1.0):
+                 size_weight=0.0, ctg_weight=0.0, cut_pool_max=200, **kw):
     from bnb_wm.solver.neural_bnb import NeuralBnBSolver
     from bnb_wm.solver.config import SolverConfig
     cfg = SolverConfig(
@@ -213,10 +195,13 @@ def build_neural(model, device, branch_mode, cut_mode, ors_cascade,
         node_selection=node_selection,
         size_weight=size_weight,
         ctg_weight=ctg_weight,
+        cut_pool_max=cut_pool_max,
+        cut_budget_cap=cut_pool_max,
         primal_heuristic=True,
         time_limit=time_limit,
         node_limit=node_limit,
         exact=True,
+        **kw,
     )
     return NeuralBnBSolver(model, device, cfg)
 
@@ -385,31 +370,21 @@ def run_scip(A, b, c, opt, time_limit, variant="default"):
 # ---------------------------------------------------------------------------
 
 ALL_METHODS_A = [
+    # Classical baselines
     "mf",
-    "classical_sb0", "classical_sb1", "classical_sb4",
-    "classical_sb8", "classical_sbfull",
-    "mf_blend_20",
-    "mf_blend_25",
-    "mf_blend_30",
-    "mf_blend_20_cuts",
-    "blend_rollout",
-    "blend_rollout_cuts",
-    "dyn_pseudo",
-    "dyn_pseudo_blend",
+    "classical_sb1",
+    "classical_sb4",
+    "classical_sb8",
+    # Neural: cheap / no-rollout
     "policy",
-    "rollout",
-    "rollout_size_05",
-    "rollout_size_10",
-    "rollout_size_20",
-    "rollout_cuts_heur",
-    "rollout_cuts_attn",
-    "neural_full",
-    # leave-one-out rows against neural_full
-    "neural_loo_no_rollout",
-    "neural_loo_no_cuts",
-    "neural_loo_ors",
-    "neural_loo_katz",
-    "neural_loo_ctg",
+    "mf_blend_20",
+    "mf_blend_20_cuts_attn",
+    # Neural: rollout ladder (two depth × two size_weight rows)
+    "rollout_d1",
+    "rollout_d1_size1",
+    "rollout_d2_size1",
+    # Candidate headline: blend + rollout + size + cuts
+    "blend_rollout_d1_size1_cuts_attn",
 ]
 
 ALL_METHODS_B = [
@@ -420,15 +395,8 @@ ALL_METHODS_B = [
 
 
 def method_needs_model(name):
-    return name in ("mf_blend_20", "mf_blend_25", "mf_blend_30",
-                    "mf_blend_20_cuts", "blend_rollout", "blend_rollout_cuts",
-                    "dyn_pseudo", "dyn_pseudo_blend",
-                    "policy", "rollout",
-                    "rollout_size_05", "rollout_size_10", "rollout_size_20",
-                    "rollout_cuts_heur", "rollout_cuts_attn",
-                    "neural_full",
-                    "neural_loo_no_rollout", "neural_loo_no_cuts",
-                    "neural_loo_ors", "neural_loo_katz", "neural_loo_ctg")
+    return name not in ("mf", "classical_sb1", "classical_sb4", "classical_sb8",
+                        "scip_default", "scip_pseudocost", "scip_fullstrong")
 
 
 def method_is_scip(name):
@@ -441,11 +409,26 @@ def method_is_scip(name):
 
 def print_table(results: dict, methods: list, opt_col="nodes"):
     """results[method][instance_idx] -> row dict"""
-    print(f"\n{'Method':<22}  {'SGM nodes':>10}  {'SGM time':>9}  "
-          f"{'solved':>6}  {'dec_lps':>8}  {'SGM dist':>9}")
-    print("-" * 75)
+    # Find the common-solved set across all methods in this table
+    all_inst = set()
+    for m in methods:
+        if m in results:
+            all_inst.update(results[m].keys())
+    common_solved = all_inst.copy()
+    for m in methods:
+        if m not in results:
+            continue
+        solved_inst = {i for i, r in results[m].items() if r["solved"]}
+        common_solved &= solved_inst
+    n_common = len(common_solved)
+
+    print(f"\n{'Method':<34}  {'SGM nodes':>10}  {'SGM time':>9}  "
+          f"{'solved':>6}  {'dec_lps':>8}  {'gap@end':>8}  {'SGM dist':>9}")
+    print("-" * 92)
 
     for m in methods:
+        if m not in results:
+            continue
         rows = [results[m][i] for i in sorted(results[m])]
         if not rows:
             continue
@@ -455,8 +438,15 @@ def print_table(results: dict, methods: list, opt_col="nodes"):
         dist_sgm = sgm([r["dist_from_optimum"] for r in rows
                         if np.isfinite(r["dist_from_optimum"])], shift=0.01)
         dec_sgm  = sgm([r["decision_lps"] for r in rows], shift=1)
-        print(f"{m:<22}  {node_sgm:>10.1f}  {time_sgm:>9.2f}  "
-              f"{n_solved:>6}/{len(rows)}  {dec_sgm:>8.1f}  {dist_sgm:>9.4f}")
+        gaps = [r["gap_at_end"] for r in rows
+                if r["gap_at_end"] is not None and np.isfinite(r["gap_at_end"])]
+        gap_mean = np.mean(gaps) if gaps else float("nan")
+        print(f"{m:<34}  {node_sgm:>10.1f}  {time_sgm:>9.2f}  "
+              f"{n_solved:>6}/{len(rows)}  {dec_sgm:>8.1f}  "
+              f"{gap_mean:>8.4f}  {dist_sgm:>9.4f}")
+
+    if n_common < len(all_inst):
+        print(f"  [common-solved subset: {n_common}/{len(all_inst)} instances]")
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +470,8 @@ def main():
     ap.add_argument("--no_scip",      action="store_true")
     ap.add_argument("--device",       default="cuda")
     ap.add_argument("--out",          required=True)
+    ap.add_argument("--cut_pool_max", type=int, default=200,
+                    help="Cap cut pool size (use ~20 for hard/large instances).")
     args = ap.parse_args()
 
     # ---- load optima ----
@@ -526,88 +518,77 @@ def main():
     # ---- build solver instances ----
     tl = args.time_limit
     nl = args.node_limit
+    cpm = args.cut_pool_max
 
     solvers: dict = {}
     for m in methods_a:
+        # ---- Classical ----
         if m == "mf":
             solvers[m] = ("classical", build_classical(0, 99, tl, nl))
-        elif m == "classical_sb0":
-            solvers[m] = ("classical", build_classical(0, 4, tl, nl))
         elif m == "classical_sb1":
             solvers[m] = ("classical", build_classical(1, 1, tl, nl))
         elif m == "classical_sb4":
             solvers[m] = ("classical", build_classical(4, 4, tl, nl))
         elif m == "classical_sb8":
             solvers[m] = ("classical", build_classical(8, 4, tl, nl))
-        elif m == "classical_sbfull":
-            solvers[m] = ("classical", build_classical(None, 4, tl, nl))
-        elif m == "mf_blend_20":
-            solvers[m] = ("neural", _build_mf_blend(model, device, 0.20, tl, nl))
-        elif m == "mf_blend_25":
-            solvers[m] = ("neural", _build_mf_blend(model, device, 0.25, tl, nl))
-        elif m == "mf_blend_30":
-            solvers[m] = ("neural", _build_mf_blend(model, device, 0.30, tl, nl))
-        elif m == "mf_blend_20_cuts":
-            solvers[m] = ("neural", _build_mf_blend_cuts(model, device, 0.20, tl, nl))
-        elif m == "blend_rollout":
-            # rollout with blended shortlist — key negative result
-            solvers[m] = ("neural", _build_blend_rollout(model, device, 0.20, tl, nl))
-        elif m == "blend_rollout_cuts":
-            solvers[m] = ("neural", _build_blend_rollout_cuts(model, device, 0.20, tl, nl))
-        elif m == "dyn_pseudo":
-            solvers[m] = ("neural", _build_dyn_pseudo(model, device, tl, nl))
-        elif m == "dyn_pseudo_blend":
-            solvers[m] = ("neural", _build_dyn_pseudo(model, device, tl, nl,
-                                                       mf_blend_alpha=0.20))
+        # ---- Neural: cheap ----
         elif m == "policy":
             solvers[m] = ("neural", build_neural(
                 model, device, "policy", "none", False, 0.0, "bound", tl, nl))
-        elif m == "rollout":
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "none", False, 0.0, "bound", tl, nl))
-        elif m == "rollout_size_05":
+        elif m == "mf_blend_20":
+            solvers[m] = ("neural", _build_mf_blend(model, device, 0.20, tl, nl))
+        elif m == "mf_blend_20_cuts_attn":
+            from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+            from bnb_wm.solver.config import SolverConfig
+            cfg = SolverConfig(
+                branch_mode="policy", cut_mode="attention",
+                ors_cascade=False, katz_weight=0.0,
+                mf_blend_alpha=0.20, node_selection="bound",
+                size_weight=0.0, ctg_weight=0.0,
+                cut_pool_max=cpm, cut_budget_cap=cpm,
+                primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
+            )
+            solvers[m] = ("neural", NeuralBnBSolver(model, device, cfg))
+        # ---- Neural: rollout ladder ----
+        elif m == "rollout_d1":
             solvers[m] = ("neural", build_neural(
                 model, device, "rollout", "none", False, 0.0, "bound", tl, nl,
-                size_weight=0.5, ctg_weight=0.0))
-        elif m == "rollout_size_10":
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "none", False, 0.0, "bound", tl, nl,
-                size_weight=1.0, ctg_weight=0.0))
-        elif m == "rollout_size_20":
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "none", False, 0.0, "bound", tl, nl,
-                size_weight=2.0, ctg_weight=0.0))
-        elif m == "rollout_cuts_heur":
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "heuristic", False, 0.0, "bound", tl, nl))
-        elif m == "rollout_cuts_attn":
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "attention", False, 0.0, "bound", tl, nl))
-        elif m == "neural_full":
-            # best assembled config: rollout + heuristic cuts + best-bound node sel
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "heuristic", False, 0.0, "bound", tl, nl))
-        # ---- leave-one-out ablation against neural_full ----
-        elif m == "neural_loo_no_rollout":
-            # policy argmax + heuristic cuts (no rollout lookahead)
-            solvers[m] = ("neural", build_neural(
-                model, device, "policy", "heuristic", False, 0.0, "bound", tl, nl))
-        elif m == "neural_loo_no_cuts":
-            # rollout, no cuts
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "none", False, 0.0, "bound", tl, nl))
-        elif m == "neural_loo_ors":
-            # neural_full + ORS cascade
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "heuristic", True, 0.0, "bound", tl, nl))
-        elif m == "neural_loo_katz":
-            # neural_full + Katz blend
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "heuristic", False, 0.3, "bound", tl, nl))
-        elif m == "neural_loo_ctg":
-            # neural_full + cost-to-go node selection
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "heuristic", False, 0.0, "cost_to_go", tl, nl))
+                size_weight=0.0, ctg_weight=0.0))
+        elif m == "rollout_d1_size1":
+            from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+            from bnb_wm.solver.config import SolverConfig
+            cfg = SolverConfig(
+                branch_mode="rollout", cut_mode="none",
+                ors_cascade=False, katz_weight=0.0, node_selection="bound",
+                lookahead_depth=1, size_weight=1.0, ctg_weight=0.0,
+                cut_pool_max=cpm, cut_budget_cap=cpm,
+                primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
+            )
+            solvers[m] = ("neural", NeuralBnBSolver(model, device, cfg))
+        elif m == "rollout_d2_size1":
+            from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+            from bnb_wm.solver.config import SolverConfig
+            cfg = SolverConfig(
+                branch_mode="rollout", cut_mode="none",
+                ors_cascade=False, katz_weight=0.0, node_selection="bound",
+                lookahead_depth=2, size_weight=1.0, ctg_weight=0.0,
+                cut_pool_max=cpm, cut_budget_cap=cpm,
+                primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
+            )
+            solvers[m] = ("neural", NeuralBnBSolver(model, device, cfg))
+        # ---- Neural: candidate headline ----
+        elif m == "blend_rollout_d1_size1_cuts_attn":
+            from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+            from bnb_wm.solver.config import SolverConfig
+            cfg = SolverConfig(
+                branch_mode="rollout", cut_mode="attention",
+                ors_cascade=False, katz_weight=0.0, mf_blend_alpha=0.20,
+                node_selection="bound", lookahead_depth=1,
+                size_weight=1.0, ctg_weight=0.0,
+                cut_pool_max=cpm, cut_budget_cap=cpm,
+                primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
+            )
+            solvers[m] = ("neural", NeuralBnBSolver(model, device, cfg))
 
     # ---- generate instances ----
     rng = np.random.default_rng(args.seed)
@@ -654,21 +635,11 @@ def main():
                       f"t={row['wall_time']:>6.2f}s")
 
     # ---- summary table ----
-    LOO_METHODS = {"neural_loo_no_rollout", "neural_loo_no_cuts",
-                   "neural_loo_ors", "neural_loo_katz", "neural_loo_ctg"}
-    additive_methods = [m for m in methods_a if m in results and m not in LOO_METHODS]
-    loo_methods      = [m for m in methods_a if m in results and m in LOO_METHODS]
-
     print(f"\n{'='*75}")
     print(f"GROUP A — our harness  ({args.n_rows}×{args.n_cols}, "
           f"seed={args.seed}, n={args.n_instances})")
     print(f"  time_limit={tl}s  node_limit={nl}")
-    print("\n--- additive ablation ladder ---")
-    print_table(results, additive_methods, "nodes")
-
-    if loo_methods:
-        print("\n--- leave-one-out ablation (vs neural_full) ---")
-        print_table(results, ["neural_full"] + loo_methods, "nodes")
+    print_table(results, [m for m in methods_a if m in results], "nodes")
 
     if not args.no_scip and methods_b:
         print(f"\nGROUP B — SCIP  (node counts only)")
