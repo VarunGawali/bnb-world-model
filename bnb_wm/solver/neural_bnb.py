@@ -803,59 +803,39 @@ class NeuralBnBSolver:
         return s * raw_up + b, s * raw_dn + b
 
     def _dyn_pseudo_calibrate(self, h_vars, z, x_lp, frac_idx, node, lp):
-        """Root calibration: SB a small set of candidates, fit (scale, bias)."""
-        cfg = self.cfg
-        n_calib = min(cfg.dyn_pseudo_calib_n, len(frac_idx))
-        # pick the most-fractional candidates for calibration
-        fr = np.abs(x_lp - np.round(x_lp))
-        order = np.argsort(-fr[frac_idx])
-        calib_vars = [int(frac_idx[i]) for i in order[:n_calib]]
-
-        predicted, actual = [], []
-        for v in calib_vars:
-            pred_up, pred_dn = self._dyn_bound_delta(h_vars, z, node.past_tokens, v)
-            # solve both child LPs
-            for fix_val, pred_d in ((1.0, pred_up), (0.0, pred_dn)):
-                vlb = node.var_lb.copy(); vub = node.var_ub.copy()
-                if fix_val == 1.0:
-                    vlb[v] = 1.0
-                else:
-                    vub[v] = 0.0
-                if np.any(vlb > vub + 1e-9):
-                    continue
-                child_lp = self._lp_solve(vlb, vub, lp.basis)
-                if child_lp.feasible:
-                    actual_d = child_lp.obj - lp.obj
-                    predicted.append(pred_d)
-                    actual.append(actual_d)
-
+        """Root calibration (no-op): centering in _dynamics_pseudo_scores makes
+        affine recalibration unnecessary.  Just marks the flag so the root check
+        doesn't fire again."""
         self._dyn_calib_done = True
-        if len(predicted) < 2:
-            return  # not enough data; keep scale=1, bias=0
-
-        p = np.array(predicted, dtype=np.float64)
-        a = np.array(actual, dtype=np.float64)
-        # least-squares fit: actual ≈ scale * predicted + bias
-        A_mat = np.stack([p, np.ones_like(p)], axis=1)
-        try:
-            coeffs, _, _, _ = np.linalg.lstsq(A_mat, a, rcond=None)
-            self._dyn_calib_scale = float(coeffs[0])
-            self._dyn_calib_bias = float(coeffs[1])
-        except np.linalg.LinAlgError:
-            pass  # keep defaults
 
     def _dynamics_pseudo_scores(self, h_vars, z, x_lp, frac_idx, node):
-        """Score each fractional candidate with the product rule on predicted Δs.
+        """Score each fractional candidate using predicted child-bound deltas.
 
-        Calibrates once at the root node, then uses the affine map forward.
+        The dynamics model's absolute bound predictions are systematically
+        biased (both children score below the parent), so the product rule on
+        raw deltas collapses to eps^2 for every variable.  Instead we:
+          1. Collect (d_up, d_dn) for every candidate.
+          2. Cross-center: subtract each column's mean so the product rule
+             operates on relative improvement across candidates.
+          3. Apply the standard product rule on the centered values.
+
         Returns a 1-D array of length len(frac_idx).
         """
         cfg = self.cfg
         eps = cfg.dyn_pseudo_eps
-        scores = np.zeros(len(frac_idx), dtype=np.float64)
+        n = len(frac_idx)
+        d_ups = np.zeros(n, dtype=np.float64)
+        d_dns = np.zeros(n, dtype=np.float64)
         for i, v in enumerate(frac_idx):
-            d_up, d_dn = self._dyn_bound_delta(h_vars, z, node.past_tokens, v)
-            scores[i] = max(d_up, eps) * max(d_dn, eps)
+            d_ups[i], d_dns[i] = self._dyn_bound_delta(
+                h_vars, z, node.past_tokens, v)
+        # Center across candidates so product rule can discriminate.
+        d_ups -= d_ups.mean()
+        d_dns -= d_dns.mean()
+        scores = np.array([
+            max(d_ups[i], eps) * max(d_dns[i], eps)
+            for i in range(n)
+        ], dtype=np.float64)
         return scores
 
     def _policy_scores(self, h_vars, z, x_lp):
