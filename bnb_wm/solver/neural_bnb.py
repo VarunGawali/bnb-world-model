@@ -161,6 +161,7 @@ class NeuralBnBSolver:
         cfg = self.cfg
         t0 = time.perf_counter()
 
+        self._t0 = t0
         A = np.ascontiguousarray(A, dtype=np.float64)
         b = np.ascontiguousarray(b, dtype=np.float64)
         c = np.ascontiguousarray(c, dtype=np.float64)
@@ -689,30 +690,20 @@ class NeuralBnBSolver:
         loose = torch.as_tensor(
             slack * frac_support, dtype=h_vars.dtype, device=self.device)  # [m0]
 
-        # --- constraint embeddings in variable space (mean-normalised) ---
-        h_con = torch.zeros(m0, H, device=self.device, dtype=h_vars.dtype)
-        for j in range(m0):
-            nz = np.flatnonzero(A_bin[j] > 0)
-            if len(nz) == 0:
-                continue
-            idx = torch.as_tensor(nz, dtype=torch.long, device=self.device)
-            w = torch.as_tensor(
-                A[j, nz].astype(np.float32), dtype=h_vars.dtype,
-                device=self.device)
-            h_con[j] = (w.unsqueeze(1) * h_vars.index_select(0, idx)).sum(0) / len(nz)
+        # --- constraint embeddings: [m0, H] via single matmul ---
+        A_w = torch.as_tensor(
+            (A * A_bin).astype(np.float32), dtype=h_vars.dtype, device=self.device)
+        row_nnz_t = torch.as_tensor(
+            row_nnz.astype(np.float32), dtype=h_vars.dtype, device=self.device).unsqueeze(1)
+        h_con = (A_w @ h_vars) / row_nnz_t   # [m0, H]
 
-        # --- cut embeddings in the same space (mean-normalised) ---
+        # --- cut embeddings: [K, H] via single matmul ---
         K = len(cands)
-        h_cut = torch.zeros(K, H, device=self.device, dtype=h_vars.dtype)
-        for k, cut in enumerate(cands):
-            nz = np.flatnonzero(np.abs(cut.lhs) > 1e-9)
-            if len(nz) == 0:
-                continue
-            idx = torch.as_tensor(nz, dtype=torch.long, device=self.device)
-            w = torch.as_tensor(
-                cut.lhs[nz].astype(np.float32), dtype=h_vars.dtype,
-                device=self.device)
-            h_cut[k] = (w.unsqueeze(1) * h_vars.index_select(0, idx)).sum(0) / len(nz)
+        lhs_mat = np.stack([c.lhs for c in cands], axis=0).astype(np.float32)  # [K, n]
+        lhs_nnz = np.maximum((np.abs(lhs_mat) > 1e-9).sum(axis=1, keepdims=True), 1.0)
+        lhs_t = torch.as_tensor(lhs_mat, dtype=h_vars.dtype, device=self.device)
+        lhs_nnz_t = torch.as_tensor(lhs_nnz.astype(np.float32), dtype=h_vars.dtype, device=self.device)
+        h_cut = (lhs_t @ h_vars) / lhs_nnz_t   # [K, H]
 
         # --- cross-attention: K × m0 ---
         scale = H ** -0.5
@@ -780,6 +771,8 @@ class NeuralBnBSolver:
 
     def _do_cuts(self, lp, h_vars, z, node, frac_idx):
         cfg = self.cfg
+        if time.perf_counter() - self._t0 > cfg.time_limit:
+            return lp, h_vars, z, frac_idx, False
         cands = self._violated_cuts(lp.x)
         if not cands:
             self._last_cut_gain = 0.0
