@@ -38,22 +38,17 @@ Group A (our harness — wall-clock and nodes both comparable):
   classical_sb4     reliability branching, eta=4  ← primary baseline
   classical_sb8     reliability branching, eta=8
   classical_sbfull  full strong branching
-  mf_blend_10       rank-blend α=0.10
-  mf_blend_15       rank-blend α=0.15
-  mf_blend_20       rank-blend α=0.20
-  mf_blend_25       rank-blend α=0.25 (75% MF, 25% policy)
+  mf_blend_20       rank-blend α=0.20 (optimum from sweep)  ← cheap headline
+  mf_blend_25       rank-blend α=0.25
   mf_blend_30       rank-blend α=0.30
-  mf_blend_50       rank-blend α=0.50 (equal weight)
-  mf_blend_75       rank-blend α=0.75 (75% policy, 25% MF)
-  blend_rollout     mf_blend_25 + rollout lookahead (world-model test)
+  mf_blend_20_cuts  mf_blend_20 + heuristic cuts (no rollout overhead)
+  blend_rollout     mf_blend_20 + rollout lookahead (negative result: rollout doesn't help on good shortlist)
+  blend_rollout_cuts mf_blend_20 + rollout + heuristic cuts
   policy            GNN policy argmax
   rollout           + latent lookahead
-  rollout_ors       + ORS cascade
-  rollout_katz      + Katz blend
   rollout_cuts_heur + max-violation cuts
-  rollout_cuts_lat  + latent cut beam
   rollout_cuts_attn + attention-scored cuts (parameter-free)
-  neural_full       best assembled config: rollout + heuristic cuts + best-bound  ← headline
+  neural_full       best rollout config: rollout + heuristic cuts + best-bound  ← rollout headline
 
 Leave-one-out ablation against neural_full:
   neural_loo_no_rollout  policy + cuts (no lookahead)
@@ -237,6 +232,44 @@ def _build_blend_rollout(model, device, alpha, time_limit, node_limit):
     return NeuralBnBSolver(model, device, cfg)
 
 
+def _build_mf_blend_cuts(model, device, alpha, time_limit, node_limit):
+    """Blended branching + heuristic cuts, no rollout."""
+    from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+    from bnb_wm.solver.config import SolverConfig
+    cfg = SolverConfig(
+        branch_mode="policy",
+        cut_mode="heuristic",
+        ors_cascade=False,
+        katz_weight=0.0,
+        mf_blend_alpha=alpha,
+        node_selection="bound",
+        primal_heuristic=True,
+        time_limit=time_limit,
+        node_limit=node_limit,
+        exact=True,
+    )
+    return NeuralBnBSolver(model, device, cfg)
+
+
+def _build_blend_rollout_cuts(model, device, alpha, time_limit, node_limit):
+    """Blended rollout + heuristic cuts."""
+    from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+    from bnb_wm.solver.config import SolverConfig
+    cfg = SolverConfig(
+        branch_mode="rollout",
+        cut_mode="heuristic",
+        ors_cascade=False,
+        katz_weight=0.0,
+        mf_blend_alpha=alpha,
+        node_selection="bound",
+        primal_heuristic=True,
+        time_limit=time_limit,
+        node_limit=node_limit,
+        exact=True,
+    )
+    return NeuralBnBSolver(model, device, cfg)
+
+
 def _build_mf_blend(model, device, alpha, time_limit, node_limit):
     from bnb_wm.solver.neural_bnb import NeuralBnBSolver
     from bnb_wm.solver.config import SolverConfig
@@ -328,20 +361,15 @@ ALL_METHODS_A = [
     "mf",
     "classical_sb0", "classical_sb1", "classical_sb4",
     "classical_sb8", "classical_sbfull",
-    "mf_blend_10",
-    "mf_blend_15",
     "mf_blend_20",
     "mf_blend_25",
     "mf_blend_30",
-    "mf_blend_50",
-    "mf_blend_75",
+    "mf_blend_20_cuts",
     "blend_rollout",
+    "blend_rollout_cuts",
     "policy",
     "rollout",
-    "rollout_ors",
-    "rollout_katz",
     "rollout_cuts_heur",
-    "rollout_cuts_lat",
     "rollout_cuts_attn",
     "neural_full",
     # leave-one-out rows against neural_full
@@ -360,11 +388,10 @@ ALL_METHODS_B = [
 
 
 def method_needs_model(name):
-    return name in ("mf_blend_10", "mf_blend_15", "mf_blend_20",
-                    "mf_blend_25", "mf_blend_30", "mf_blend_50", "mf_blend_75",
-                    "blend_rollout",
-                    "policy", "rollout", "rollout_ors", "rollout_katz",
-                    "rollout_cuts_heur", "rollout_cuts_lat", "rollout_cuts_attn",
+    return name in ("mf_blend_20", "mf_blend_25", "mf_blend_30",
+                    "mf_blend_20_cuts", "blend_rollout", "blend_rollout_cuts",
+                    "policy", "rollout",
+                    "rollout_cuts_heur", "rollout_cuts_attn",
                     "neural_full",
                     "neural_loo_no_rollout", "neural_loo_no_cuts",
                     "neural_loo_ors", "neural_loo_katz", "neural_loo_ctg")
@@ -480,41 +507,28 @@ def main():
             solvers[m] = ("classical", build_classical(8, 4, tl, nl))
         elif m == "classical_sbfull":
             solvers[m] = ("classical", build_classical(None, 4, tl, nl))
-        elif m == "mf_blend_10":
-            solvers[m] = ("neural", _build_mf_blend(model, device, 0.10, tl, nl))
-        elif m == "mf_blend_15":
-            solvers[m] = ("neural", _build_mf_blend(model, device, 0.15, tl, nl))
         elif m == "mf_blend_20":
             solvers[m] = ("neural", _build_mf_blend(model, device, 0.20, tl, nl))
         elif m == "mf_blend_25":
             solvers[m] = ("neural", _build_mf_blend(model, device, 0.25, tl, nl))
         elif m == "mf_blend_30":
             solvers[m] = ("neural", _build_mf_blend(model, device, 0.30, tl, nl))
-        elif m == "mf_blend_50":
-            solvers[m] = ("neural", _build_mf_blend(model, device, 0.50, tl, nl))
-        elif m == "mf_blend_75":
-            solvers[m] = ("neural", _build_mf_blend(model, device, 0.75, tl, nl))
+        elif m == "mf_blend_20_cuts":
+            solvers[m] = ("neural", _build_mf_blend_cuts(model, device, 0.20, tl, nl))
         elif m == "blend_rollout":
-            # rollout lookahead with mf_blend_alpha=0.25 as the candidate ranker
-            solvers[m] = ("neural", _build_blend_rollout(model, device, 0.25, tl, nl))
+            # rollout with blended shortlist — key negative result
+            solvers[m] = ("neural", _build_blend_rollout(model, device, 0.20, tl, nl))
+        elif m == "blend_rollout_cuts":
+            solvers[m] = ("neural", _build_blend_rollout_cuts(model, device, 0.20, tl, nl))
         elif m == "policy":
             solvers[m] = ("neural", build_neural(
                 model, device, "policy", "none", False, 0.0, "bound", tl, nl))
         elif m == "rollout":
             solvers[m] = ("neural", build_neural(
                 model, device, "rollout", "none", False, 0.0, "bound", tl, nl))
-        elif m == "rollout_ors":
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "none", True, 0.0, "bound", tl, nl))
-        elif m == "rollout_katz":
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "none", True, 0.3, "bound", tl, nl))
         elif m == "rollout_cuts_heur":
             solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "heuristic", True, 0.3, "bound", tl, nl))
-        elif m == "rollout_cuts_lat":
-            solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "latent", True, 0.3, "bound", tl, nl))
+                model, device, "rollout", "heuristic", False, 0.0, "bound", tl, nl))
         elif m == "rollout_cuts_attn":
             solvers[m] = ("neural", build_neural(
                 model, device, "rollout", "attention", False, 0.0, "bound", tl, nl))
