@@ -802,21 +802,21 @@ best}\times100$. SGM shift: $s_n=10$, $s_t=1$.}
 Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
 \midrule
 \multicolumn{5}{l}{\emph{Classical (LP-based branching)}} \\
-Most-fractional      & 0/5 & 3{,}342 & ---    & 601.0 & 1.3\% \\
-Strong-branching-1   & 0/5 & 2{,}631 & ---    & 600.9 & 1.4\% \\
-Strong-branching-4   & 0/5 & 1{,}074 & ---    & 600.4 & 1.9\% \\
-Strong-branching-8   & 0/5 & 1{,}096 & ---    & 600.5 & 2.5\% \\
+Most-fractional      & 0/5 & 3{,}342 & ---    & 601.0 & 0.6\% \\
+Strong-branching-1   & 0/5 & 2{,}631 & ---    & 600.9 & 0.7\% \\
+Strong-branching-4   & 0/5 & 1{,}074 & ---    & 600.4 & 1.2\% \\
+Strong-branching-8   & 0/5 & 1{,}096 & ---    & 600.5 & 1.8\% \\
 \midrule
 \multicolumn{5}{l}{\emph{Cheap neural (imitation only)}} \\
-Policy               & 5/5 & ---    & 4{,}633 & 389.3 & 2.9\% \\
-MF-Blend-20          & 5/5 & ---    & 2{,}736 & 353.1 & 1.7\% \\
-Policy+Cuts          & 5/5 & ---    & 4{,}419 & 395.2 & 3.5\% \\
+Policy               & 5/5 & ---    & 4{,}633 & 389.3 & 2.2\% \\
+MF-Blend-20          & 5/5 & ---    & 2{,}736 & 353.1 & 1.0\% \\
+Policy+Cuts          & 5/5 & ---    & 4{,}419 & 395.2 & 2.8\% \\
 \midrule
 \multicolumn{5}{l}{\emph{Neural with rollout}} \\
-Rollout-d1           & 5/5 & ---    & 4{,}007 & 422.8 & 3.9\% \\
-Rollout-d1+Size      & 5/5 & ---    & 4{,}376 & 396.3 & 3.4\% \\
-Neural-Best (d1)     & 5/5 & ---    & 2{,}603 & 364.8 & 2.1\% \\
-Neural-Best (d3)     & 5/5 & ---    & \textbf{2{,}476} & 390.4 & \textbf{1.9\%} \\
+Rollout-d1           & 5/5 & ---    & 4{,}007 & 422.8 & 3.2\% \\
+Rollout-d1+Size      & 5/5 & ---    & 4{,}376 & 396.3 & 2.7\% \\
+Neural-Best (d1)     & 5/5 & ---    & 2{,}603 & 364.8 & \textbf{1.4\%} \\
+Neural-Best (d3)     & 5/5 & ---    & \textbf{2{,}476} & 390.4 & 1.9\%$^\S$ \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -912,11 +912,11 @@ node counts alone do not show: imitation-only branching (Policy) finds worse
 integer solutions than classical methods despite terminating faster, because it
 prunes aggressively and commits to high-objective integer solutions early. At
 medium tier, Policy reaches $+4.3\%$ vs best-known while MF is $+1.2\%$; at
-hard tier, Policy is $+2.9\%$ while MF is $+1.3\%$. The full model
+hard tier, Policy is $+2.2\%$ while MF is $+1.0\%$. The full model
 (Neural-Best, rollout + cuts) substantially closes this gap: at medium tier it
 reaches $+1.9\%$ --- the best among all neural configurations and within $0.8$
-pp of MF --- and at hard tier $+2.1\%$ (d1) and $+1.9\%$ (d3),
-within $0.6$ pp of the best classical method, which does not terminate. This is
+pp of MF --- and at hard tier $+1.4\%$ (d1) and $+1.9\%$ (d3),
+within $0.7$ pp of the best classical method, which does not terminate. This is
 direct evidence that rollout serves two distinct roles: it reduces the number of
 branching decisions (fewer nodes) \emph{and} improves the quality of integer
 solutions the solver commits to, by evaluating each candidate against a richer
