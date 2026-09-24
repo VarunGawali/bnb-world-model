@@ -48,6 +48,9 @@ Group A (our harness — wall-clock and nodes both comparable):
   dyn_pseudo_blend  dyn_pseudo + MF blend at α=0.20 as fallback ranker
   policy            GNN policy argmax
   rollout           + latent lookahead
+  rollout_size_05   rollout with SubtreeSizeHead weight=0.5, ctg_weight=0
+  rollout_size_10   rollout with SubtreeSizeHead weight=1.0, ctg_weight=0
+  rollout_size_20   rollout with SubtreeSizeHead weight=2.0, ctg_weight=0
   rollout_cuts_heur + max-violation cuts
   rollout_cuts_attn + attention-scored cuts (parameter-free)
   neural_full       best rollout config: rollout + heuristic cuts + best-bound  ← rollout headline
@@ -198,7 +201,8 @@ def run_classical(solver, A, b, c, opt):
 
 
 def build_neural(model, device, branch_mode, cut_mode, ors_cascade,
-                 katz_weight, node_selection, time_limit, node_limit):
+                 katz_weight, node_selection, time_limit, node_limit,
+                 size_weight=0.0, ctg_weight=1.0):
     from bnb_wm.solver.neural_bnb import NeuralBnBSolver
     from bnb_wm.solver.config import SolverConfig
     cfg = SolverConfig(
@@ -207,6 +211,8 @@ def build_neural(model, device, branch_mode, cut_mode, ors_cascade,
         ors_cascade=ors_cascade,
         katz_weight=katz_weight,
         node_selection=node_selection,
+        size_weight=size_weight,
+        ctg_weight=ctg_weight,
         primal_heuristic=True,
         time_limit=time_limit,
         node_limit=node_limit,
@@ -392,6 +398,9 @@ ALL_METHODS_A = [
     "dyn_pseudo_blend",
     "policy",
     "rollout",
+    "rollout_size_05",
+    "rollout_size_10",
+    "rollout_size_20",
     "rollout_cuts_heur",
     "rollout_cuts_attn",
     "neural_full",
@@ -415,6 +424,7 @@ def method_needs_model(name):
                     "mf_blend_20_cuts", "blend_rollout", "blend_rollout_cuts",
                     "dyn_pseudo", "dyn_pseudo_blend",
                     "policy", "rollout",
+                    "rollout_size_05", "rollout_size_10", "rollout_size_20",
                     "rollout_cuts_heur", "rollout_cuts_attn",
                     "neural_full",
                     "neural_loo_no_rollout", "neural_loo_no_cuts",
@@ -555,6 +565,18 @@ def main():
         elif m == "rollout":
             solvers[m] = ("neural", build_neural(
                 model, device, "rollout", "none", False, 0.0, "bound", tl, nl))
+        elif m == "rollout_size_05":
+            solvers[m] = ("neural", build_neural(
+                model, device, "rollout", "none", False, 0.0, "bound", tl, nl,
+                size_weight=0.5, ctg_weight=0.0))
+        elif m == "rollout_size_10":
+            solvers[m] = ("neural", build_neural(
+                model, device, "rollout", "none", False, 0.0, "bound", tl, nl,
+                size_weight=1.0, ctg_weight=0.0))
+        elif m == "rollout_size_20":
+            solvers[m] = ("neural", build_neural(
+                model, device, "rollout", "none", False, 0.0, "bound", tl, nl,
+                size_weight=2.0, ctg_weight=0.0))
         elif m == "rollout_cuts_heur":
             solvers[m] = ("neural", build_neural(
                 model, device, "rollout", "heuristic", False, 0.0, "bound", tl, nl))
