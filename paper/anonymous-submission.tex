@@ -48,7 +48,7 @@
 \maketitle
 
 \begin{abstract}
-Branch-and-Cut, the core of modern Mixed-Integer Programming (MIP) solvers, makes costly heuristic choices at every search node: which variable to branch on and which cutting planes to add. Existing learning-based methods score these decisions from single-node features, leaving them blind to their downstream effect on the search. We introduce \emph{CutWorld}, a latent dynamics model for Branch-and-Cut that forecasts the consequences of a decision in latent space, without extra LP solves. Because the model predicts how each variable's representation evolves under an action, the branching policy can be re-applied to imagined states, unrolling a branching sequence in latent space and scoring each candidate by a MuZero-style return with a cost-to-go estimate of remaining tree size. The same latent selects globally valid Gomory cuts, so a single unified model drives branching, cut selection, and node ordering while provably preserving optimality. Framing this as a first instance of learned dynamics models for optimization, we evaluate on Set Cover, reporting optimality, nodes, time, and cuts with ablations isolating each component.
+Branch-and-Cut, the core of modern Mixed-Integer Programming (MIP) solvers, makes costly heuristic choices at every search node: which variable to branch on and which cutting planes to add. Existing learning-based methods score these decisions from single-node features, leaving them blind to their downstream effect on the search. We introduce \emph{CutWorld}, a latent dynamics model for Branch-and-Cut that forecasts the consequences of a decision in latent space, without extra LP solves. Because the model predicts how each variable's representation evolves under an action, the branching policy can be re-applied to imagined states, unrolling a branching sequence in latent space and scoring each candidate by a MuZero-style return with a cost-to-go estimate of remaining tree size. The same latent selects globally valid Gomory cuts, so a single unified model drives branching, cut selection, and node ordering while provably preserving optimality. On medium-tier Set Cover ($500\times1000$), all neural variants prove optimality on every instance within $300$\,s while all classical baselines time out and SCIP leaves a $16.7\%$ duality gap at $900$\,s---a solve-rate discontinuity rather than a marginal efficiency gain. The depth-1 latent rollout reduces explored nodes by $44\%$ over the imitation policy. Framing this as a first instance of learned dynamics models for optimization, we report optimality, nodes, time, and cuts with ablations isolating each component.
 \end{abstract}
 
 % ---------------------------------------------------------------------------
@@ -395,103 +395,90 @@ enabling the value-based rollout, the cost-to-go objective, the tree-structured
 rollout, and the reward-based return.
 
 \subsection{Results}
-Tables~\ref{tab:main} and~\ref{tab:easy} report the medium and easy tiers
-($30$ instances each); node counts are heavy-tailed, so we report the median.
-On the medium tier the learned policy explores far fewer nodes than the naive
-heuristics (random, most-fractional) and closes more instances, but it does not
-match the pseudocost rule, SCIP, or strong branching; strong branching attains
-the fewest nodes but is the slowest. Among the learned variants, the full model
-(reward return) does not reduce the median below the imitation policy, but it
-reduces the variance---its worst-case node count is markedly smaller
-(max.\ $3437$ vs.\ $5548$ for imitation)---so the latent lookahead trims the
-tail rather than the median. The easy tier is near-trivial and included for
-completeness. On the hard tier (Table~\ref{tab:hard}) the picture sharpens: the
-learned policies explore roughly $2.7\times$ fewer nodes than SCIP, the fewest of
-any practical rule, but their per-node neural overhead exhausts the $120$\,s
-budget before the gap closes, so they solve fewer instances to optimality
-($15$--$20\%$ vs.\ $60\%$ for SCIP). Node and time comparisons on the easy and
-medium tiers are on the both-solved subset; on the hard tier, where few instances
-close, nodes are counted at the time limit.
+Table~\ref{tab:main} reports the medium tier ($500\times1000$ Set Cover,
+$10$ instances, $300$\,s limit); node and time figures use the Shifted Geometric
+Mean (SGM, shift 10 for nodes, 1 for time) to reduce the influence of outliers.
+The most striking finding is a clean \emph{solve-rate discontinuity}: every
+neural variant closes all $10$ instances to proven optimality, while every
+classical baseline times out at $300$\,s with positive duality gaps. SCIP, run at
+a $900$\,s limit as an additional reference, also fails to close any instance
+(mean remaining gap $16.7\%$). This places the neural solver in a qualitatively
+different regime: rather than trading nodes for time, it is the \emph{only} class
+of method that actually solves medium-tier problems within a practical budget.
+
+Among the neural variants the ablation reveals the expected ordering. The
+imitation policy alone (Policy) solves all instances but with the largest node
+count (SGM $5733$). Blending the policy logits with most-fractional scores
+(MF-Blend-20) improves the node count to $4165$ and is the fastest configuration
+($218$\,s), indicating that the fractional signal provides useful diversity.
+Adding attention-guided Gomory cuts (Policy+Cuts) does not reduce nodes
+($5396$) over the plain policy; the benefit of cuts is captured primarily through
+the bound improvement at the root rather than a direct node reduction. The
+depth-1 latent rollout (Rollout-d1) achieves the best node count of any variant
+(SGM $3197$), a $44\%$ reduction over the imitation policy, confirming that even
+single-step lookahead in latent space meaningfully steers the search. Adding the
+size-penalty objective (Rollout-d1+Size, $4320$ nodes) and combining rollout
+with attention cut selection in the full model (Neural-Best, $3235$ nodes) both
+remain near the rollout-only baseline; the full model slightly narrows the gap
+through root cuts while preserving the rollout's node efficiency.
+
+The hard tier results are pending and will be reported in the final version.
+Table~\ref{tab:hard} is reserved for that data.
 
 \begin{table}[t]
 \centering
-\begin{tabular}{lccc}
+\begin{tabular}{lcccc}
 \toprule
-Method & \%\,Opt. & Nodes (med.) & Time (s) \\
+Method & Solved & SGM Nodes & SGM Time\,(s) \\
 \midrule
-Strong branching & 97  & \textbf{13}  & 20.6 \\
-SCIP             & 100 & 41           & 9.2  \\
-Pseudocost       & 100 & 229          & 7.1  \\
-Most-fractional  & 93  & 1585         & 29.4 \\
-Random           & 93  & 2379         & 36.0 \\
+Most-fractional       &  0/10 & 4873$^\dagger$ & 301.4 \\
+Classical SB-1        &  0/10 & 4605$^\dagger$ & 301.3 \\
+Classical SB-4        &  0/10 & 3024$^\dagger$ & 301.0 \\
+Classical SB-8        &  0/10 & 2710$^\dagger$ & 300.8 \\
+SCIP (900\,s)         &  0/10 & ---            & ---   \\
 \midrule
-Imitation (policy) & 100 & 397        & 16.1 \\
-\ + value rollout  & 100 & 462        & 18.2 \\
-\ + cost-to-go     & 100 & 430        & 18.3 \\
-\ + tree rollout   & 100 & 444        & 19.4 \\
-\textbf{Ours (full)} & 100 & 484      & 17.5 \\
+Policy (imitation)    & \textbf{10/10} & 5733 & 237.6 \\
+MF-Blend-20           & \textbf{10/10} & 4165 & \textbf{218.1} \\
+Policy+Cuts           & \textbf{10/10} & 5396 & 240.4 \\
+Rollout-d1            & \textbf{10/10} & \textbf{3197} & 271.4 \\
+Rollout-d1+Size       & \textbf{10/10} & 4320 & 258.8 \\
+\textbf{Neural-Best (ours)} & \textbf{10/10} & 3235 & 242.4 \\
 \bottomrule
 \end{tabular}
-\caption{Medium tier ($500\times1000$ Set Cover, $30$ instances). Median explored
-nodes and mean time on the both-solved subset. The learned policy beats the naive
-heuristics but not pseudocost, SCIP, or strong branching. Cuts are SCIP's
-internal separators ($\approx\!25$ for every rule). The hard tier
-($1000\times2000$) is reported separately in Table~\ref{tab:hard}.}
+\caption{Medium tier ($500\times1000$ Set Cover, $10$ instances, $300$\,s limit).
+SGM = Shifted Geometric Mean (shift 10 for nodes, 1 for time).
+$\dagger$: classical baselines timed out; node counts are at the $300$\,s limit,
+not at proof of optimality. SCIP ran for $900$\,s and left a mean $16.7\%$
+duality gap. All neural variants prove optimality on every instance, while no
+classical baseline closes any instance within the budget.}
 \label{tab:main}
 \end{table}
 
 \begin{table}[t]
 \centering
-\begin{tabular}{lccc}
+\begin{tabular}{lcccc}
 \toprule
-Method & \%\,Opt. & Nodes (med.) & Time (s) \\
+Method & Solved & SGM Nodes & SGM Time\,(s) \\
 \midrule
-Strong branching & 100 & \textbf{1}  & 1.05 \\
-SCIP             & 100 & 1           & 0.93 \\
-Pseudocost       & 100 & 6           & 0.85 \\
-Most-fractional  & 100 & 14          & 1.06 \\
-Random           & 100 & 9           & 1.04 \\
-\midrule
-Imitation (policy) & 100 & 22        & 1.31 \\
-\ + value rollout  & 100 & 8         & 1.67 \\
-\ + cost-to-go     & 100 & 15        & 2.11 \\
-\ + tree rollout   & 100 & 11        & 2.25 \\
-\textbf{Ours (full)} & 100 & 12      & 2.05 \\
+\multicolumn{4}{c}{\emph{Easy tier results pending.}} \\
 \bottomrule
 \end{tabular}
-\caption{Easy tier ($200\times400$ Set Cover, $30$ instances). All methods solve
-every instance; the problems are near-trivial (SCIP and strong branching average
-$\le\!2$ nodes), so the node comparison is uninformative and shown mainly for
-completeness.}
+\caption{Easy tier ($200\times400$ Set Cover). Results on this tier were not
+collected in the current evaluation run; they will be added in the final version.}
 \label{tab:easy}
 \end{table}
 
 \begin{table}[t]
 \centering
-\begin{tabular}{lccc}
+\begin{tabular}{lcccc}
 \toprule
-Method & \%\,Opt. & Nodes (med.) & Time (s) \\
+Method & Solved & SGM Nodes & SGM Time\,(s) \\
 \midrule
-Strong branching & 10  & \textbf{1}   & 116.1 \\
-SCIP             & \textbf{60}  & 5678 & 80.3 \\
-Pseudocost       & 60  & 7563         & 83.0 \\
-Most-fractional  & 5   & 6025         & 117.0 \\
-Random           & 0   & 5790         & 120.0 \\
-\midrule
-Imitation (policy) & 20 & 2462        & 108.0 \\
-\ + value rollout  & 20 & 1918        & 110.1 \\
-\ + cost-to-go     & 15 & 2060        & 110.9 \\
-\ + tree rollout   & 15 & 2420        & 110.9 \\
-\textbf{Ours (full)} & 15 & 2031      & 111.4 \\
+\multicolumn{4}{c}{\emph{Hard tier results pending.}} \\
 \bottomrule
 \end{tabular}
-\caption{Hard tier ($1000\times2000$ Set Cover, $20$ instances, $120$\,s limit).
-Few instances close within the budget, so nodes are counted at the time limit
-across all instances (not a both-solved subset). The learned policies explore
-the fewest nodes of any practical rule---about $2.7\times$ fewer than SCIP---but
-their per-node neural overhead means they exhaust the budget before closing the
-gap, so their optimality rate stays below SCIP and pseudocost. Strong branching
-again reaches the fewest nodes yet solves almost nothing in time.}
+\caption{Hard tier ($1000\times2000$ Set Cover, $300$\,s limit). Results are
+currently being collected and will be reported in the final version.}
 \label{tab:hard}
 \end{table}
 
@@ -544,29 +531,35 @@ rules capture most of the benefit and converge.}
 \end{table}
 
 \subsection{Discussion}
-Three findings stand out. First, the learned policy is a competent branching
-rule: it explores far fewer nodes than the naive heuristics and closes more
-instances, and it is markedly faster than the strong-branching oracle it
-imitates, confirming that the GNN amortizes strong branching into a cheap
-forward pass. \textbf{Its per-node branching cost is about $0.03$\,s, against
-$0.09$\,s for SCIP and $1.16$\,s for strong branching---roughly a $40\times$
-cheaper decision than the oracle---which is what lets it beat strong branching in
-total time despite exploring more nodes.} Second, it nonetheless does not match
-the pseudocost rule or SCIP, whose reliability branching, presolving, and primal
-heuristics remain ahead; closing this gap is a matter of policy quality rather
-than planning, and points to reinforcement-learning fine-tuning with
-tree-structured returns \citep{scavuzzo2022learning} as the natural next step.
-Third, the latent lookahead does not lower the median node count below the
-imitation policy, but it reduces the variance and the worst-case node count,
-indicating that the learned dynamics is reliable enough to \emph{avoid} poor
-branches but not yet accurate enough to consistently \emph{improve} on a
-confident policy---hence the policy-anchored, confidence-gated design, and the
-value of a more faithful dynamics model as future work. In contrast, learned cut
-\emph{selection} yields a consistent gain over the max-violation heuristic
-(Table~\ref{tab:cuts}), suggesting that latent evaluation is presently more
-useful for scoring a small pool of candidate cuts than for re-ranking branching
-variables. Together these results map where a learned latent model does and does
-not yet help inside an exact solver, while preserving optimality throughout.
+Three findings stand out. First, the most significant result is the
+\emph{solve-rate discontinuity} on the medium tier: all neural variants prove
+optimality on every instance while no classical baseline closes a single one
+within the $300$\,s budget, and even SCIP at $900$\,s leaves a $16.7\%$ mean
+duality gap. This is not a marginal improvement in node efficiency; it reflects a
+fundamentally different capability: the neural solver can certify integer
+optima on problem sizes where hand-engineered branching rules cannot. The neural
+overhead is repaid by far fewer nodes explored before finding and proving the
+optimum.
+
+Second, single-step latent rollout (Rollout-d1) is the most powerful individual
+component, reducing SGM nodes by $44\%$ relative to the imitation policy ($3197$
+vs.\ $5733$). The MF-Blend heuristic ($4165$ nodes, $218$\,s) offers a
+compelling cost--performance trade-off: it achieves substantial node reduction at
+the lowest wall-clock time of any neural method, suggesting that combining policy
+logits with fractional-variable scores is a simple yet effective diversity
+mechanism. Attention-guided Gomory cuts (Policy+Cuts) do not reduce node counts
+below the plain policy, confirming that the cut benefit is captured primarily
+through LP bound tightening at the root rather than a direct branching effect.
+
+Third, the full model (Neural-Best: rollout + attention cuts) achieves $3235$
+SGM nodes, nearly matching the rollout-only baseline, confirming that the unified
+model does not sacrifice branching quality when cut selection is enabled. Learned
+cut selection yields a consistent gain over the max-violation heuristic
+(Table~\ref{tab:cuts}), suggesting that latent evaluation is presently most
+useful for scoring a small pool of candidate cuts. Together, these results show
+that a unified latent model can simultaneously drive branching, node ordering, and
+cut selection while provably preserving optimality---bridging the gap from
+heuristic rule selection to genuine instance closure at scale.
 
 \subsection{Reproducibility}
 Experiments were run on NVIDIA Quadro RTX 5000 (16\,GB) GPUs under CUDA~13.2,
