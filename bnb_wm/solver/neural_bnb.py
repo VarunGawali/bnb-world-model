@@ -602,6 +602,71 @@ class NeuralBnBSolver:
             embeds[i] = e
         return embeds
 
+    def _attention_cut_scores(
+        self,
+        cands: list[CutData],
+        h_vars: torch.Tensor,
+        x_lp: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Parameter-free cross-attention cut scorer.
+
+        Scores cut k by how well it structurally aligns with constraints
+        that are currently loose AND connected to fractional variables.
+        Both cuts and constraints are embedded in variable space (weighted
+        sum of h_vars), so the dot product is geometrically meaningful.
+
+        Returns shape [K] scores — higher = more structurally useful.
+        """
+        import torch.nn.functional as F
+
+        A = self._lp.A        # [m0, n]  original constraints only
+        b = self._lp.b        # [m0]
+        m0, n = A.shape
+        H = h_vars.size(1)
+
+        # --- looseness: slack * mean fractionality of the row's support ---
+        slack = np.maximum((A @ x_lp - b) / (np.abs(b) + 1.0), 0.0)   # [m0]
+        frac = np.abs(x_lp - np.round(x_lp))                           # [n]
+        A_bin = (np.abs(A) > 1e-9).astype(np.float32)
+        row_nnz = np.maximum(A_bin.sum(axis=1), 1.0)
+        frac_support = (A_bin @ frac) / row_nnz                        # [m0]
+        loose = torch.as_tensor(
+            slack * frac_support, dtype=h_vars.dtype, device=self.device)  # [m0]
+
+        # --- constraint embeddings in variable space (mean-normalised) ---
+        h_con = torch.zeros(m0, H, device=self.device, dtype=h_vars.dtype)
+        for j in range(m0):
+            nz = np.flatnonzero(A_bin[j] > 0)
+            if len(nz) == 0:
+                continue
+            idx = torch.as_tensor(nz, dtype=torch.long, device=self.device)
+            w = torch.as_tensor(
+                A[j, nz].astype(np.float32), dtype=h_vars.dtype,
+                device=self.device)
+            h_con[j] = (w.unsqueeze(1) * h_vars.index_select(0, idx)).sum(0) / len(nz)
+
+        # --- cut embeddings in the same space (mean-normalised) ---
+        K = len(cands)
+        h_cut = torch.zeros(K, H, device=self.device, dtype=h_vars.dtype)
+        for k, cut in enumerate(cands):
+            nz = np.flatnonzero(np.abs(cut.lhs) > 1e-9)
+            if len(nz) == 0:
+                continue
+            idx = torch.as_tensor(nz, dtype=torch.long, device=self.device)
+            w = torch.as_tensor(
+                cut.lhs[nz].astype(np.float32), dtype=h_vars.dtype,
+                device=self.device)
+            h_cut[k] = (w.unsqueeze(1) * h_vars.index_select(0, idx)).sum(0) / len(nz)
+
+        # --- cross-attention: K × m0 ---
+        scale = H ** -0.5
+        attn = (h_cut @ h_con.T) * scale          # [K, m0]
+        alpha = F.softmax(attn, dim=1)            # [K, m0]
+        scores = (alpha * loose.unsqueeze(0)).sum(1)  # [K]
+
+        return scores.cpu().numpy()
+
     def _cut_beam(self, z, h_vars, cut_embeds, cuts, past_tokens):
         cfg = self.cfg
         C = cut_embeds.size(0)
@@ -668,6 +733,14 @@ class NeuralBnBSolver:
         if cfg.cut_mode == "heuristic":
             viol = np.array([cut.rhs - float(cut.lhs @ lp.x) for cut in cands])
             chosen = [cands[i] for i in np.argsort(-viol)[:cfg.max_cuts_per_node]]
+        elif cfg.cut_mode == "attention":
+            viol = np.array([cut.rhs - float(cut.lhs @ lp.x) for cut in cands])
+            attn_score = self._attention_cut_scores(cands, h_vars, lp.x)
+            k = len(cands)
+            r_viol = np.argsort(np.argsort(-viol)) / max(k - 1, 1)
+            r_attn = np.argsort(np.argsort(-attn_score)) / max(k - 1, 1)
+            blend = r_viol + cfg.cut_attn_lambda * r_attn
+            chosen = [cands[i] for i in np.argsort(blend)[:cfg.max_cuts_per_node]]
         else:
             t0 = time.perf_counter()
             embeds = self._cut_embeds(cands, h_vars)

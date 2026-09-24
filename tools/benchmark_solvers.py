@@ -44,6 +44,7 @@ Group A (our harness — wall-clock and nodes both comparable):
   rollout_katz      + Katz blend
   rollout_cuts_heur + max-violation cuts
   rollout_cuts_lat  + latent cut beam
+  rollout_cuts_attn + attention-scored cuts (parameter-free)
   neural_full       + cost-to-go node selection  ← headline
 
 Group B (SCIP harness — node counts only, never wall-clock vs Group A):
@@ -281,6 +282,7 @@ ALL_METHODS_A = [
     "rollout_katz",
     "rollout_cuts_heur",
     "rollout_cuts_lat",
+    "rollout_cuts_attn",
     "neural_full",
 ]
 
@@ -293,7 +295,8 @@ ALL_METHODS_B = [
 
 def method_needs_model(name):
     return name in ("policy", "rollout", "rollout_ors", "rollout_katz",
-                    "rollout_cuts_heur", "rollout_cuts_lat", "neural_full")
+                    "rollout_cuts_heur", "rollout_cuts_lat", "rollout_cuts_attn",
+                    "neural_full")
 
 
 def method_is_scip(name):
@@ -424,6 +427,9 @@ def main():
         elif m == "rollout_cuts_lat":
             solvers[m] = ("neural", build_neural(
                 model, device, "rollout", "latent", True, 0.3, "bound", tl, nl))
+        elif m == "rollout_cuts_attn":
+            solvers[m] = ("neural", build_neural(
+                model, device, "rollout", "attention", False, 0.0, "bound", tl, nl))
         elif m == "neural_full":
             solvers[m] = ("neural", build_neural(
                 model, device, "rollout", "latent", True, 0.3, "cost_to_go", tl, nl))

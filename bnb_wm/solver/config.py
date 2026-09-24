@@ -71,7 +71,7 @@ class SolverConfig:
     # ------------------------------------------------------------------ #
     # Cuts                                                                 #
     # ------------------------------------------------------------------ #
-    # "none" | "heuristic" | "latent"
+    # "none" | "heuristic" | "latent" | "attention"
     cut_mode: str = "none"
     force_root_cuts: bool = False
     cut_budget_cap: int = 200
@@ -89,6 +89,11 @@ class SolverConfig:
 
     # Cut embedding normalisation: "none" | "mean" | "l2match"
     cut_embed_norm: str = "mean"
+
+    # Attention cut scoring (cut_mode="attention"):
+    #   final_rank = rank(violation) + cut_attn_lambda * rank(attention_score)
+    #   0.0 = pure violation, 1.0 = equal weight, 2.0 = attention-dominant
+    cut_attn_lambda: float = 1.0
 
     # ------------------------------------------------------------------ #
     # Node selection                                                       #
@@ -181,6 +186,13 @@ class SolverConfig:
         """rollout + ORS + Katz + latent cut beam."""
         return cls(branch_mode="rollout", cut_mode="latent",
                    ors_cascade=True, katz_weight=0.3,
+                   node_selection="bound", **kw)
+
+    @classmethod
+    def cuts_attention(cls, **kw) -> "SolverConfig":
+        """rollout + attention-scored cuts (parameter-free, within variable space)."""
+        return cls(branch_mode="rollout", cut_mode="attention",
+                   ors_cascade=False, katz_weight=0.0,
                    node_selection="bound", **kw)
 
     @classmethod
