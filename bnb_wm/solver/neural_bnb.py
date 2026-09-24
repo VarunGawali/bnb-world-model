@@ -608,10 +608,12 @@ class NeuralBnBSolver:
     def _cut_pool(self) -> list[CutData]:
         if self._gomory_pool is None:
             from bnb_wm.solver.gomory import generate_root_gomory_cuts
+            remaining = self.cfg.time_limit - (time.perf_counter() - self._t0)
+            gomory_tl = max(min(remaining * 0.15, 30.0), 5.0)
             try:
                 pool = generate_root_gomory_cuts(
                     self._A, self._b, self._c, self._highs,
-                    max_cuts=self.cfg.cut_pool_max)
+                    max_cuts=self.cfg.cut_pool_max, time_limit=gomory_tl)
             except TypeError:
                 pool = generate_root_gomory_cuts(
                     self._A, self._b, self._c, self._highs)
