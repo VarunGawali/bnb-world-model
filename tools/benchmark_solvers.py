@@ -383,6 +383,7 @@ ALL_METHODS_A = [
     "rollout_d1_size1",
     # Neural best: all good components combined
     "neural_best",
+    "neural_best_d3",
 ]
 
 ALL_METHODS_B = [
@@ -570,6 +571,18 @@ def main():
                 branch_mode="rollout", cut_mode="attention",
                 ors_cascade=False, katz_weight=0.0, mf_blend_alpha=0.20,
                 node_selection="bound", lookahead_depth=1,
+                size_weight=1.0, ctg_weight=0.0,
+                cut_pool_max=cpm, cut_budget_cap=cpm,
+                primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
+            )
+            solvers[m] = ("neural", NeuralBnBSolver(model, device, cfg))
+        elif m == "neural_best_d3":
+            from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+            from bnb_wm.solver.config import SolverConfig
+            cfg = SolverConfig(
+                branch_mode="rollout", cut_mode="attention",
+                ors_cascade=False, katz_weight=0.0, mf_blend_alpha=0.20,
+                node_selection="bound", lookahead_depth=3,
                 size_weight=1.0, ctg_weight=0.0,
                 cut_pool_max=cpm, cut_budget_cap=cpm,
                 primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
