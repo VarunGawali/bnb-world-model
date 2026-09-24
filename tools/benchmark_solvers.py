@@ -378,6 +378,7 @@ ALL_METHODS_A = [
     # Neural: individual components
     "policy",
     "mf_blend_20",
+    "policy_cuts_attn",
     "rollout_d1",
     "rollout_d1_size1",
     # Neural best: all good components combined
@@ -534,6 +535,17 @@ def main():
                 model, device, "policy", "none", False, 0.0, "bound", tl, nl))
         elif m == "mf_blend_20":
             solvers[m] = ("neural", _build_mf_blend(model, device, 0.20, tl, nl))
+        elif m == "policy_cuts_attn":
+            from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+            from bnb_wm.solver.config import SolverConfig
+            cfg = SolverConfig(
+                branch_mode="policy", cut_mode="attention",
+                ors_cascade=False, katz_weight=0.0, mf_blend_alpha=None,
+                node_selection="bound", size_weight=0.0, ctg_weight=0.0,
+                cut_pool_max=cpm, cut_budget_cap=cpm,
+                primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
+            )
+            solvers[m] = ("neural", NeuralBnBSolver(model, device, cfg))
         # ---- Neural: rollout components ----
         elif m == "rollout_d1":
             solvers[m] = ("neural", build_neural(
