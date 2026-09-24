@@ -38,6 +38,9 @@ Group A (our harness — wall-clock and nodes both comparable):
   classical_sb4     reliability branching, eta=4  ← primary baseline
   classical_sb8     reliability branching, eta=8
   classical_sbfull  full strong branching
+  mf_blend_25       rank-blend α=0.25 (75% MF, 25% policy)
+  mf_blend_50       rank-blend α=0.50 (equal weight)
+  mf_blend_75       rank-blend α=0.75 (75% policy, 25% MF)
   policy            GNN policy argmax
   rollout           + latent lookahead
   rollout_ors       + ORS cascade
@@ -210,6 +213,24 @@ def build_neural(model, device, branch_mode, cut_mode, ors_cascade,
     return NeuralBnBSolver(model, device, cfg)
 
 
+def _build_mf_blend(model, device, alpha, time_limit, node_limit):
+    from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+    from bnb_wm.solver.config import SolverConfig
+    cfg = SolverConfig(
+        branch_mode="policy",
+        cut_mode="none",
+        ors_cascade=False,
+        katz_weight=0.0,
+        mf_blend_alpha=alpha,
+        node_selection="bound",
+        primal_heuristic=True,
+        time_limit=time_limit,
+        node_limit=node_limit,
+        exact=True,
+    )
+    return NeuralBnBSolver(model, device, cfg)
+
+
 def run_neural(solver, A, b, c, opt):
     t0 = time.perf_counter()
     r = solver.solve(A, b, c)
@@ -283,6 +304,9 @@ ALL_METHODS_A = [
     "mf",
     "classical_sb0", "classical_sb1", "classical_sb4",
     "classical_sb8", "classical_sbfull",
+    "mf_blend_25",
+    "mf_blend_50",
+    "mf_blend_75",
     "policy",
     "rollout",
     "rollout_ors",
@@ -307,7 +331,8 @@ ALL_METHODS_B = [
 
 
 def method_needs_model(name):
-    return name in ("policy", "rollout", "rollout_ors", "rollout_katz",
+    return name in ("mf_blend_25", "mf_blend_50", "mf_blend_75",
+                    "policy", "rollout", "rollout_ors", "rollout_katz",
                     "rollout_cuts_heur", "rollout_cuts_lat", "rollout_cuts_attn",
                     "neural_full",
                     "neural_loo_no_rollout", "neural_loo_no_cuts",
@@ -424,6 +449,12 @@ def main():
             solvers[m] = ("classical", build_classical(8, 4, tl, nl))
         elif m == "classical_sbfull":
             solvers[m] = ("classical", build_classical(None, 4, tl, nl))
+        elif m == "mf_blend_25":
+            solvers[m] = ("neural", _build_mf_blend(model, device, 0.25, tl, nl))
+        elif m == "mf_blend_50":
+            solvers[m] = ("neural", _build_mf_blend(model, device, 0.50, tl, nl))
+        elif m == "mf_blend_75":
+            solvers[m] = ("neural", _build_mf_blend(model, device, 0.75, tl, nl))
         elif m == "policy":
             solvers[m] = ("neural", build_neural(
                 model, device, "policy", "none", False, 0.0, "bound", tl, nl))

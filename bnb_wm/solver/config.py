@@ -62,6 +62,13 @@ class SolverConfig:
     significance_fn: Optional[Callable] = field(default=None, repr=False)
 
     # ------------------------------------------------------------------ #
+    # MF blend  (rank-blend with most-fractional)                        #
+    # ------------------------------------------------------------------ #
+    # final_score = alpha * rank(policy) + (1-alpha) * rank(frac)
+    # 0.0 = pure MF, 1.0 = pure policy.  None = off (pure policy scores).
+    mf_blend_alpha: Optional[float] = None
+
+    # ------------------------------------------------------------------ #
     # Katz blend                                                          #
     # ------------------------------------------------------------------ #
     katz_weight: float = 0.0
@@ -145,6 +152,13 @@ class SolverConfig:
         return cls(branch_mode="most_fractional", cut_mode="none",
                    ors_cascade=False, katz_weight=0.0,
                    node_selection="bound", **kw)
+
+    @classmethod
+    def mf_blend(cls, alpha: float = 0.5, **kw) -> "SolverConfig":
+        """rank(policy)*alpha + rank(frac)*(1-alpha) — no rollout overhead."""
+        return cls(branch_mode="policy", cut_mode="none",
+                   ors_cascade=False, katz_weight=0.0,
+                   mf_blend_alpha=alpha, node_selection="bound", **kw)
 
     @classmethod
     def policy(cls, **kw) -> "SolverConfig":

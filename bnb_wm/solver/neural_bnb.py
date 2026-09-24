@@ -779,6 +779,17 @@ class NeuralBnBSolver:
                                     self.cfg.katz_alpha, self.cfg.katz_iters)
             scores = scores + self.cfg.katz_weight * torch.as_tensor(
                 np.log1p(katz), dtype=scores.dtype, device=self.device)
+        if self.cfg.mf_blend_alpha is not None:
+            alpha = self.cfg.mf_blend_alpha
+            n = scores.size(0)
+            # rank(policy): higher score → higher rank value
+            p_np = scores.detach().cpu().numpy()
+            r_policy = np.argsort(np.argsort(p_np)).astype(np.float32) / max(n - 1, 1)
+            # rank(frac): closer to 0.5 → higher rank value
+            frac = np.abs(x_lp - np.round(x_lp)).astype(np.float32)
+            r_frac = np.argsort(np.argsort(frac)).astype(np.float32) / max(n - 1, 1)
+            blended = alpha * r_policy + (1.0 - alpha) * r_frac
+            scores = torch.as_tensor(blended, dtype=scores.dtype, device=self.device)
         return scores
 
     def _select_branch_var(self, h_vars, z, x_lp, frac_idx, node, leaf_prob):
