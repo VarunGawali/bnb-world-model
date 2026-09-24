@@ -38,9 +38,14 @@ Group A (our harness — wall-clock and nodes both comparable):
   classical_sb4     reliability branching, eta=4  ← primary baseline
   classical_sb8     reliability branching, eta=8
   classical_sbfull  full strong branching
+  mf_blend_10       rank-blend α=0.10
+  mf_blend_15       rank-blend α=0.15
+  mf_blend_20       rank-blend α=0.20
   mf_blend_25       rank-blend α=0.25 (75% MF, 25% policy)
+  mf_blend_30       rank-blend α=0.30
   mf_blend_50       rank-blend α=0.50 (equal weight)
   mf_blend_75       rank-blend α=0.75 (75% policy, 25% MF)
+  blend_rollout     mf_blend_25 + rollout lookahead (world-model test)
   policy            GNN policy argmax
   rollout           + latent lookahead
   rollout_ors       + ORS cascade
@@ -213,6 +218,25 @@ def build_neural(model, device, branch_mode, cut_mode, ors_cascade,
     return NeuralBnBSolver(model, device, cfg)
 
 
+def _build_blend_rollout(model, device, alpha, time_limit, node_limit):
+    """Rollout lookahead with blended (policy + MF) candidate scoring."""
+    from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+    from bnb_wm.solver.config import SolverConfig
+    cfg = SolverConfig(
+        branch_mode="rollout",
+        cut_mode="none",
+        ors_cascade=False,
+        katz_weight=0.0,
+        mf_blend_alpha=alpha,
+        node_selection="bound",
+        primal_heuristic=True,
+        time_limit=time_limit,
+        node_limit=node_limit,
+        exact=True,
+    )
+    return NeuralBnBSolver(model, device, cfg)
+
+
 def _build_mf_blend(model, device, alpha, time_limit, node_limit):
     from bnb_wm.solver.neural_bnb import NeuralBnBSolver
     from bnb_wm.solver.config import SolverConfig
@@ -304,9 +328,14 @@ ALL_METHODS_A = [
     "mf",
     "classical_sb0", "classical_sb1", "classical_sb4",
     "classical_sb8", "classical_sbfull",
+    "mf_blend_10",
+    "mf_blend_15",
+    "mf_blend_20",
     "mf_blend_25",
+    "mf_blend_30",
     "mf_blend_50",
     "mf_blend_75",
+    "blend_rollout",
     "policy",
     "rollout",
     "rollout_ors",
@@ -331,7 +360,9 @@ ALL_METHODS_B = [
 
 
 def method_needs_model(name):
-    return name in ("mf_blend_25", "mf_blend_50", "mf_blend_75",
+    return name in ("mf_blend_10", "mf_blend_15", "mf_blend_20",
+                    "mf_blend_25", "mf_blend_30", "mf_blend_50", "mf_blend_75",
+                    "blend_rollout",
                     "policy", "rollout", "rollout_ors", "rollout_katz",
                     "rollout_cuts_heur", "rollout_cuts_lat", "rollout_cuts_attn",
                     "neural_full",
@@ -449,12 +480,23 @@ def main():
             solvers[m] = ("classical", build_classical(8, 4, tl, nl))
         elif m == "classical_sbfull":
             solvers[m] = ("classical", build_classical(None, 4, tl, nl))
+        elif m == "mf_blend_10":
+            solvers[m] = ("neural", _build_mf_blend(model, device, 0.10, tl, nl))
+        elif m == "mf_blend_15":
+            solvers[m] = ("neural", _build_mf_blend(model, device, 0.15, tl, nl))
+        elif m == "mf_blend_20":
+            solvers[m] = ("neural", _build_mf_blend(model, device, 0.20, tl, nl))
         elif m == "mf_blend_25":
             solvers[m] = ("neural", _build_mf_blend(model, device, 0.25, tl, nl))
+        elif m == "mf_blend_30":
+            solvers[m] = ("neural", _build_mf_blend(model, device, 0.30, tl, nl))
         elif m == "mf_blend_50":
             solvers[m] = ("neural", _build_mf_blend(model, device, 0.50, tl, nl))
         elif m == "mf_blend_75":
             solvers[m] = ("neural", _build_mf_blend(model, device, 0.75, tl, nl))
+        elif m == "blend_rollout":
+            # rollout lookahead with mf_blend_alpha=0.25 as the candidate ranker
+            solvers[m] = ("neural", _build_blend_rollout(model, device, 0.25, tl, nl))
         elif m == "policy":
             solvers[m] = ("neural", build_neural(
                 model, device, "policy", "none", False, 0.0, "bound", tl, nl))
