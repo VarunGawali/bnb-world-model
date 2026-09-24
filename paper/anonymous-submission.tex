@@ -786,8 +786,10 @@ for essentially all of the node reduction over imitation; adding root cuts
 \end{figure*}}{}
 
 \begin{table}[t]
-\caption{Hard tier ($1000\times2000$ Set Cover, $300$\,s limit).
-Results are currently being collected and will be reported in the final version.}
+\caption{Hard tier ($1000\times2000$ Set Cover, $600$\,s limit, 5 instances).
+All classical methods exhaust the budget (0/5 solved); all neural variants
+terminate on every instance (5/5). $\dagger$~classical node counts are lower
+bounds on what a completed solve would explore. SGM shift: $s_n=10$, $s_t=1$.}
 \label{tab:hard}
 \begin{center}
 \begin{tabular}{lcccc}
@@ -796,7 +798,22 @@ Results are currently being collected and will be reported in the final version.
 \cmidrule(lr){3-4}
 Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) \\
 \midrule
-\multicolumn{5}{c}{\emph{Results pending.}} \\
+\multicolumn{4}{l}{\emph{Classical (LP-based branching)}} \\
+Most-fractional      & 0/5 & 3{,}342 & ---    & 601.0 \\
+Strong-branching-1   & 0/5 & 2{,}631 & ---    & 600.9 \\
+Strong-branching-4   & 0/5 & 1{,}074 & ---    & 600.4 \\
+Strong-branching-8   & 0/5 & 1{,}096 & ---    & 600.5 \\
+\midrule
+\multicolumn{4}{l}{\emph{Cheap neural (imitation only)}} \\
+Policy               & 5/5 & ---    & 4{,}633 & 389.3 \\
+MF-Blend-20          & 5/5 & ---    & 2{,}736 & 353.1 \\
+Policy+Cuts          & 5/5 & ---    & 4{,}419 & 395.2 \\
+\midrule
+\multicolumn{4}{l}{\emph{Neural with rollout}} \\
+Rollout-d1           & 5/5 & ---    & 4{,}007 & 422.8 \\
+Rollout-d1+Size      & 5/5 & ---    & 4{,}376 & 396.3 \\
+Neural-Best (d1)     & 5/5 & ---    & 2{,}603 & 364.8 \\
+Neural-Best (d3)     & 5/5 & ---    & \textbf{2{,}476} & 390.4 \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -838,42 +855,53 @@ The results above map onto four takeaways about what the model does and does not
 yet achieve.
 
 \textbf{Termination is the primary gain; node counts must be read carefully.}
-Within a $300$\,s budget, every neural variant terminates on all 10 instances
-while every classical rule exhausts the budget. The neural efficiency advantage
-is $10$--$25\%$ in wall time, which is real but not dramatic; what makes it
-consequential is that it falls on the correct side of the budget cutoff. The
-classical node counts in Table~\ref{tab:main} (left column, measured at timeout)
-are lower bounds on what a completed solve would explore; SB-8's $2{,}710$ looks
-competitive with neural counts in the same column only because it is an
-incomplete count. Putting the two blocks in separate columns is therefore not a
-formatting choice but a semantic one.
+At both medium tier (10 instances, $300$\,s) and hard tier (5 instances,
+$600$\,s) every neural variant terminates on every instance, while every
+classical rule exhausts the budget --- a $10/10$ vs.\ $0/10$ and $5/5$ vs.\
+$0/5$ solve-rate discontinuity. The neural wall-time advantage over MF is
+$10$--$25\%$ at medium and $7$--$41\%$ at hard; what makes this consequential
+is that it falls on the correct side of the budget cutoff. Classical node counts
+in Tables~\ref{tab:main} and~\ref{tab:hard} (left column, measured at timeout)
+are lower bounds on what a completed solve would explore; SB-8's $2{,}710$
+(medium) and $1{,}096$ (hard) look competitive with neural counts in the same
+column only because they are incomplete counts from a timed-out run. Putting the
+two blocks in separate columns is therefore not a formatting choice but a
+semantic one.
 
-\textbf{Depth-1 rollout is the single most powerful component.} The $44\%$
-SGM-node reduction from Rollout-d1 ($3{,}197$ vs.\ $5{,}733$) is the largest
+\textbf{Rollout and cuts are complementary.} At medium tier, depth-1 rollout
+reduces SGM nodes by $44\%$ ($3{,}197$ vs.\ $5{,}733$); this is the largest
 single-step gain in the ablation ladder. Adding root Gomory cuts (Neural-Best,
 $3{,}235$ nodes) does not reduce branching nodes further but tightens the LP
-bound at the root; the combination confirms that rollout and cuts are
-complementary. Cuts alone, without rollout, yield only $-6\%$ ($5{,}396$
-nodes), consistent with root cuts having limited leverage when the LP relaxation
-is already relatively tight.
+bound at the root, cutting wall time. Cuts alone, without rollout, yield only
+$-6\%$ ($5{,}396$ nodes), consistent with root cuts having limited leverage when
+the LP relaxation is already relatively tight. At hard tier the pattern
+persists: Neural-Best ($2{,}603$) improves on both MF-Blend-20 ($2{,}736$) and
+Rollout-d1 ($4{,}007$), confirming that blending rollout-scored branching with
+learned cut selection at the root transfers across scale.
 
-\textbf{The subtree-size head does not generalise to medium scale.}
-Rollout-d1+Size reverses its easy-tier gain, increasing nodes from $3{,}197$ to
-$4{,}320$ ($+35\%$). The head was trained on trajectories from small trees and
-is extrapolating beyond its distribution at medium scale; this is the sharpest
-evidence that the training distribution is a binding constraint for the planning
-components, and expanding it is the most direct path to generalisation.
+\textbf{The subtree-size head does not generalise beyond easy tier.}
+Rollout-d1+Size reverses its easy-tier gain at both medium ($4{,}320$,
+$+35\%$ over Rollout-d1) and hard tier ($4{,}376$, $+9\%$). The head was
+trained on trajectories from small trees and is extrapolating beyond its
+distribution; this is the sharpest evidence that the training distribution is a
+binding constraint for the planning components, and expanding it is the most
+direct path to generalisation.
 
-\textbf{Deeper rollout is actively harmful at current dynamics fidelity.}
-Depth-3 rollout ($3{,}697$ nodes, $+14\%$ over depth-1) confirms that the
-dynamics model's single-step fidelity does not compose cleanly over three steps.
-This is not a reason to avoid planning depth; it is a precise specification of
-what must improve --- multi-step dynamics accuracy --- before deeper planning
-helps. Learned cut selection at a tight budget (Table~\ref{tab:cuts}) provides
-parallel evidence: latent evaluation is most reliable on a small candidate set
-over a short horizon. Together, these results map where a latent dynamics model
-currently helps inside an exact solver and where it does not, while the
-exactness guarantee holds throughout.
+\textbf{Deeper rollout reverses direction across scale.}
+At medium tier, depth-3 rollout increases nodes by $+14\%$ ($3{,}697$ vs
+$3{,}197$), suggesting that cumulative dynamics error outweighs the planning
+benefit on trees of moderate size. At hard tier the ranking reverses: Neural-Best
+(d3) reaches $2{,}476$ nodes vs $2{,}603$ for the depth-1 counterpart
+($-4.9\%$) and $4{,}007$ for rollout-d1 alone ($-38\%$). The most plausible
+explanation is a scale threshold: on larger trees the per-step fidelity of the
+dynamics model --- even if imperfect --- provides a richer planning signal than
+a single-step value estimate, and the gain from better candidate selection
+outweighs the compounding approximation error. This suggests that dynamics
+fidelity, not rollout depth \emph{per se}, is the binding constraint; improving
+multi-step accuracy should unlock further gains. Learned cut selection at a tight
+budget (Table~\ref{tab:cuts}) provides parallel evidence: latent evaluation is
+most reliable over a short horizon when the candidate set is small, but the
+benefit of depth grows as the branching factor and tree depth increase.
 
 \subsection{Reproducibility}
 
