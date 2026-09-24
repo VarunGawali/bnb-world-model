@@ -295,6 +295,12 @@ class NeuralBnBSolver:
                     continue
                 node.lb = max(node.lb, lp.obj)
 
+            # dynamics-as-pseudocost: calibrate once at root
+            if (self.cfg.branch_mode == "dyn_pseudo"
+                    and not self._dyn_calib_done
+                    and node.depth == 0):
+                self._dyn_pseudo_calibrate(h_vars, z, lp.x, frac_idx, node, lp)
+
             # branch variable
             t_br = time.perf_counter()
             branch_var, child_tokens = self._select_branch_var(
@@ -355,6 +361,10 @@ class NeuralBnBSolver:
         self._struct_cache = None
         self._pending_root_lp = None
         self._last_cut_gain = float("inf")
+        # dynamics-as-pseudocost calibration (set once at root)
+        self._dyn_calib_scale: float = 1.0
+        self._dyn_calib_bias: float = 0.0
+        self._dyn_calib_done: bool = False
         self._timing = {"encode": 0.0, "branch": 0.0, "rollout": 0.0,
                         "cutbeam": 0.0, "lp": 0.0}
         self._diag = {
@@ -769,6 +779,85 @@ class NeuralBnBSolver:
     # Branching
     # ==================================================================
 
+    # ==================================================================
+    # Dynamics-as-pseudocost
+    # ==================================================================
+
+    def _dyn_bound_delta(self, h_vars, z, tokens, cand_idx):
+        """Predict bound improvement for up and down branches of cand_idx.
+
+        Returns (delta_up, delta_down) as numpy floats, calibration-adjusted.
+        """
+        with torch.no_grad():
+            a = h_vars[cand_idx].unsqueeze(0)
+            z_up, _, _ = self.model.dynamics_step_full(
+                z, a, h_vars.unsqueeze(0), tokens, 1.0)
+            z_dn, _, _ = self.model.dynamics_step_full(
+                z, a, h_vars.unsqueeze(0), tokens, -1.0)
+            b_parent = float(self.model.dynamics_bound_pred(z))
+            b_up = float(self.model.dynamics_bound_pred(z_up))
+            b_dn = float(self.model.dynamics_bound_pred(z_dn))
+        raw_up = b_up - b_parent
+        raw_dn = b_dn - b_parent
+        s, b = self._dyn_calib_scale, self._dyn_calib_bias
+        return s * raw_up + b, s * raw_dn + b
+
+    def _dyn_pseudo_calibrate(self, h_vars, z, x_lp, frac_idx, node, lp):
+        """Root calibration: SB a small set of candidates, fit (scale, bias)."""
+        cfg = self.cfg
+        n_calib = min(cfg.dyn_pseudo_calib_n, len(frac_idx))
+        # pick the most-fractional candidates for calibration
+        fr = np.abs(x_lp - np.round(x_lp))
+        order = np.argsort(-fr[frac_idx])
+        calib_vars = [int(frac_idx[i]) for i in order[:n_calib]]
+
+        predicted, actual = [], []
+        for v in calib_vars:
+            pred_up, pred_dn = self._dyn_bound_delta(h_vars, z, node.past_tokens, v)
+            # solve both child LPs
+            for fix_val, pred_d in ((1.0, pred_up), (0.0, pred_dn)):
+                vlb = node.var_lb.copy(); vub = node.var_ub.copy()
+                if fix_val == 1.0:
+                    vlb[v] = 1.0
+                else:
+                    vub[v] = 0.0
+                if np.any(vlb > vub + 1e-9):
+                    continue
+                child_lp = self._lp_solve(vlb, vub, lp.basis)
+                if child_lp.feasible:
+                    actual_d = child_lp.obj - lp.obj
+                    predicted.append(pred_d)
+                    actual.append(actual_d)
+
+        self._dyn_calib_done = True
+        if len(predicted) < 2:
+            return  # not enough data; keep scale=1, bias=0
+
+        p = np.array(predicted, dtype=np.float64)
+        a = np.array(actual, dtype=np.float64)
+        # least-squares fit: actual ≈ scale * predicted + bias
+        A_mat = np.stack([p, np.ones_like(p)], axis=1)
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(A_mat, a, rcond=None)
+            self._dyn_calib_scale = float(coeffs[0])
+            self._dyn_calib_bias = float(coeffs[1])
+        except np.linalg.LinAlgError:
+            pass  # keep defaults
+
+    def _dynamics_pseudo_scores(self, h_vars, z, x_lp, frac_idx, node):
+        """Score each fractional candidate with the product rule on predicted Δs.
+
+        Calibrates once at the root node, then uses the affine map forward.
+        Returns a 1-D array of length len(frac_idx).
+        """
+        cfg = self.cfg
+        eps = cfg.dyn_pseudo_eps
+        scores = np.zeros(len(frac_idx), dtype=np.float64)
+        for i, v in enumerate(frac_idx):
+            d_up, d_dn = self._dyn_bound_delta(h_vars, z, node.past_tokens, v)
+            scores[i] = max(d_up, eps) * max(d_dn, eps)
+        return scores
+
     def _policy_scores(self, h_vars, z, x_lp):
         bvec = torch.zeros(h_vars.size(0), dtype=torch.long, device=self.device)
         with torch.no_grad():
@@ -800,6 +889,15 @@ class NeuralBnBSolver:
             return int(frac_idx[np.argmax(fr[frac_idx])]), node.past_tokens
         if cfg.branch_mode == "random":
             return int(np.random.choice(frac_idx)), node.past_tokens
+
+        if cfg.branch_mode == "dyn_pseudo":
+            scores = self._dynamics_pseudo_scores(h_vars, z, x_lp, frac_idx, node)
+            v = int(frac_idx[np.argmax(scores)])
+            with torch.no_grad():
+                a = h_vars[v].unsqueeze(0)
+                _z, tok, _ = self.model.dynamics_step_full(
+                    z, a, h_vars.unsqueeze(0), node.past_tokens, 0.0)
+            return v, tok
 
         scores = self._policy_scores(h_vars, z, x_lp)
         frac_t = torch.as_tensor(frac_idx, dtype=torch.long, device=self.device)

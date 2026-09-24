@@ -30,7 +30,7 @@ class SolverConfig:
     # ------------------------------------------------------------------ #
     # Branching mode                                                       #
     # ------------------------------------------------------------------ #
-    # "most_fractional" | "random" | "policy" | "rollout"
+    # "most_fractional" | "random" | "policy" | "rollout" | "dyn_pseudo"
     branch_mode: str = "rollout"
 
     # ------------------------------------------------------------------ #
@@ -60,6 +60,16 @@ class SolverConfig:
     ors_sig_thresh: float = 0.1
     ors_p_explore: float = 0.05
     significance_fn: Optional[Callable] = field(default=None, repr=False)
+
+    # ------------------------------------------------------------------ #
+    # Dynamics-as-pseudocost                                             #
+    # ------------------------------------------------------------------ #
+    # branch_mode="dyn_pseudo": use the dynamics bound predictor to
+    # estimate child-node bound improvements without solving child LPs.
+    # Root calibration: strong-branch dyn_pseudo_calib_n candidates for
+    # real, regress predicted Δ vs actual Δ, apply the affine map forward.
+    dyn_pseudo_calib_n: int = 8       # candidates to SB at root (2 LPs each)
+    dyn_pseudo_eps: float = 1e-6      # floor for product-rule scores
 
     # ------------------------------------------------------------------ #
     # MF blend  (rank-blend with most-fractional)                        #
@@ -150,6 +160,13 @@ class SolverConfig:
     def mf(cls, **kw) -> "SolverConfig":
         """most_fractional baseline."""
         return cls(branch_mode="most_fractional", cut_mode="none",
+                   ors_cascade=False, katz_weight=0.0,
+                   node_selection="bound", **kw)
+
+    @classmethod
+    def dyn_pseudo(cls, **kw) -> "SolverConfig":
+        """Dynamics-as-pseudocost branching: bound predictor replaces child LPs."""
+        return cls(branch_mode="dyn_pseudo", cut_mode="none",
                    ors_cascade=False, katz_weight=0.0,
                    node_selection="bound", **kw)
 

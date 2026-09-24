@@ -44,6 +44,8 @@ Group A (our harness — wall-clock and nodes both comparable):
   mf_blend_20_cuts  mf_blend_20 + heuristic cuts (no rollout overhead)
   blend_rollout     mf_blend_20 + rollout lookahead (negative result: rollout doesn't help on good shortlist)
   blend_rollout_cuts mf_blend_20 + rollout + heuristic cuts
+  dyn_pseudo        dynamics bound predictor replaces child LPs (world-model test)
+  dyn_pseudo_blend  dyn_pseudo + MF blend at α=0.20 as fallback ranker
   policy            GNN policy argmax
   rollout           + latent lookahead
   rollout_cuts_heur + max-violation cuts
@@ -232,6 +234,25 @@ def _build_blend_rollout(model, device, alpha, time_limit, node_limit):
     return NeuralBnBSolver(model, device, cfg)
 
 
+def _build_dyn_pseudo(model, device, time_limit, node_limit, mf_blend_alpha=None):
+    """Dynamics-as-pseudocost branching with optional MF blend fallback."""
+    from bnb_wm.solver.neural_bnb import NeuralBnBSolver
+    from bnb_wm.solver.config import SolverConfig
+    cfg = SolverConfig(
+        branch_mode="dyn_pseudo",
+        cut_mode="none",
+        ors_cascade=False,
+        katz_weight=0.0,
+        mf_blend_alpha=mf_blend_alpha,
+        node_selection="bound",
+        primal_heuristic=True,
+        time_limit=time_limit,
+        node_limit=node_limit,
+        exact=True,
+    )
+    return NeuralBnBSolver(model, device, cfg)
+
+
 def _build_mf_blend_cuts(model, device, alpha, time_limit, node_limit):
     """Blended branching + heuristic cuts, no rollout."""
     from bnb_wm.solver.neural_bnb import NeuralBnBSolver
@@ -367,6 +388,8 @@ ALL_METHODS_A = [
     "mf_blend_20_cuts",
     "blend_rollout",
     "blend_rollout_cuts",
+    "dyn_pseudo",
+    "dyn_pseudo_blend",
     "policy",
     "rollout",
     "rollout_cuts_heur",
@@ -390,6 +413,7 @@ ALL_METHODS_B = [
 def method_needs_model(name):
     return name in ("mf_blend_20", "mf_blend_25", "mf_blend_30",
                     "mf_blend_20_cuts", "blend_rollout", "blend_rollout_cuts",
+                    "dyn_pseudo", "dyn_pseudo_blend",
                     "policy", "rollout",
                     "rollout_cuts_heur", "rollout_cuts_attn",
                     "neural_full",
@@ -520,6 +544,11 @@ def main():
             solvers[m] = ("neural", _build_blend_rollout(model, device, 0.20, tl, nl))
         elif m == "blend_rollout_cuts":
             solvers[m] = ("neural", _build_blend_rollout_cuts(model, device, 0.20, tl, nl))
+        elif m == "dyn_pseudo":
+            solvers[m] = ("neural", _build_dyn_pseudo(model, device, tl, nl))
+        elif m == "dyn_pseudo_blend":
+            solvers[m] = ("neural", _build_dyn_pseudo(model, device, tl, nl,
+                                                       mf_blend_alpha=0.20))
         elif m == "policy":
             solvers[m] = ("neural", build_neural(
                 model, device, "policy", "none", False, 0.0, "bound", tl, nl))
