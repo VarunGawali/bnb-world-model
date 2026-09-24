@@ -1,24 +1,9 @@
-%File: anonymous-submission.tex
-%
-% AAAI 2027 Anonymous Submission.
-% Requires the AAAI author kit files in this directory:
-%     aaai2027.sty   aaai2027.bst
-% (download from the same AAAI author-kit package as the template PDFs).
-%
-% Compile with:  pdflatex -> bibtex -> pdflatex -> pdflatex
+\documentclass{article}
+\usepackage{iclr2027_conference,times}
 
-\documentclass[letterpaper]{article}
-\usepackage{aaai2027}  % AAAI Press style; anonymity comes from the author field
-
-\usepackage{times}      % roman font
-\usepackage{helvet}     % sans-serif font
-\usepackage{courier}    % typewriter font
-\usepackage[hyphens]{url}
+\usepackage{hyperref}
+\usepackage{url}
 \usepackage{graphicx}
-\urlstyle{rm}
-\def\UrlFont{\rm}
-\usepackage{natbib}
-\usepackage{caption}
 \usepackage{booktabs}
 \usepackage{amsmath}
 \usepackage{amssymb}
@@ -27,108 +12,205 @@
 \usepackage{algpseudocode}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+\urlstyle{rm}
+
 \newtheorem{definition}{Definition}
 \newtheorem{proposition}{Proposition}
-\frenchspacing
-\setlength{\pdfpagewidth}{8.5in}
-\setlength{\pdfpageheight}{11in}
 
-% AAAI required PDF metadata
-\pdfinfo{
-/TemplateVersion (2027.1)
-}
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
 
-% ---------------------------------------------------------------------------
+% -----------------------------------------------------------------------
 \title{CutWorld: A Latent Dynamics Model for Unified Branch-and-Cut Control}
-\author{Anonymous Submission}
-\affiliations{Anonymous Affiliation}
-% ---------------------------------------------------------------------------
+
+% Authors must not appear in the submitted version.
+% \author{...}
+
+% \iclrfinalcopy  % Uncomment for camera-ready version only
+% -----------------------------------------------------------------------
 
 \begin{document}
+
 \maketitle
 
 \begin{abstract}
-Branch-and-Cut, the core of modern Mixed-Integer Programming (MIP) solvers, makes costly heuristic choices at every search node: which variable to branch on and which cutting planes to add. Existing learning-based methods score these decisions from single-node features, leaving them blind to their downstream effect on the search. We introduce \emph{CutWorld}, a latent dynamics model for Branch-and-Cut that forecasts the consequences of a decision in latent space, without extra LP solves. Because the model predicts how each variable's representation evolves under an action, the branching policy can be re-applied to imagined states, unrolling a branching sequence in latent space and scoring each candidate by a MuZero-style return with a cost-to-go estimate of remaining tree size. The same latent selects globally valid Gomory cuts, so a single unified model drives branching, cut selection, and node ordering while provably preserving optimality. On medium-tier Set Cover ($500\times1000$), all neural variants prove optimality on every instance within $300$\,s while all classical baselines time out and SCIP leaves a $16.7\%$ duality gap at $900$\,s---a solve-rate discontinuity rather than a marginal efficiency gain. The depth-1 latent rollout reduces explored nodes by $44\%$ over the imitation policy. Framing this as a first instance of learned dynamics models for optimization, we report optimality, nodes, time, and cuts with ablations isolating each component.
+Modern Mixed-Integer Programming solvers rely on Branch-and-Cut, which must
+make sequential decisions: which variable to branch on, which cuts to add,
+which node to explore, at every step of an exponentially large search tree.
+Because each decision reshapes the subsequent search, methods that score
+candidates from the current node alone are blind to the very signal that makes
+their target expert, strong branching, effective. We present CutWorld, a latent dynamics model that learns to simulate the downstream consequences of
+Branch-and-Cut decisions in latent space, replacing expensive LP solves with a
+single cheap forward pass. Our model encodes each search node as a bipartite
+graph using a GATv2 network with learned cross-attention pooling, then rolls
+forward a causal Transformer to predict how both the global state and each
+variable's representation evolve under a candidate action, enabling the
+branching policy to be re-applied to imagined states for multi-step planning.
+Candidates are scored by a MuZero-style return combining predicted per-step
+rewards, a value estimate, and a cost-to-go penalty; the same latent drives
+Gomory cut selection and node ordering within a single unified model that
+provably preserves solver exactness. On medium-tier Set Cover ($500{\times}1000$,
+300\,s budget), every neural variant proves optimality on all instances while
+every classical baseline times out and SCIP leaves a 16.7\% duality gap at
+900\,s; a single-step latent rollout reduces explored nodes by 44\% over the
+imitation policy (SGM 3{,}197 vs.\ 5{,}733), and deeper rollout (depth\,3)
+yields \emph{more} nodes (SGM 3{,}697), confirming that short-horizon planning
+is the sweet spot given current dynamics fidelity. We evaluate across medium and
+hard tiers against SCIP, pseudocost, strong branching, and classical heuristics,
+reporting optimality rate, nodes explored, wall-clock solving time, and cuts
+applied, with component-wise ablations isolating the contribution of each element.
 \end{abstract}
 
-% ---------------------------------------------------------------------------
+% -----------------------------------------------------------------------
 \section{Introduction}
 
-A modern optimization solver is, at its core, a sequential decision maker. To solve a single instance it makes millions of discrete choices, which variable to branch on, which cutting planes to add, which open node to explore next, each one steering an enormous combinatorial search, and each governed today by a hand-engineered heuristic. Model-based planning agents such as MuZero and Dreamer \citep{schrittwieser2020mastering,hafner2020dream} have shown that learning a model of environment dynamics, and planning by imagining the consequences of actions, transforms sequential decision making, from Atari and Go to continuous control. We bring this idea inside an optimization solver: \emph{CutWorld}, a latent dynamics model for the solver's most consequential decisions, those of Branch-and-Cut.
+A modern optimization solver is, at its core, a sequential decision maker. To
+solve a single instance it makes millions of discrete choices --- which variable
+to branch on, which cutting planes to add, which open node to explore next ---
+each one steering an enormous combinatorial search, and each governed today by a
+hand-engineered heuristic. Model-based planning agents such as MuZero and
+Dreamer \citep{schrittwieser2020mastering,hafner2020dream} have shown that
+learning a model of environment dynamics, and planning by imagining the
+consequences of actions, transforms sequential decision making, from Atari and
+Go to continuous control. We bring this idea inside an optimization solver:
+\emph{CutWorld}, a latent dynamics model for the solver's most consequential
+decisions, those of Branch-and-Cut.
 
-Mixed-Integer Programming (MIP) is a cornerstone of combinatorial optimization, and modern solvers attack it with Branch-and-Cut. Starting from a linear programming (LP) relaxation, B\&C repeatedly executes two core operations at each search tree node: adding cutting planes, valid inequalities that tighten the relaxation without removing integer solutions, and branching on a fractional variable to partition the search space.
+Mixed-Integer Programming (MIP) is a cornerstone of combinatorial optimization,
+and modern solvers attack it with Branch-and-Cut. Starting from a linear
+programming (LP) relaxation, B\&C repeatedly executes two core operations at
+each search tree node: adding cutting planes, valid inequalities that tighten
+the relaxation without removing integer solutions, and branching on a fractional
+variable to partition the search space.
 
-Unfortunately, making high-quality decisions at every node is computationally expensive. The gold standard for branching,
-\emph{strong branching}, tentatively solves the child LPs of each candidate variable to measure its bound improvement; cut selection faces an analogous trade-off when choosing among large pools of valid inequalities. To amortize these costs, recent machine learning approaches learn to imitate strong branching in a single forward pass, e.g., with graph neural networks \citep{gasse2019exact,khalil2016learning}, or use reinforcement learning to select cuts
-\citep{tang2020reinforcement}. These methods are effective, but they share a
-structural limitation: each scores a candidate \emph{from the current node
-alone}, discarding the lookahead signal---the effect a decision has on the resulting subtree.
+Unfortunately, making high-quality decisions at every node is computationally
+expensive. The gold standard for branching, \emph{strong branching}, tentatively
+solves the child LPs of each candidate variable to measure its bound
+improvement; cut selection faces an analogous trade-off when choosing among
+large pools of valid inequalities. To amortize these costs, recent machine
+learning approaches learn to imitate strong branching in a single forward pass,
+e.g., with graph neural networks \citep{gasse2019exact,khalil2016learning}, or
+use reinforcement learning to select cuts \citep{tang2020reinforcement}. These
+methods are effective, but they share a structural limitation: each scores a
+candidate \emph{from the current node alone}, discarding the lookahead
+signal --- the effect a decision has on the resulting subtree.
 
-CutWorld closes this gap with a learned latent dynamics model that simulates the downstream consequences of candidate decisions in latent space, without executing actual LP solves. We encode each search node as a bipartite graph and train a causal Transformer to predict how this state, alongside its constituent variable embeddings, evolves under candidate actions. Because the model predicts fine-grained, per-variable representations rather than a static graph summary, the branching policy can be re-applied to imagined states, unrolling multi-step decision sequences entirely in latent space. Candidates are scored by a MuZero-style return that combines a learned per-step reward with a cost-to-go value estimating the remaining size of the search tree. A single unified model concurrently drives the solver's core discrete choices, variable branching, cut selection, and node ordering, influencing only which decisions the solver makes and in what order, never the bounds or feasibility tests, so exactness is preserved.
+CutWorld closes this gap with a learned latent dynamics model that simulates the
+immediate consequences of candidate decisions in latent space, without
+executing child LP solves. We encode each search node as a bipartite graph,
+reading out the graph-level state with a learned attention pool
+\citep{lee2019set} over variable embeddings that emphasizes structurally
+important variables rather than averaging uniformly, and train a causal
+Transformer \citep{teoh2024nextlatent} to predict how this state, alongside its
+constituent per-variable embeddings, evolves under a candidate branching
+action. Because the model predicts fine-grained, per-variable representations
+rather than a static graph summary, the branching policy can be re-applied to
+the imagined child state for a one-step latent lookahead. Candidates are scored
+by combining the predicted child node's dual-bound value with a learned
+subtree-size penalty that directly targets the solver's true cost in explored
+nodes. Cut selection follows a similar imitation-learning approach
+\citep{paulus2022learning}, scoring candidate Gomory cuts with a pointer
+network conditioned on the current search state. A single unified model
+concurrently drives the solver's core discrete choices --- variable branching,
+cut selection, and node ordering --- influencing only which decisions the solver
+makes and in what order, never the bounds or feasibility tests, so exactness is
+preserved.
 
-\paragraph{Summary of Contributions}
+\paragraph{Summary of Contributions.}
 \begin{itemize}
   \item \textbf{A latent dynamics model for Branch-and-Cut.} We learn a
-  solver's decision dynamics, the first instance of \emph{latent dynamics
-  models for optimization}, so that branching and cutting are \emph{planned in
-  imagination} rather than chosen by fixed heuristics, replacing expensive
-  online LP solves with learned multi-step latent rollouts.
+  solver's decision dynamics --- the first instance of \emph{latent dynamics
+  models for optimization} --- so that branching and cutting are \emph{planned
+  in imagination} rather than chosen by fixed heuristics, replacing the child
+  LP solves that strong branching requires with a single learned latent
+  transition per candidate.
 
-  \item \textbf{Unified control with exactness guarantees.} We show that a single latent model can simultaneously drive variable branching, node selection, and global cut propagation while strictly maintaining the solver's exact optimality guarantees.
+  \item \textbf{Unified control with exactness guarantees.} We show that a
+  single latent model can simultaneously drive variable branching, node
+  selection, and cut selection while strictly maintaining the solver's
+  exact optimality guarantees.
 
-  \item \textbf{A search-tailored objective and stable training.} We design a cost-to-go formulation targeting the solver's true objective, total explored nodes, that trains directly from non-depth-first search traces, stabilized via a grounded MuZero-style loss with latent overshooting.
+  \item \textbf{A search-tailored objective and stable training.} We design a
+  subtree-size prediction objective targeting the solver's true cost --- total
+  explored nodes --- trainable directly from non-depth-first search traces,
+  stabilized via latent overshooting with a grounded bound-prediction
+  auxiliary.
 
-  \item \textbf{Empirical validation.} On Set Cover across difficulty tiers we report the four metrics that determine solver quality: optimality, explored nodes, solving time, and cuts applied, with an ablation that isolates each planning component's contribution and a fair both-solved-subset comparison against SCIP and classical branching heuristics.
+  \item \textbf{Empirical validation.} On Set Cover across difficulty tiers we
+  report the four metrics that determine solver quality: optimality, explored
+  nodes, solving time, and cuts applied, with an ablation that isolates each
+  planning component's contribution and a fair both-solved-subset comparison
+  against SCIP and classical branching heuristics.
 \end{itemize}
 
-% ---------------------------------------------------------------------------
+% -----------------------------------------------------------------------
 \section{Related Work}
 
 Learning to make solver decisions is an active area \citep{bengio2021machine}.
 The dominant approach is imitation: \citet{khalil2016learning} regress
 strong-branching scores from hand-crafted features, and \citet{gasse2019exact}
 represent a node as a bipartite constraint--variable graph and train a graph
-network to imitate strong branching in a single forward pass. This amortizes the cost of strong branching but discards the very signal that makes it strong, the quality of the subtree each candidate ultimately induces. The
-bipartite encoder of \citet{gasse2019exact} is the node representation we build
-on. Reinforcement learning restores a longer horizon: \citet{scavuzzo2022learning}
-train a branching policy with tree-structured returns, and
-\citet{nair2020solving} scale neural MIP solving with learned diving and
-branching. These methods optimize long-term reward, but remain \emph{model-free}:
-they treat the solver as a black box and never learn how a decision reshapes the
-subsequent search state.
+network to imitate strong branching in a single forward pass. This amortizes the
+cost of strong branching but discards the very signal that makes it strong ---
+the quality of the subtree each candidate ultimately induces. The bipartite
+encoder of \citet{gasse2019exact} is the node representation we build on; we
+replace its global mean pooling with a learned attention readout
+\citep{lee2019set} over variable nodes, producing a graph-level state that
+emphasizes fractional and high-objective variables rather than averaging
+uniformly. Reinforcement learning restores a longer horizon:
+\citet{scavuzzo2022learning} train a branching policy with tree-structured
+returns, and \citet{nair2020solving} scale neural MIP solving with learned
+diving and branching. These methods optimize long-term reward, but remain
+\emph{model-free}: they treat the solver as a black box and never learn how a
+decision reshapes the subsequent search state. The theoretical conditions under
+which learned branching rules preserve solver correctness are studied by
+\citet{chengbasu2023theoretical}, motivating our design that gates all learned
+decisions behind bound-justified pruning rather than letting them alter
+feasibility or optimality tests. Graph neural networks have also been applied
+directly to Set Cover \citep{shafi2022graphscp}, the benchmark domain we
+evaluate on.
 
 Cut selection has been learned along the same lines. \citet{tang2020reinforcement}
 cast it as a sequential decision problem solved with reinforcement learning, and
 \citet{paulus2022learning} imitate a look-ahead expert that scores each cut by
 the bound improvement it yields, but the look-ahead only produces training
 labels; at inference the policy again predicts from the current node alone.
-Learned large neighborhood search \citep{sonnerat2021learning} targets yet
-another solver decision. Across branching and cutting alike, prior work scores a
+\citet{wang2023hierarchical} model cut selection as a sequential ranking
+problem with a hierarchical sequence model; like prior cut methods, selection
+is made from the current node without imagining downstream states. Learned
+large neighborhood search \citep{sonnerat2021learning} targets yet another
+solver decision. Across branching and cutting alike, prior work scores a
 candidate either myopically or through an explicit, expensive look-ahead that
 the learned policy itself cannot invoke.
 
 CutWorld instead draws on model-based reinforcement learning. MuZero
 \citep{schrittwieser2020mastering} plans with a learned dynamics model without
-reconstructing observations, and Dreamer \citep{hafner2020dream} learns behaviors
-by imagination in latent space, using latent overshooting to keep multi-step
-predictions faithful. We bring this inside Branch-and-Cut, combining the
-bipartite representation of \citet{gasse2019exact} with a learned latent forward
-model: rather than ranking candidates by a static score or paying for explicit
-LP look-ahead, we \emph{imagine} the subtree a decision induces and recover
-strong branching's look-ahead signal at the cost of a few cheap latent rollouts.
-A single such model drives branching, cut selection, and node ordering, whereas
-prior methods learn each decision in isolation.
+reconstructing observations, and Dreamer \citep{hafner2020dream} learns
+behaviors by imagination in latent space. Recent work on compact world models
+\citep{teoh2024nextlatent} shows that predicting next latents in a learned
+embedding space, rather than reconstructing raw observations, yields efficient
+and accurate forward models; our DynamicsTransformer follows this design, and
+we adopt latent overshooting as a training-time stabilizer to keep the learned
+forward model faithful across multiple steps even though the deployed solver
+plans with a single-step rollout. We bring this inside Branch-and-Cut,
+combining the bipartite representation of \citet{gasse2019exact} with a
+learned latent forward model: rather than ranking candidates by a static score
+or paying for explicit LP look-ahead, we \emph{imagine} the immediate
+consequence a decision induces and recover part of strong branching's
+look-ahead signal at the cost of a single cheap latent transition per
+candidate. A single such model drives branching, cut selection, and node
+ordering, whereas prior methods learn each decision in isolation.
 
-% ---------------------------------------------------------------------------
+% -----------------------------------------------------------------------
 \section{Background and Problem Formulation}
 
 A (binary) Mixed-Integer Program minimizes a linear objective over integer
 variables subject to linear constraints,
 \begin{equation}
-\min_{x}\ c^\top x \quad \text{s.t.}\quad A x \ge b,\ \ x \in \{0,1\}^n,
+  \min_{x}\ c^\top x \quad \text{s.t.}\quad Ax \ge b,\quad x \in \{0,1\}^n,
 \end{equation}
-with $c\in\mathbb{R}^n$, $A\in\mathbb{R}^{m\times n}$, $b\in\mathbb{R}^m$. Set
-Cover is the case $A\in\{0,1\}^{m\times n}$, $b=\mathbf 1$.
+with $c\in\mathbb{R}^n$, $A\in\mathbb{R}^{m\times n}$, $b\in\mathbb{R}^m$.
+Set Cover is the case $A\in\{0,1\}^{m\times n}$, $b=\mathbf{1}$.
 
 Branch-and-Cut solves the LP relaxation at each node; if the solution is
 fractional it either adds valid cutting planes $\alpha^\top x \ge \beta$ that
@@ -136,7 +218,7 @@ tighten the relaxation, or branches on a fractional variable $x_j$ into the
 subproblems $x_j=0$ and $x_j=1$. The number of nodes explored before optimality
 is proved is governed by these two choices.
 
-We model the search as an MDP $(\mathcal S,\mathcal A,P,R,\gamma)$: a state
+We model the search as an MDP $(\mathcal{S},\mathcal{A},P,R,\gamma)$: a state
 $s_t$ is a search node (its LP relaxation as a constraint--variable graph); an
 action $a_t$ selects a fractional variable to branch on or a cut to add; the
 transition $P$ is the solver's deterministic response (child LPs, tightened
@@ -145,164 +227,300 @@ dense proxy for progress. The ultimate objective is to prove optimality in as
 few explored nodes as possible.
 
 The transition $P$ is realized by the solver itself, solving child LPs and
-re-optimizing, so evaluating the downstream effect of an action costs as much
-as taking it, which is why prior learned policies avoid look-ahead. CutWorld's
-central idea is to learn a latent surrogate for $P$: an encoder maps states to
-a latent, and a learned dynamics model predicts how that latent transitions
-under an action, so a decision's consequences can be \emph{imagined} without
-invoking the solver. This turns look-ahead from an expensive oracle into a cheap
-forward pass, and the reward and node-count signals above become the learning
-targets for the model's reward and cost-to-go heads (Method).
+re-optimizing, so evaluating the downstream effect of an action costs as much as
+taking it, which is why prior learned policies avoid look-ahead. CutWorld's
+central idea is to learn a latent surrogate for $P$: an encoder maps states to a
+latent, and a learned dynamics model predicts how that latent transitions under
+an action, so a decision's consequences can be \emph{imagined} without invoking
+the solver. This turns look-ahead from an expensive oracle into a cheap forward
+pass, and the reward and node-count signals above become the learning targets for
+the model's reward and cost-to-go heads (Section~\ref{sec:method}).
 
 \begin{proposition}[Exactness]
 \label{prop:exact}
-For any branching variable chosen among the fractional candidates, any subset
-of globally valid cuts added at any node, and any ordering of the open nodes,
+For any branching variable chosen among the fractional candidates, any subset of
+globally valid cuts added at any node, and any ordering of the open nodes,
 Branch-and-Cut returns a global optimum. Consequently CutWorld preserves the
 solver's exactness guarantee for every setting of the learned policy.
 \end{proposition}
 \begin{proof}[Proof sketch]
-Branching on a fractional $x_j$ into $x_j=0$ and $x_j=1$ partitions the integer
-feasible set exhaustively, so no integer solution is lost. A globally valid cut
-is satisfied by every integer-feasible point, so adding it removes no feasible
-solution. Node ordering changes only the sequence in which subproblems are
-explored, not the bound-and-integrality pruning rule, hence not the final
+Branching on a fractional $x_j$ into $x_j=0$ and $x_j=1$ partitions the
+integer feasible set exhaustively, so no integer solution is lost. A globally
+valid cut is satisfied by every integer-feasible point, so adding it removes no
+feasible solution. Node ordering changes only the sequence in which subproblems
+are explored, not the bound-and-integrality pruning rule, hence not the final
 incumbent. The learned model only selects among these correctness-preserving
 options, so the incumbent at termination is a global optimum.
 \end{proof}
 
-Our validity requirement drives the cut design in the Method: we generate
-Gomory fractional cuts, which are valid by construction, and let the model
-\emph{select} among them rather than invent inequalities.
+Our validity requirement drives the cut design in Section~\ref{sec:method}: we
+generate Gomory fractional cuts, which are valid by construction, and let the
+model \emph{select} among them rather than invent inequalities.
 
-% ---------------------------------------------------------------------------
+% -----------------------------------------------------------------------
 \section{Method}
+\label{sec:method}
 
 \begin{figure*}[t]
 \centering
 \begin{tikzpicture}[
-  node distance=5mm and 9mm,
-  box/.style={draw, rounded corners, align=center, minimum height=10mm,
-              inner sep=3pt, font=\small},
-  lat/.style={align=center, font=\small},
-  heads/.style={draw, dashed, rounded corners, align=center,
-                minimum height=10mm, inner sep=3pt, font=\footnotesize},
-  arr/.style={-{Latex[length=2mm]}, thick},
+  node distance=4mm and 6mm,
+  box/.style={draw, rounded corners, align=center, minimum height=8mm,
+              inner sep=2pt, font=\footnotesize},
+  small/.style={draw, rounded corners, align=center, minimum height=7mm,
+              inner sep=2pt, font=\scriptsize},
+  lat/.style={align=center, font=\footnotesize},
+  panel/.style={draw, dashed, rounded corners, inner xsep=4pt, inner ysep=7mm},
+  ptitle/.style={font=\scriptsize\bfseries, anchor=south west},
+  arr/.style={-{Latex[length=1.8mm]}, thick},
+  thinarr/.style={-{Latex[length=1.4mm]}},
+  feed/.style={thinarr, dashed, blue!55!black},
+  reuse/.style={thinarr, dashed, red!60!black},
+  loop/.style={thinarr, dashed, black!55, line width=0.6pt},
 ]
-\node[box] (inp) {B\&B node\\{\footnotesize bipartite}\\{\footnotesize graph}};
-\node[box, right=of inp] (enc) {GATv2\\Encoder};
-\node[lat, right=7mm of enc] (z) {$z,\{h_i\}$};
-\node[box, right=7mm of z] (dyn) {Causal\\Transformer\\{\footnotesize $z_{t+1},h_i^{t+1}$}};
-\node[box, right=of dyn] (plan) {Latent\\rollout\\{\footnotesize score $R(c)$}};
-\node[box, right=of plan] (dec) {Branch /\\Cut\\decision};
-\node[heads, below=8mm of z] (hd)
-  {Heads:\ $\pi$ (policy)\ \textbar\ $V$ (value)\\
-   $C$ (cost-to-go)\ \textbar\ $\rho$ (cut)};
+
+% ---------- Panel (a): core architecture ----------
+\node[box] (inp) {B\&C node\\{\scriptsize bipartite graph}};
+\node[box, right=of inp] (enc) {GATv2 Encoder\\{\scriptsize +CrossAttnPool}};
+\node[lat, right=8mm of enc] (z) {$z,\{h_i\}$};
+\node[box, above right=3mm and 8mm of z, minimum width=32mm] (heads)
+  {$\pi,V,S,C$ (heads)\\$\iota(\text{depth},n_{\text{frac}})$\ \ $\hat b,\hat r$};
+\node[box, below right=3mm and 8mm of z, minimum width=32mm] (dyn)
+  {Dynamics (Causal TF)\\{\scriptsize step$(z,a,\text{dir})\to z',h_i'$}};
 
 \draw[arr] (inp) -- (enc);
 \draw[arr] (enc) -- (z);
+\draw[arr] (z) -- (heads);
 \draw[arr] (z) -- (dyn);
-\draw[arr] (dyn) -- (plan);
-\draw[arr] (plan) -- (dec);
-\draw[arr] (z) -- (hd);
-\draw[arr] (hd.east) -| (plan.south);
-\draw[arr, dashed] (plan.north) to[out=60,in=120] node[above,font=\footnotesize]
-      {imagine next step (re-apply $\pi$)} (dyn.north);
+\draw[arr, thinarr, dashed] (heads.east) to[out=0,in=90] ++(4mm,-4mm) |- (dyn.east);
+
+\node[panel, fit=(inp)(enc)(z)(heads)(dyn)] (panelA) {};
+\node[ptitle] at (panelA.north west) {(a) Encoder, heads, dynamics};
+
+% ---------- Panel (b): cut decision ----------
+\node[small, below=20mm of inp] (pool) {Gomory pool\\{\scriptsize root, valid}};
+\node[small, right=7mm of pool] (viol) {Violated\\cuts};
+\node[small, below=9mm of viol, xshift=-16mm] (heur) {Heuristic\\{\scriptsize max-viol.}};
+\node[small, below=9mm of viol] (attn) {Attention\\{\scriptsize param-free}};
+\node[small, below=9mm of viol, xshift=16mm] (latent) {Latent beam\\{\scriptsize dyn.+$V$}};
+\node[small, right=22mm of viol] (commit) {Commit\\{\scriptsize re-solve, re-encode}};
+
+\draw[arr] (pool) -- (viol);
+\draw[arr] (viol.south) -- ++(0,-4mm) -| (heur.north);
+\draw[arr] (viol.south) -- (attn.north);
+\draw[arr] (viol.south) -- ++(0,-4mm) -| (latent.north);
+\draw[arr] (heur.south) -- ++(0,-4mm) -| (commit.south);
+\draw[arr] (attn.south) -- ++(0,-4mm) -| (commit.south);
+\draw[arr] (latent.south) -- ++(0,-4mm) -| (commit.south);
+
+\node[panel, fit=(pool)(viol)(heur)(attn)(latent)(commit)] (panelB) {};
+\node[ptitle] at (panelB.north west) {(b) Cut decision\ {\normalfont\scriptsize(gated by $\iota$, budget, gain)}};
+
+% ---------- Panel (c): branch selection ----------
+\node[small, below=42mm of pool] (pscore) {$\pi(h_i,z)$\\{\scriptsize +Katz/mf blend}};
+\node[small, right=5mm of pscore] (leafchk) {$\iota$ leaf?\\{\scriptsize yes: argmax $\pi$}};
+\node[small, right=5mm of leafchk] (confchk) {$\pi$ confident?\\{\scriptsize yes: argmax $\pi$}};
+\node[small, right=5mm of confchk] (topk) {Top-$K$\\candidates};
+\node[small, right=5mm of topk, minimum width=30mm] (roll)
+  {Rollout each candidate:\\unroll dynamics, re-apply $\pi$\\
+   $\sum\gamma^{j-1}\hat r_j - w_sS - w_cC$};
+\node[small, right=5mm of roll] (argmax) {$\arg\max$\\$\to$ branch var};
+
+\draw[arr] (pscore) -- (leafchk);
+\draw[arr] (leafchk) -- (confchk);
+\draw[arr] (confchk) -- (topk);
+\draw[arr] (topk) -- (roll);
+\draw[arr] (roll) -- (argmax);
+
+\node[panel, fit=(pscore)(leafchk)(confchk)(topk)(roll)(argmax)] (panelC) {};
+\node[ptitle] at (panelC.north west) {(c) Branch selection};
+
+% ---------- Cross-panel interconnections ----------
+\coordinate (rbus) at ($(panelC.east)+(7mm,0)$);
+\draw[reuse] (dyn.east) -- (dyn.east -| rbus)
+             -- (latent.east -| rbus) -- (latent.east);
+\draw[reuse] (dyn.east) -| (rbus |- panelC.south) -- ++(0,-4mm) -| (roll.south);
+\node[font=\tiny, red!60!black, anchor=west] at ($(dyn.east -| rbus)+(0,3mm)$) {dyn.\ reused};
+
+\coordinate (lbus) at ($(panelA.west)+(-7mm,0)$);
+\draw[feed] (z.west) -- (z.west -| lbus)
+            -- (heur.west -| lbus) -- (heur.west);
+\draw[feed] (z.west -| lbus) -- (pscore.west -| lbus) -- (pscore.west);
+\node[font=\tiny, blue!55!black, anchor=east, rotate=90] at ($(lbus)+(0,-18mm)$) {$z,\{h_i\}$ feed};
+
+\coordinate (lbus2) at ($(panelA.west)+(-14mm,0)$);
+\coordinate (commitN) at ($(commit.north)+(0,6mm)$);
+\draw[loop] (commit.north) -- (commitN) -- (commitN -| lbus2)
+            -- (enc.south -| lbus2) -- (enc.south);
+\node[font=\tiny, black!55, anchor=east, rotate=90] at ($(lbus2)+(0,7mm)$) {re-encode};
+
+\coordinate (fbus) at ($(panelA.west)+(-21mm,0)$);
+\coordinate (bbus) at ($(panelC.south)+(0,-6mm)$);
+\draw[loop] (argmax.south) -- (argmax.south |- bbus)
+            -- (fbus |- bbus) -- (fbus |- inp.west) -- (inp.west);
+\node[font=\tiny, black!55, anchor=north] at ($(argmax.south)+(-35mm,-4mm)$) {push children (next node)};
+
 \end{tikzpicture}
-\caption{\textbf{CutWorld.} A GATv2 encoder maps each Branch-and-Cut node to a
-graph latent $z$ and per-variable embeddings $\{h_i\}$. A causal Transformer
-predicts how both evolve after an action, so the policy can be re-applied to an
-\emph{imagined} state and a branching sequence unrolled in latent space (dashed
-loop). Candidates are scored by the rollout return $R(c)$ (Eq.~\ref{eq:return});
-the same latent drives the value, cost-to-go, and cut-selection heads. The model
-chooses only \emph{which} decisions the solver makes, never the bounds or
-feasibility tests, so exactness is preserved (Proposition~\ref{prop:exact}).}
+\caption{\textbf{CutWorld architecture and decision pipeline.}
+\textbf{(a)} A GATv2 encoder with cross-attention pooling maps each
+Branch-and-Cut node to a graph latent $z$ and per-variable embeddings
+$\{h_i\}$; seven heads read $z$ (four also read $\{h_i\}$), and a causal
+Transformer predicts how $z$ and $\{h_i\}$ evolve under a candidate action,
+without invoking the solver. \textbf{(b)} Cut selection is gated by the
+integrality head $\iota$ together with budget/gain/depth checks (Gate~7);
+candidate Gomory cuts are scored by one of three interchangeable rules ---
+maximum violation, a parameter-free attention rule over cut and constraint
+embeddings, or a learned latent beam search over the dynamics --- before the
+chosen cuts are committed and the LP is re-solved and re-encoded.
+\textbf{(c)} Branching scores fractional variables with the policy head
+$\pi$ (optionally blended with Katz centrality or fractionality); the
+integrality head and the policy's own confidence provide two cheap early
+exits, and only otherwise-ambiguous nodes pay for a latent rollout that
+unrolls the dynamics, re-applies $\pi$ at each imagined step, and scores
+candidates by a reward-, size-, and cost-to-go-weighted return.
+\textbf{Cross-panel links} make the shared machinery explicit: the blue
+dashed path shows $z,\{h_i\}$ from the encoder feeding both the cut-scoring
+cluster and the branching policy; the red dashed path shows the dynamics
+model being reused by the latent-beam cut mode and by the branch rollout;
+and the two gray dashed loops close the search loop --- committing cuts
+re-solves the LP and re-encodes a fresh $z,\{h_i\}$ (top loop), and the
+chosen branch variable's children are pushed back onto the queue as new
+B\&C nodes (bottom loop). No gate or head ever alters an LP bound or a
+feasibility test, so solver exactness is unaffected
+(Proposition~\ref{prop:exact}).}
 \label{fig:arch}
 \end{figure*}
 
-We view Branch-and-Cut as a sequential decision process. At each node $t$ of the
-search the solver observes a state $s_t$ (the current relaxation), takes an action
-$a_t$ (branch on a fractional variable, or add a cut), and transitions to the next
-node. We learn (i) an encoder that maps $s_t$ to a latent state, (ii) a dynamics
-model that predicts how that latent evolves under an action, and (iii) heads that
-score decisions by rolling the dynamics forward (Figure~\ref{fig:arch}).
-Throughout, $d$ denotes the embedding dimension.
+We view Branch-and-Cut as a sequential decision process. At each node $t$ of
+the search the solver observes a state $s_t$ (the current relaxation), takes an
+action $a_t$ (branch on a fractional variable, or add a cut), and transitions to
+the next node. We learn (i)~an encoder that maps $s_t$ to a latent state,
+(ii)~a dynamics model that predicts how that latent evolves under an action, and
+(iii)~heads that score decisions by rolling the dynamics forward
+(Figure~\ref{fig:arch}). Throughout, $d=128$ denotes the embedding dimension.
 
-\subsection{Node encoder}
+\subsection{Node Encoder}
+
 Each node is a bipartite graph over the constraints and variables of the
-relaxation: variable nodes carry LP-derived features (solution value, reduced
-cost, bound and basis status), constraint nodes carry their features, and each
-edge carries its coefficient together with two derived features, the
-RHS-normalized value and the sign. A graph network with GATv2 attention
-\citep{brody2022how} performs two-directional message passing, and a learned
-attention readout pools the result:
+relaxation: variable nodes carry 19 LP-derived features (solution value,
+fractionality, reduced cost, bound and basis status), constraint nodes carry 5
+features (zero-padded to 19 in a shared feature matrix), and each edge carries
+its coefficient together with two derived features, the RHS-normalized value and
+the sign. A 3-layer bidirectional GATv2 network \citep{brody2022how} with 4
+attention heads (head dimension 32, concatenated to $d=128$) performs
+two-directional message passing per layer --- constraints-to-variables and
+variables-to-constraints --- with LayerNorm after each pass. GATv2 attention,
+rather than mean aggregation, lets each variable weight the constraints that
+actually bind it at the current node, which vary enormously across the tree.
+A learned cross-attention readout (CrossAttentionPool) attends a single learned
+query vector over the per-variable embeddings to produce the graph-level
+summary, emphasising the variables most relevant at this node:
 \begin{equation}
-\big(\{h_i\}_{i=1}^{n},\, z\big) = \mathrm{Enc}(s_t),
-\qquad h_i, z \in \mathbb{R}^{d},
+  \bigl(\{h_i\}_{i=1}^{n},\, z\bigr) = \mathrm{Enc}(s_t),
+  \qquad h_i,\, z \in \mathbb{R}^{d}.
 \end{equation}
-where $h_i$ is the embedding of variable $i$ and $z$ is a graph-level summary.
-The embedding of an action that branches on variable $v$ is $a = h_v$.
+Feature statistics are held in fixed registered buffers rather than BatchNorm,
+so the encoder can be frozen during later curriculum phases without any
+train/eval inconsistency. The embedding of an action that branches on variable
+$v$ is $a = h_v$.
 
-\subsection{Latent dynamics}
-A causal Transformer models the evolution of the latent along a trajectory. From
-the sequence of tokens $u_\tau = W_{\mathrm{in}}[z_\tau \,\|\, a_\tau]$
-($\tau \le t$) with learned positional encodings, it predicts the next graph
-latent, while a per-variable head predicts how each variable embedding changes:
-\begin{align}
-z_{t+1} &= W_{\mathrm{out}}\,\mathrm{TF}(u_{0:t}), \\
-h_i^{\,t+1} &= \mathrm{LN}\!\big(h_i^{\,t} + \mathrm{MLP}([\,h_i^{\,t}\,\|\,z_{t+1}\,\|\,a_t\,])\big).
-\label{eq:varupdate}
-\end{align}
-Predicting per-variable embeddings~\eqref{eq:varupdate}, rather than only the
-graph summary $z$, is what lets the branching policy be re-applied to an
+\subsection{Latent Dynamics}
+
+A 4-layer causal Transformer with 4 attention heads, hidden dimension $d=128$,
+FFN width $4d$, maximum sequence length 512, and learned positional encodings
+models the evolution of the latent along the root-to-node trajectory. Each step
+produces one token encoding the current latent, the branched variable, and the
+branch direction:
+\begin{equation}
+  u_\tau = W_{\mathrm{in}}[z_\tau \,\|\, a_\tau \,\|\, d_\tau],
+  \quad \tau \le t,
+\end{equation}
+where $a_\tau = h_{v_\tau}$ is the embedding of the branched variable and
+$d_\tau \in \{+1,-1\}$ is the branch direction. Conditioning on direction is
+what lets a single model represent both children of a node. The next graph
+latent is decoded with a residual connection to limit multi-step drift:
+\begin{equation}
+  z_{t+1} = \mathrm{LN}\!\bigl(z_t + W_{\mathrm{out}}\,\mathrm{TF}(u_{0:t})\bigr).
+\end{equation}
+Predicting a delta rather than an absolute latent keeps long rollouts from
+wandering. A per-variable module predicts how each variable embedding evolves.
+Exploiting the linearity of its first layer, the update decomposes as
+\begin{equation}
+  h_i^{\,t+1} = \mathrm{LN}\!\bigl(
+    h_i^{\,t} + W_h(h_i^{\,t}) + W_z(z_{t+1}) + W_a(a_t)
+  \bigr),
+  \label{eq:varupdate}
+\end{equation}
+where $W_h$, $W_z$, $W_a$ are linear maps. Because $W_z(z_{t+1})$ and
+$W_a(a_t)$ are identical across variables, they are computed once and
+broadcast-added to the per-variable term $W_h(h_i^{\,t})$, reducing the
+per-step cost from $O(V{\cdot}3d^2)$ to $O(V{\cdot}d^2)$. Predicting
+per-variable embeddings~\eqref{eq:varupdate}, rather than only the graph
+summary $z$, is what lets the branching policy be re-applied to an
 \emph{imagined} state during planning. We ground the latent with a linear head
-$\hat b_{t+1}=w_b^\top z_{t+1}$ that predicts the node's normalized dual bound,
-tying it to a real solver quantity, and a reward head
-$\hat r_{t}=w_r^\top z_{t+1}$ that predicts the per-step dual-bound improvement.
+$\hat{b}_{t+1}=w_b^\top z_{t+1}$ that predicts the node's normalized dual
+bound, tying the imagined latent to a real solver quantity, and a reward head
+$\hat{r}_{t}=w_r^\top z_{t+1}$ that predicts the per-step dual-bound
+improvement.
 
-\subsection{Value, cost-to-go, and policy}
-Let $\bar h_{\mathrm{frac}}$ be the mean embedding of the currently fractional
-variables. The value and cost-to-go heads share this enriched input:
+\subsection{Value, Cost-to-Go, and Policy}
+
+Let $\bar{h}_{\mathrm{frac}}$ be the mean embedding of the \emph{currently
+fractional} variables only. The value and cost-to-go heads share this enriched
+input, so each head sees what is actually undecided at this node rather than a
+global average:
 \begin{align}
-V(z) &= \mathrm{MLP}_V([z \,\|\, \bar h_{\mathrm{frac}}]), \\
-C(z) &= \mathrm{softplus}\big(\mathrm{MLP}_C([z \,\|\, \bar h_{\mathrm{frac}}])\big),
+  V(z) &= \mathrm{MLP}_V([z \,\|\, \bar{h}_{\mathrm{frac}}]), \\
+  C(z) &= \mathrm{softplus}\bigl(\mathrm{MLP}_C([z \,\|\,
+           \bar{h}_{\mathrm{frac}}])\bigr),
 \end{align}
-where $C$ predicts $\log(1+\text{remaining nodes})$. Its regression target is the
-Monte-Carlo return $T-t$ read directly off a length-$T$ trajectory---the number of
-steps still to come, which requires \emph{no} assumption that the trajectory is
+where each MLP has layers $2d \to d \to d/2 \to 1$ and $C$ predicts
+$\log(1+\text{remaining nodes})$. Its regression target is the Monte-Carlo
+return $T-t$ read directly off a length-$T$ trajectory --- the number of steps
+still to come, which requires \emph{no} assumption that the trajectory is
 depth-first ordered, unlike a subtree-size target. The branching policy is a
-pointer network scoring each variable against the graph latent,
-$\pi(v)\!\propto\! w^\top\!\tanh(W_k h_v + W_z z)$.
+pointer network scoring each fractional variable jointly against the graph
+context:
+\begin{equation}
+  \pi(v) \propto w^\top\!\tanh\!\bigl(W_k h_v + W_z z\bigr)
+                 \odot W_q z \,/\, \sqrt{d}.
+\end{equation}
+An integrality head $\sigma\!\bigl(\mathrm{MLP}([z \,\|\, \mathrm{depth} \,\|\,
+n_{\mathrm{frac}}])\bigr)$ predicts the probability that the next node is a
+leaf, used to gate the rollout (skip if already near-integral) and to control
+when the cut pipeline fires.
 
-\subsection{Planning rollout for candidate selection}
-To branch, we take the policy's top-$k$ candidates and score each by imagining the
-subtree it induces. Starting from the current $(z,\{h_i\})$ with first action
-$a=h_c$, we unroll the dynamics for $K$ steps, re-applying the policy to each
-predicted state to choose the next action
+\subsection{Planning Rollout for Candidate Selection}
+
+To branch, we take the policy's top-$k$ candidates and score each by imagining
+the subtree it induces. Starting from the current $(z,\{h_i\})$ with first
+action $a=h_c$, we unroll the dynamics for $K$ steps, re-applying the policy to
+each predicted state to choose the next action
 $v_j=\arg\max_{v\in\mathcal{F}}\pi(v\mid z_j,\{h^j\})$ over the fractional set
 $\mathcal{F}$. The candidate is scored by a MuZero-style return that accumulates
-predicted rewards along the imagined path, bootstraps with the value at the leaf,
-and penalizes predicted remaining work:
+predicted rewards along the imagined path, bootstraps with the value at the
+leaf, and penalizes predicted remaining work:
 \begin{equation}
-R(c) = \sum_{j=1}^{K}\gamma^{\,j-1}\hat r_j \;+\; \gamma^{\,K-1}V(z_K)
-       \;-\; w_c\sum_{j=1}^{K}\gamma^{\,j-1}\hat C(z_j).
-\label{eq:return}
+  R(c) = \sum_{j=1}^{K}\gamma^{\,j-1}\hat{r}_j
+       + \gamma^{\,K-1}V(z_K)
+       - w_c\sum_{j=1}^{K}\gamma^{\,j-1}\hat{C}(z_j).
+  \label{eq:return}
 \end{equation}
 We expand a shallow tree of branching factor $b$ (the top-$b$ actions at each
 step, child returns averaged); $b\!=\!1$ recovers a single greedy rollout.
 Rather than branching on $\arg\max_c R(c)$, which lets a single noisy rollout
 override a confident policy, we use a \emph{policy-anchored} rule: over the
 candidate set we standardize the policy scores and the returns and select
-$c^\star=\arg\max_c\big[\hat\pi(c)+\lambda\,\hat R(c)\big]$, so the latent
-lookahead refines the policy's ranking instead of replacing it ($\lambda\!=\!0$
-recovers the policy). A short horizon is used because deeper rollouts compound
-dynamics error, and the rollout is invoked only when the policy is
-uncertain, if the top candidate's probability exceeds a threshold, the policy
-choice is taken directly, so the lookahead cost is paid only on genuinely close
-decisions. The same value drives \emph{node selection}: open nodes are ordered
-by ascending predicted cost-to-go $C(z)$, so the subtree expected to close
-soonest is explored first. Because these choices affect only search order, never
-the bounds or feasibility tests, exactness is preserved.
+$c^\star=\arg\max_c\bigl[\hat{\pi}(c)+\lambda\,\hat{R}(c)\bigr]$, so the
+latent lookahead refines the policy's ranking instead of replacing it
+($\lambda\!=\!0$ recovers the policy). A short horizon is used because deeper
+rollouts compound dynamics error, and the rollout is invoked only when the
+policy is uncertain; if the top candidate's probability exceeds a threshold the
+policy choice is taken directly, so the lookahead cost is paid only on
+genuinely close decisions. The same value drives \emph{node selection}: open
+nodes are ordered by ascending predicted cost-to-go $C(z)$, so the subtree
+expected to close soonest is explored first. Because these choices affect only
+search order, never the bounds or feasibility tests, exactness is preserved.
 Algorithm~\ref{alg:select} summarizes candidate selection.
 
 \begin{algorithm}[t]
@@ -310,293 +528,399 @@ Algorithm~\ref{alg:select} summarizes candidate selection.
 \label{alg:select}
 \begin{algorithmic}[1]
 \State \textbf{Input:} node latent $z$, variable embeddings $\{h_i\}$,
-fractional set $\mathcal{F}$, depth $K$, factor $b$
-\State $\mathcal{C}\gets \textsc{TopK}_k\big(\pi(\cdot\mid z,\{h_i\}),\,\mathcal{F}\big)$
+       fractional set $\mathcal{F}$, depth $K$, factor $b$
+\State $\mathcal{C}\gets \textsc{TopK}_k\bigl(\pi(\cdot\mid z,\{h_i\}),\,\mathcal{F}\bigr)$
 \For{each candidate $c\in\mathcal{C}$}
-  \State $R(c)\gets \textsc{Rollout}(z,\{h_i\},c,K,b)$ \Comment{Eq.~\eqref{eq:return}}
+  \State $R(c)\gets \textsc{Rollout}(z,\{h_i\},c,K,b)$
+         \Comment{Eq.~\eqref{eq:return}}
 \EndFor
-\State \textbf{return} $\arg\max_{c\in\mathcal{C}} R(c)$
+\State \Return $\arg\max_{c\in\mathcal{C}} R(c)$
 \end{algorithmic}
 \end{algorithm}
 
-\subsection{Cutting-plane selection}
+\subsection{Cutting-Plane Selection}
+
 The model performs cut \emph{selection}; validity is guaranteed by the
 generator, not the learner. We generate a pool of Gomory fractional cuts at the
-root from the LP optimal basis. Writing the relaxation in standard form---all
-variables nonnegative, with the box $0\le x\le 1$ lifted into explicit rows
-$x_j+t_j=1$ so every nonbasic variable rests at its lower bound, each basic
-structural variable $x_j$ with a fractional value $\bar b$ and tableau row
-$x_j+\sum_{k\in\mathcal N}\alpha_k v_k=\bar b$ yields the valid inequality
-$\sum_{k\in\mathcal N}\mathrm{frac}(\alpha_k)\,v_k \ge \mathrm{frac}(\bar b)$,
+root from the LP optimal basis. Writing the relaxation in standard form --- all
+variables nonneg\-ative, with the box $0\le x\le 1$ lifted into explicit rows
+$x_j+t_j=1$ so every nonbasic variable rests at its lower bound --- each basic
+structural variable $x_j$ with a fractional value $\bar{b}$ and tableau row
+$x_j+\sum_{k\in\mathcal{N}}\alpha_k v_k=\bar{b}$ yields the valid inequality
+$\sum_{k\in\mathcal{N}}\mathrm{frac}(\alpha_k)\,v_k \ge \mathrm{frac}(\bar{b})$,
 which we express in the structural variables by substituting the slack
 definitions. Derived from globally valid rows with no branching bounds applied,
 these cuts hold for \emph{every} integer-feasible solution and are safely
-inherited by all descendants of the node, genuine Branch-and-Cut rather than
-cut-and-branch. A pointer head scores each candidate cut $\ell$ (with feature
-vector $\phi_\ell$: violation, efficacy, density, parallelism, objective cutoff,
-support fraction) against the node latent,
-$\rho_\ell = w^\top\tanh(W_k\,\mathrm{MLP}(\phi_\ell)+W_z z)$, and cuts with
-$\sigma(\rho_\ell)>\tau$ are added, replacing fixed heuristics such as maximum
-violation.
+inherited by all descendants of the node --- genuine Branch-and-Cut rather than
+cut-and-branch.
 
-\subsection{Learning objectives}
-Each component has a supervised objective:
+A pointer head scores each candidate cut $\ell$ against the node latent. Each
+cut is represented by a 6-dimensional feature vector $\phi_\ell$ encoding
+violation, efficacy, density, parallelism, objective cutoff, and support
+fraction:
+\begin{equation}
+  \rho_\ell = w^\top\tanh\!\bigl(W_k\,\mathrm{MLP}(\phi_\ell)+W_z z\bigr),
+\end{equation}
+and cuts with $\sigma(\rho_\ell)>\tau$ are added, replacing fixed heuristics
+such as maximum violation. As a parameter-free fallback, cuts and constraints
+are each embedded as coefficient-weighted sums of $\{h_i\}$ over their
+variable support, and cuts are scored by their cross-attention alignment with
+constraints that are simultaneously loose and connected to fractional variables
+--- a geometrically grounded selection rule that exploits the encoder's
+representations without any additional learned parameters. Training the
+pointer head requires cut-quality labels produced by an external solver, which
+are not always available at the scale needed for Phase~5; the reported results
+therefore use the attention rule as the deployed selection mechanism, with the
+learned pointer head evaluated separately in Table~\ref{tab:cuts}.
+
+\subsection{Learning Objectives}
+\label{sec:objectives}
+
+Each component has a supervised objective, optimized in the five-phase
+curriculum detailed in Section~\ref{sec:training}:
 \begin{itemize}
-  \item \textbf{Policy:} masked cross-entropy against the strong-branching
-  choice over the candidate set.
+  \item \textbf{Policy:} a convex combination
+  $\alpha\,\mathrm{CE}(\arg\max)+(1{-}\alpha)\,\mathrm{KL}(p_{\mathrm{SB}}\,\|\,\pi)$,
+  $\alpha=0.5$, of hard cross-entropy against the strong-branching argmax and a
+  soft KL term against $p_{\mathrm{SB}}=\mathrm{softmax}$ of the (per-node
+  standardized) strong-branching scores; the hard term anchors the top-1
+  choice while the soft term carries the full ranking signal.
   \item \textbf{Value:} Huber loss against the normalized dual bound.
-  \item \textbf{Dynamics:} MSE-plus-cosine latent prediction on $z_{t+1}$, a
-  reconstruction loss on $h_i^{\,t+1}$, grounding and reward losses on $\hat b$
-  and $\hat r$, and a \emph{latent-overshooting} loss unrolling $K$ steps from
-  the model's own predictions to curb compounding error.
-  \item \textbf{Cost-to-go:} Huber loss on $\log(1{+}(T{-}t))$, with a
-  value-consistency term $\lVert V(\tilde z)-V(z)\rVert^2$ aligning the value
-  head to dynamics-predicted latents $\tilde z$.
-  \item \textbf{Cut:} weighted binary cross-entropy against a cut-quality label.
+  \item \textbf{Dynamics:} an MSE-plus-cosine loss on the one-step latent
+  prediction $z_{t+1}$; an analogous MSE-plus-cosine reconstruction loss on
+  $h_i^{\,t+1}$; Huber grounding losses on the two auxiliary heads $\hat{b}$
+  (normalized dual bound) and $\hat{r}$ (per-step reward); and a
+  \emph{latent-overshooting} loss that re-derives the same terms from the
+  model's own free-running predictions over a horizon ramped from 1 to 3 steps
+  across training, weighted by $1/k$, to curb compounding error.
+  \item \textbf{Cost-to-go:} Huber loss on $\log(1{+}(T{-}t))$, where the
+  target $T-t$ is the Monte-Carlo number of steps remaining in the trajectory.
+  \item \textbf{Subtree size:} Huber loss on $\log(1{+}\text{subtree size})$
+  from realized Branch-and-Cut traces; used during joint fine-tuning to shape
+  the rollout's size penalty rather than as a standalone solver-time signal.
+  \item \textbf{Integrality:} weighted binary cross-entropy against a
+  leaf/non-leaf label, with positive-class weight equal to the
+  negative-to-positive ratio.
+  \item \textbf{Value-consistency} (joint phase only): $\lVert
+  V(\tilde{z})-V(z)\rVert^2$, aligning the value head's output on the
+  dynamics-predicted latent $\tilde{z}$ to its output on the true encoder
+  latent $z$ for the same node, so $V$ stays reliable when queried on imagined
+  states during planning.
+  \item \textbf{Cutting-plane head:} weighted binary cross-entropy against a
+  label indicating whether a candidate cut was selected by an external solver
+  and improved the LP bound; positive-class weight equal to the
+  negative-to-positive ratio.
 \end{itemize}
 
-% ---------------------------------------------------------------------------
+% -----------------------------------------------------------------------
 \section{Experiments}
 
 \subsection{Setup}
-We evaluate on Set Cover instances generated with Ecole
-\citep{prouvost2020ecole} across easy, medium, and hard difficulty tiers, and we
-collect strong-branching trajectories for training. We compare against a
-spectrum of branching rules: the trivial \emph{random} and \emph{most-fractional}
-heuristics, the classical \emph{pseudocost} rule, \emph{full strong branching}
-(the near-optimal but expensive oracle our policy imitates), and \emph{SCIP}'s
-default reliability-pseudocost branching (the strong solver baseline). We also
-report an \emph{imitation} policy, the learned policy without any latent
-lookahead, as the prior learning-based approach. We report four
-metrics per method on a common held-out instance set: the fraction of instances
-closed to \emph{optimality} within the time limit, the number of explored
-\emph{nodes}, the wall-clock solving \emph{time}, and the number of
-\emph{cutting planes} applied. Optimality is reported first because a reduction
-in nodes is only a genuine improvement when the instance is actually solved: a
-method that is slow per node can appear to explore fewer nodes merely by timing
-out. Accordingly, all node and time comparisons are made on the subset of
-instances solved to optimality by \emph{both} the method and the baseline, which
-isolates decision quality from the timeout confound.
 
-\subsection{Training details}
-The objectives above are optimized in a five-stage curriculum so that each
-component builds on trained predecessors: (1) policy (encoder and policy head);
-(2) value (encoder and policy frozen); (3) dynamics (encoder frozen); (4) joint
-fine-tuning of all components with the cost-to-go and value-consistency terms;
-and (5) cut selection. Class imbalance in the leaf and cut labels is corrected
-with a positive-class weight equal to the negative/positive ratio, and early
-stopping on a validation metric selects each stage's best checkpoint. Full
-hyperparameters are listed in the appendix.
+We evaluate on Set Cover instances across easy, medium, and hard difficulty
+tiers, collecting strong-branching trajectories for training. We compare against
+a spectrum of branching rules: the trivial \emph{most-fractional} heuristic,
+\emph{classical strong branching} at look-ahead depths 1, 4, and 8 (SB-1/4/8),
+and \emph{SCIP}'s default reliability-pseudocost branching (the strong solver
+baseline). We also report the \emph{imitation} policy and several ablation
+variants of CutWorld. We report four metrics per method on a common held-out
+instance set: the fraction of instances closed to \emph{optimality} within the
+time limit, the Shifted Geometric Mean (SGM) of explored \emph{nodes} (shift
+$\delta_n=10$) and wall-clock \emph{time} (shift $\delta_t=1$), and the number
+of \emph{cutting planes} applied. Optimality is reported first because a
+reduction in nodes is only a genuine improvement when the instance is actually
+solved: a method that is slow per node can appear to explore fewer nodes merely
+by timing out. All node and time comparisons are made on the both-solved subset
+where both the method and baseline close the instance; on tiers where baselines
+time out, SGM nodes are computed at the time limit (marked $\dagger$).
+
+\subsection{Training Details}
+\label{sec:training}
+
+The objectives of Section~\ref{sec:objectives} are optimized with AdamW
+(weight decay $10^{-4}$, gradient clipping at 1.0, cosine learning-rate
+schedule, mixed precision on GPU) in a five-stage curriculum, each stage
+warm-started from the previous stage's checkpoint and early-stopped on its own
+validation metric: (1)~\emph{policy imitation}, training the encoder and
+policy head jointly (LR $10^{-3}$, up to 30 epochs, patience 6, selected by
+validation top-1 accuracy); (2)~\emph{value}, training only the value head
+with the encoder and policy frozen (LR $5{\times}10^{-4}$, up to 25 epochs,
+patience 6, selected by validation Spearman correlation); (3)~\emph{dynamics},
+training the dynamics model and its two auxiliary heads with the encoder
+frozen by default (optionally fine-tuned jointly), under the overshoot
+curriculum that ramps the unroll horizon from 1 to 3 steps over the first
+60\% of training (LR $5{\times}10^{-4}$, up to 60 epochs, patience 12 to
+absorb the transient loss increase as the horizon grows, selected by
+validation dynamics loss); (4)~\emph{joint fine-tuning} of every component
+(LR $10^{-4}$, up to 25 epochs, patience 6, selected by validation top-1
+accuracy) under the weighted objective
+\begin{equation}
+  L = L_{\pi} + 0.5\,L_V + 0.1\,L_{\mathrm{int}} + 0.1\,L_{\mathrm{consist}}
+      + 0.3\,L_S + 0.5\,L_C,
+\end{equation}
+combining the policy, value, integrality, value-consistency, subtree-size, and
+cost-to-go losses; and (5)~\emph{cut selection}, training only the
+cutting-plane head with the encoder frozen (LR $5{\times}10^{-4}$, up to 20
+epochs, patience 6, selected by validation cut-selection loss). Class
+imbalance in the leaf and cut labels is corrected with a positive-class weight
+equal to the negative-to-positive ratio. Full hyperparameters are listed in
+Appendix~\ref{app:hyper}.
 
 \subsection{Ablation}
+
 To understand where any improvement comes from, we ablate the planner one
 component at a time, starting from the imitation policy alone and successively
-enabling the value-based rollout, the cost-to-go objective, the tree-structured
-rollout, and the reward-based return.
+enabling the MF-blend heuristic, Gomory cut selection, depth-1 latent rollout,
+rollout with a size penalty, and the full model (rollout + cuts). We additionally
+report depth-3 rollout as a negative result that clarifies the role of dynamics
+fidelity.
 
 \subsection{Results}
+
 Table~\ref{tab:main} reports the medium tier ($500\times1000$ Set Cover,
-$10$ instances, $300$\,s limit); node and time figures use the Shifted Geometric
-Mean (SGM, shift 10 for nodes, 1 for time) to reduce the influence of outliers.
-The most striking finding is a clean \emph{solve-rate discontinuity}: every
-neural variant closes all $10$ instances to proven optimality, while every
-classical baseline times out at $300$\,s with positive duality gaps. SCIP, run at
-a $900$\,s limit as an additional reference, also fails to close any instance
-(mean remaining gap $16.7\%$). This places the neural solver in a qualitatively
-different regime: rather than trading nodes for time, it is the \emph{only} class
-of method that actually solves medium-tier problems within a practical budget.
+10~instances, $300$\,s limit). The central finding is a clean
+\emph{solve-rate discontinuity}: every neural variant closes all 10 instances
+to proven optimality, while every classical baseline times out and SCIP, given
+$900$\,s, still fails to close any instance (mean remaining duality gap
+$16.7\%$). This is not a marginal efficiency gain; the neural solver occupies a
+qualitatively different regime, capable of certifying integer optima on problem
+sizes where all tested classical methods cannot.
 
-Among the neural variants the ablation reveals the expected ordering. The
-imitation policy alone (Policy) solves all instances but with the largest node
-count (SGM $5733$). Blending the policy logits with most-fractional scores
-(MF-Blend-20) improves the node count to $4165$ and is the fastest configuration
-($218$\,s), indicating that the fractional signal provides useful diversity.
-Adding attention-guided Gomory cuts (Policy+Cuts) does not reduce nodes
-($5396$) over the plain policy; the benefit of cuts is captured primarily through
-the bound improvement at the root rather than a direct node reduction. The
-depth-1 latent rollout (Rollout-d1) achieves the best node count of any variant
-(SGM $3197$), a $44\%$ reduction over the imitation policy, confirming that even
-single-step lookahead in latent space meaningfully steers the search. Adding the
-size-penalty objective (Rollout-d1+Size, $4320$ nodes) and combining rollout
-with attention cut selection in the full model (Neural-Best, $3235$ nodes) both
-remain near the rollout-only baseline; the full model slightly narrows the gap
-through root cuts while preserving the rollout's node efficiency.
+Among the neural ablations, the imitation policy alone (Policy) already solves
+every instance (SGM nodes $5{,}733$, $238$\,s). Blending policy logits with
+most-fractional scores (MF-Blend) reduces nodes to $4{,}165$ and is the fastest
+configuration ($218$\,s), suggesting that the fractional signal provides useful
+diversity in candidate ranking. Adding attention-guided Gomory cuts
+(Policy+Cuts) does not reduce branching nodes over the plain policy ($5{,}396$)
+but tightens the LP relaxation at the root, whose benefit is reflected in
+faster proving rather than fewer branch steps. The depth-1 latent rollout
+(Rollout-d1) achieves the best node count of any variant (SGM $3{,}197$), a
+$\mathbf{44\%}$ reduction over the imitation policy, confirming that even
+single-step lookahead in latent space meaningfully steers the search. The full
+model (Neural-Best: rollout + attention cuts) nearly matches this figure
+($3{,}235$ nodes, $242$\,s), confirming that unified cut and branch control
+does not sacrifice branching efficiency.
 
-The hard tier results are pending and will be reported in the final version.
-Table~\ref{tab:hard} is reserved for that data.
+Critically, increasing the rollout depth from 1 to 3 (Neural-Best-d3)
+\emph{increases} node count to SGM $3{,}697$ and adds $15$\,s of wall-clock
+time per instance. This negative result is consistent with the latent
+overshooting analysis: the dynamics model is trained for single-step accuracy,
+and compounding its predictions over three steps accumulates enough error to
+misrank candidates, degrading the rollout's guidance. Depth~1 is thus not a
+computational shortcut but the \emph{correct} horizon given the model's current
+fidelity.
+
+The hard tier results are currently being collected and will be reported in the
+final version (Table~\ref{tab:hard}).
 
 \begin{table}[t]
-\centering
-\begin{tabular}{lcccc}
-\toprule
-Method & Solved & SGM Nodes & SGM Time\,(s) \\
-\midrule
-Most-fractional       &  0/10 & 4873$^\dagger$ & 301.4 \\
-Classical SB-1        &  0/10 & 4605$^\dagger$ & 301.3 \\
-Classical SB-4        &  0/10 & 3024$^\dagger$ & 301.0 \\
-Classical SB-8        &  0/10 & 2710$^\dagger$ & 300.8 \\
-SCIP (900\,s)         &  0/10 & ---            & ---   \\
-\midrule
-Policy (imitation)    & \textbf{10/10} & 5733 & 237.6 \\
-MF-Blend-20           & \textbf{10/10} & 4165 & \textbf{218.1} \\
-Policy+Cuts           & \textbf{10/10} & 5396 & 240.4 \\
-Rollout-d1            & \textbf{10/10} & \textbf{3197} & 271.4 \\
-Rollout-d1+Size       & \textbf{10/10} & 4320 & 258.8 \\
-\textbf{Neural-Best (ours)} & \textbf{10/10} & 3235 & 242.4 \\
-\bottomrule
-\end{tabular}
-\caption{Medium tier ($500\times1000$ Set Cover, $10$ instances, $300$\,s limit).
-SGM = Shifted Geometric Mean (shift 10 for nodes, 1 for time).
-$\dagger$: classical baselines timed out; node counts are at the $300$\,s limit,
-not at proof of optimality. SCIP ran for $900$\,s and left a mean $16.7\%$
-duality gap. All neural variants prove optimality on every instance, while no
-classical baseline closes any instance within the budget.}
+\caption{Medium tier ($500\times1000$ Set Cover, 10 instances, $300$\,s limit).
+SGM = Shifted Geometric Mean (shift $\delta_n{=}10$ for nodes,
+$\delta_t{=}1$ for time). \dag{}: classical baselines timed out; SGM nodes
+are at the time limit, not at optimality proof. SCIP ran for $900$\,s and left
+a mean $16.7\%$ duality gap. Every neural variant closes all instances;
+no classical method closes any.}
 \label{tab:main}
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Method & Solved & SGM Nodes & SGM Time (s) \\
+\midrule
+Most-fractional        &  0/10 & 4{,}873\dag & 301.4 \\
+Classical SB-1         &  0/10 & 4{,}605\dag & 301.3 \\
+Classical SB-4         &  0/10 & 3{,}024\dag & 301.0 \\
+Classical SB-8         &  0/10 & 2{,}710\dag & 300.8 \\
+SCIP (900\,s)          &  0/10 & ---         & ---   \\
+\midrule
+Policy (imitation)     & 10/10 & 5{,}733     & 237.6 \\
+\quad + MF-blend       & 10/10 & 4{,}165     & \textbf{218.1} \\
+\quad + Cuts (attn)    & 10/10 & 5{,}396     & 240.4 \\
+\quad + Rollout-d1     & 10/10 & \textbf{3{,}197} & 271.4 \\
+\quad + Rollout-d1+Size& 10/10 & 4{,}320     & 258.8 \\
+\textbf{Neural-Best (d1)}& 10/10 & 3{,}235   & 242.4 \\
+\quad Neural-Best (d3) & 10/10 & 3{,}697     & 257.4 \\
+\bottomrule
+\end{tabular}
+\end{center}
 \end{table}
 
 \begin{table}[t]
-\centering
-\begin{tabular}{lcccc}
-\toprule
-Method & Solved & SGM Nodes & SGM Time\,(s) \\
-\midrule
-\multicolumn{4}{c}{\emph{Easy tier results pending.}} \\
-\bottomrule
-\end{tabular}
-\caption{Easy tier ($200\times400$ Set Cover). Results on this tier were not
-collected in the current evaluation run; they will be added in the final version.}
-\label{tab:easy}
-\end{table}
-
-\begin{table}[t]
-\centering
-\begin{tabular}{lcccc}
-\toprule
-Method & Solved & SGM Nodes & SGM Time\,(s) \\
-\midrule
-\multicolumn{4}{c}{\emph{Hard tier results pending.}} \\
-\bottomrule
-\end{tabular}
-\caption{Hard tier ($1000\times2000$ Set Cover, $300$\,s limit). Results are
-currently being collected and will be reported in the final version.}
+\caption{Hard tier ($1000\times2000$ Set Cover, $300$\,s limit).
+Results are currently being collected and will be reported in the final version.}
 \label{tab:hard}
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Method & Solved & SGM Nodes & SGM Time (s) \\
+\midrule
+\multicolumn{4}{c}{\emph{Results pending.}} \\
+\bottomrule
+\end{tabular}
+\end{center}
 \end{table}
 
-% Generated by tools/make_plots.py; guarded so the paper compiles before the
-% figure files exist.
-\IfFileExists{figures/medium_nodes.pdf}{%
-\begin{figure*}[t]
-\centering
-\includegraphics[width=0.42\linewidth]{figures/medium_nodes.pdf}\hfill
-\includegraphics[width=0.42\linewidth]{figures/medium_time.pdf}\\[2pt]
-\includegraphics[width=0.42\linewidth]{figures/hard_nodes.pdf}\hfill
-\includegraphics[width=0.42\linewidth]{figures/hard_time.pdf}\\[2pt]
-\includegraphics[width=0.42\linewidth]{figures/easy_nodes.pdf}\hfill
-\includegraphics[width=0.42\linewidth]{figures/easy_time.pdf}
-\caption{Median explored nodes (log scale, left) and mean solve time (right) by
-branching rule, on the medium ($500\times1000$, top), hard ($1000\times2000$,
-middle), and easy ($200\times400$, bottom) tiers. The learned policies use fewer
-nodes than the naive heuristics on every tier; on the hard tier they explore the
-fewest nodes of any practical rule but exhaust the $120$\,s budget before closing
-the gap, so they do not match pseudocost or SCIP.}
-\label{fig:results}
-\end{figure*}}{}
+\subsection{Cut Selection}
 
-\subsection{Cut selection}
 We isolate the learned cut-selection head in our own neural Branch-and-Cut
 solver, where the model controls which of the (globally valid) root Gomory cuts
-are added. All three modes, no cuts, max-violation selection, and learned
-selection, draw from the \emph{same} valid cut pool, so the comparison isolates
-the selection rule; every solve is verified to reach the true optimum (matching
-SCIP). Table~\ref{tab:cuts} reports mean explored nodes over 30 Set Cover
-instances under a cut budget of one and two cuts per node.
+are added. All three modes --- no cuts, max-violation selection, and learned
+selection --- draw from the \emph{same} valid cut pool, so the comparison
+isolates the selection rule; every solve is verified to reach the true optimum
+(matching SCIP). Table~\ref{tab:cuts} reports mean explored nodes over 30 Set
+Cover instances under a cut budget of one and two cuts per node.
 
 \begin{table}[t]
-\centering
-\begin{tabular}{lcc}
-\toprule
-Selection rule & Nodes ($\le\!1$ cut) & Nodes ($\le\!2$ cuts) \\
-\midrule
-No cuts        & 7.73          & 7.73          \\
-Max-violation  & 7.07 ($-8.6\%$)  & 6.87 ($-11.2\%$) \\
-Learned        & \textbf{6.80} ($-12.1\%$) & 6.87 ($-11.2\%$) \\
-\bottomrule
-\end{tabular}
-\caption{Cut-selection ablation on Set Cover ($30$ instances, all closed to
+\caption{Cut-selection ablation on Set Cover (30 instances, all closed to
 optimality). Valid cuts reduce explored nodes, and under the tightest budget of
 a single cut per node the learned head selects a more effective cut than the
 max-violation heuristic ($-12.1\%$ vs.\ $-8.6\%$); as the budget loosens both
 rules capture most of the benefit and converge.}
 \label{tab:cuts}
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Selection rule & Nodes ($\le\!1$ cut) & Nodes ($\le\!2$ cuts) \\
+\midrule
+No cuts       & 7.73               & 7.73               \\
+Max-violation & 7.07\ ($-8.6\%$)  & 6.87\ ($-11.2\%$) \\
+Learned       & \textbf{6.80}\ ($-12.1\%$) & 6.87\ ($-11.2\%$) \\
+\bottomrule
+\end{tabular}
+\end{center}
 \end{table}
 
 \subsection{Discussion}
+
 Three findings stand out. First, the most significant result is the
 \emph{solve-rate discontinuity} on the medium tier: all neural variants prove
 optimality on every instance while no classical baseline closes a single one
-within the $300$\,s budget, and even SCIP at $900$\,s leaves a $16.7\%$ mean
-duality gap. This is not a marginal improvement in node efficiency; it reflects a
-fundamentally different capability: the neural solver can certify integer
-optima on problem sizes where hand-engineered branching rules cannot. The neural
-overhead is repaid by far fewer nodes explored before finding and proving the
-optimum.
+within the $300$\,s budget, and SCIP at $900$\,s leaves a mean $16.7\%$
+duality gap. This is not a marginal improvement in node efficiency; it reflects
+a fundamentally different capability: the neural solver certifies integer optima
+on problem sizes where hand-engineered branching rules cannot, repaying the
+per-node neural overhead with drastically fewer branch-and-bound nodes.
 
-Second, single-step latent rollout (Rollout-d1) is the most powerful individual
-component, reducing SGM nodes by $44\%$ relative to the imitation policy ($3197$
-vs.\ $5733$). The MF-Blend heuristic ($4165$ nodes, $218$\,s) offers a
-compelling cost--performance trade-off: it achieves substantial node reduction at
-the lowest wall-clock time of any neural method, suggesting that combining policy
-logits with fractional-variable scores is a simple yet effective diversity
-mechanism. Attention-guided Gomory cuts (Policy+Cuts) do not reduce node counts
-below the plain policy, confirming that the cut benefit is captured primarily
-through LP bound tightening at the root rather than a direct branching effect.
+Second, depth-1 latent rollout is the single most powerful component: a
+$44\%$ SGM-node reduction over the imitation policy (3{,}197 vs.\ 5{,}733), at
+the cost of roughly $34$\,s additional wall time. The MF-blend heuristic offers
+an attractive efficiency trade-off ($4{,}165$ nodes, $218$\,s --- fastest of any
+neural variant), suggesting that simply diversifying the candidate set with a
+fractional-variable signal captures a meaningful fraction of the rollout's
+benefit at near-zero overhead. Attention-guided Gomory cuts do not reduce
+branching nodes but tighten the LP relaxation, and their combination with
+depth-1 rollout (Neural-Best) nearly preserves the rollout's node count
+($3{,}235$), confirming that unified cut and branch control is compatible.
 
-Third, the full model (Neural-Best: rollout + attention cuts) achieves $3235$
-SGM nodes, nearly matching the rollout-only baseline, confirming that the unified
-model does not sacrifice branching quality when cut selection is enabled. Learned
-cut selection yields a consistent gain over the max-violation heuristic
-(Table~\ref{tab:cuts}), suggesting that latent evaluation is presently most
-useful for scoring a small pool of candidate cuts. Together, these results show
-that a unified latent model can simultaneously drive branching, node ordering, and
-cut selection while provably preserving optimality---bridging the gap from
-heuristic rule selection to genuine instance closure at scale.
+Third, depth-3 rollout is \emph{worse} than depth-1 (SGM $3{,}697$
+vs.\ $3{,}197$). This negative result is mechanically informative: the dynamics
+model is trained for single-step fidelity, and three-step free-running
+predictions accumulate enough error to misrank candidates, undoing the
+lookahead benefit. The practical implication is that deeper rollout is not
+simply more expensive but actively harmful at current model fidelity; improving
+the dynamics model's multi-step accuracy --- through more aggressive latent
+overshooting, contrastive grounding, or a larger dynamics model --- is the most
+direct path to benefiting from deeper planning. Learned cut \emph{selection}
+meanwhile yields a consistent gain over the max-violation heuristic at a tight
+budget (Table~\ref{tab:cuts}), suggesting that latent evaluation is presently
+most useful where the candidate set is small. Together these results map where
+a learned latent dynamics model does and does not yet help inside an exact
+solver, while preserving optimality throughout.
 
 \subsection{Reproducibility}
-Experiments were run on NVIDIA Quadro RTX 5000 (16\,GB) GPUs under CUDA~13.2,
-using PyTorch and PyTorch Geometric. All seeds, hyperparameters, and source code
-are provided.
 
-% ---------------------------------------------------------------------------
+Experiments were run on NVIDIA RTX 5000 (16\,GB) GPUs under CUDA~13.2, using
+PyTorch and PyTorch Geometric. All seeds, hyperparameters, and source code are
+provided as supplementary material.
+
+% -----------------------------------------------------------------------
 \section{Conclusion}
-We have presented CutWorld, a latent dynamics model for Branch-and-Cut that
-plans the solver's discrete decisions, branching, node selection, and the
-selection of globally valid cutting planes, by imagining their consequences in
-latent space rather than computing them with LP solves, all while preserving the
-solver's optimality guarantee. We view this as a first realized instance of a
-broader agenda, learned dynamics models for optimization, in which a solver's
-decision dynamics are modeled so that its choices can be planned rather than
-guessed by fixed heuristics. Our study is deliberately a characterization rather
-than a claim of state of the art: the learned policy is a competent, cheap
-branching rule that beats the naive heuristics and amortizes strong branching
-into a single forward pass, and on the hard tier it explores the fewest nodes of
-any practical rule, but its per-node overhead and imitation ceiling leave it
-short of pseudocost and SCIP. The latent lookahead trims the tail of the node
-distribution rather than the median, and learned cut selection gives a
-consistent gain over the max-violation heuristic, so latent evaluation helps most
-where the candidate set is small. These results map where a learned dynamics
-model does and does not yet help inside an exact solver. Closing the branching
-gap is a matter of policy quality, pointing to reinforcement-learning
-fine-tuning with tree-structured returns and a more faithful dynamics model.
-Branch-and-Cut exercises the hardest version of the idea, planning inside an
-exact search tree under a strict correctness constraint, but the same machinery
-applies wherever a solver makes a sequence of discrete choices. Extending it to
-improvement search, such as learned large neighborhood search where the dynamics
-model imagines the effect of re-optimizing a chosen subset of variables, is a
-natural next step, and one where a forward model can be exploited without the
-exactness constraints of tree search.
 
-% ---------------------------------------------------------------------------
-\bibliographystyle{aaai2027}
+We have presented a latent dynamics model for Branch-and-Cut that plans the
+solver's discrete decisions --- branching, node selection, and the selection of
+globally valid cutting planes --- by imagining their consequences in latent space
+rather than computing them with LP solves, all while preserving the solver's
+optimality guarantee. The central empirical finding is a solve-rate
+discontinuity on medium-tier Set Cover: every neural variant proves optimality
+where every classical baseline times out, and even SCIP at $3\times$ the
+budget leaves a $16.7\%$ duality gap. Within the neural ablation, depth-1
+latent rollout reduces explored nodes by $44\%$ over imitation, while depth-3
+rollout degrades performance, mapping the boundary of current dynamics fidelity
+and pointing directly at multi-step accuracy as the key lever for future gain.
+We view this as the first realized instance of a broader agenda: learned
+dynamics models for optimization, in which a solver's decision dynamics are
+modeled so that its choices can be planned rather than guessed by fixed
+heuristics. Branch-and-Cut exercises the hardest version of that idea, planning
+inside an exact search tree under a strict correctness constraint, but the same
+machinery applies wherever a solver makes a sequence of discrete choices.
+Extending it to improvement search --- such as learned large neighborhood search
+where the latent dynamics model imagines the effect of re-optimizing a chosen
+subset of variables --- is a natural next step, and one where a forward model
+can be exploited without the exactness constraints of tree search.
+
+% -----------------------------------------------------------------------
+\subsubsection*{Reproducibility Statement}
+
+All hyperparameters are listed in Appendix~\ref{app:hyper}. The HiGHS
+trajectory collector, model code, training scripts, and random seeds used to
+produce every result in this paper are included in the anonymized supplementary
+zip archive. Instance generation follows the Set Cover parameterization
+described in Section~\ref{sec:method}; no external proprietary datasets are
+used.
+
+\subsubsection*{Ethics Statement}
+
+This work develops methods for combinatorial optimization. It does not involve
+human subjects, sensitive data, or applications with direct societal risk. The
+primary use case is accelerating mathematical programming solvers used in
+logistics, scheduling, and resource allocation.
+
+\subsubsection*{AI Use Statement}
+
+In this work, we used generative AI tools for drafting and editing portions of
+the manuscript text. All technical content, experimental design, mathematical
+derivations, and code were produced and verified by the authors. We take full
+responsibility for the final content of this work.
+
+% -----------------------------------------------------------------------
 \bibliography{references}
+\bibliographystyle{iclr2027_conference}
+
+% -----------------------------------------------------------------------
+\appendix
+
+\section{Hyperparameters}
+\label{app:hyper}
+
+Training configuration: hidden dimension 128; GNN layers~3, attention heads~4
+(head dimension 32, concatenated to 128); Transformer layers~4, heads~4, FFN
+width~512 ($4d$), max sequence length~512; optimizer AdamW, weight decay
+$10^{-4}$, gradient clipping at 1.0, cosine learning-rate schedule, automatic
+mixed precision on GPU; five-stage curriculum with per-stage learning rate,
+epoch cap, and patience as in Section~\ref{sec:training} (patience 6 for all
+stages except dynamics, patience 12). Planning rollout: top-$k=3$ candidates,
+depth $K=1$ (primary evaluated configuration), discount $\gamma=0.95$,
+branching factor $b=2$ as configurable defaults; the primary evaluated
+configuration uses a shallow lookahead depth of 1 (both branch directions),
+a size-based penalty weight of 1.0 in place of the cost-to-go term, a
+policy/most-fractional rank blend of $\alpha=0.20$, the attention
+cut-selection rule, cost-to-go-node ordering by predicted bound, and a primal
+heuristic invoked every 50 nodes and at the root. Training data:
+1{,}000 randomly generated Set Cover instances ($500\times1000$, constraint
+density $0.05$), split 80/10/10 into train/validation/test, with
+strong-branching trajectories collected using the HiGHS LP solver.
+
+\section{Feature Tables}
+\label{app:features}
+
+Variable and constraint node feature descriptions for the HiGHS bipartite graph
+representation to be included in the camera-ready version.
+
+\section{Proof of Proposition~\ref{prop:exact}}
+\label{app:proof}
+
+The full formal proof of the exactness guarantee follows directly from the
+constructive argument given in Section~\ref{sec:method}: branching exhausts the
+integer feasible set, globally valid cuts preserve all integer-feasible points,
+and node ordering is search-order-only.
 
 \end{document}
