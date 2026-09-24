@@ -49,13 +49,12 @@ branching policy to be re-applied to imagined states for multi-step planning.
 Candidates are scored by a MuZero-style return combining predicted per-step
 rewards, a value estimate, and a cost-to-go penalty; the same latent drives
 Gomory cut selection and node ordering within a single unified model that
-provably preserves solver exactness. On medium-tier Set Cover ($500{\times}1000$,
-300\,s budget), every neural variant proves optimality on all instances while
-every classical baseline times out and SCIP leaves a 16.7\% duality gap at
-900\,s; a single-step latent rollout reduces explored nodes by 44\% over the
-imitation policy (SGM 3{,}197 vs.\ 5{,}733), and deeper rollout (depth\,3)
-yields \emph{more} nodes (SGM 3{,}697), confirming that short-horizon planning
-is the sweet spot given current dynamics fidelity. We evaluate across medium and
+provably preserves solver exactness. On medium-tier Set Cover ($500{\times}1000$, 300\,s budget), every neural
+variant terminates on all instances while every classical branching rule in the
+same harness times out; a single-step latent rollout reduces explored nodes by
+44\% over the imitation policy (SGM 3{,}197 vs.\ 5{,}733), and deeper rollout
+(depth\,3) increases nodes by 14\%, confirming that short-horizon planning is
+the correct regime given current dynamics fidelity. We evaluate across medium and
 hard tiers against SCIP, pseudocost, strong branching, and classical heuristics,
 reporting optimality rate, nodes explored, wall-clock solving time, and cuts
 applied, with component-wise ablations isolating the contribution of each element.
@@ -236,6 +235,7 @@ the solver. This turns look-ahead from an expensive oracle into a cheap forward
 pass, and the reward and node-count signals above become the learning targets for
 the model's reward and cost-to-go heads (Section~\ref{sec:method}).
 
+\label{sec:exactness}
 \begin{proposition}[Exactness]
 \label{prop:exact}
 For any branching variable chosen among the fractional candidates, any subset of
@@ -676,92 +676,127 @@ report depth-3 rollout as a negative result that clarifies the role of dynamics
 fidelity.
 
 \subsection{Results}
+\label{sec:results}
 
-Table~\ref{tab:main} reports the medium tier ($500\times1000$ Set Cover,
-10~instances, $300$\,s limit). Five findings summarize the results.
+Table~\ref{tab:main} and Figure~\ref{fig:medium} report the medium tier
+($500\times1000$ Set Cover, 10 instances, $300$\,s limit). All methods run
+inside the \emph{same} branch-and-bound harness, differing only in the
+branching rule and cut policy, so the comparison isolates those components.
 
-\textbf{(1) Solve-rate discontinuity.} All four classical baselines time out on
-every instance (0/10 solved), while every neural variant proves optimality on
-all 10 instances within the $300$\,s budget. SCIP, given three times the budget
-($900$\,s), still closes zero instances and leaves a mean duality gap of
-$16.7\%$. The neural solver is not marginally more efficient; it certifies
-integer optima on problem sizes where all tested classical methods cannot
-terminate.
+\textbf{(1) Termination, not node count, is the separation.}
+Every neural variant terminates on all 10 instances within the budget; all four
+classical branching rules exhaust it on all 10. This gap must be read carefully:
+the classical node counts in Table~\ref{tab:main} (left block, marked $\dagger$)
+are measured \emph{at the time limit} and are therefore lower bounds on the
+nodes a completed solve would require --- they are \emph{not} comparable to the
+neural counts at termination. The margin is not large in absolute time: neural
+solves finish in SGM $218$--$271$\,s against a $300$\,s wall, a $10$--$25\%$
+efficiency advantage that happens to fall on either side of this particular
+budget. The correct reading is not a discontinuity in kind but a consistent
+efficiency advantage that, at this budget, determines whether a solve terminates.
 
-\textbf{(2) Neural-Best vs.\ SCIP.} The full model (Neural-Best: rollout~+
-attention cuts) proves optimality in SGM $242$\,s --- comfortably within the
-$300$\,s budget --- while SCIP needs more than $900$\,s and still fails.
-This $3.7\times$ wall-time advantage comes with provably optimal certificates,
-not an approximation gap.
+\textbf{(2) The latent rollout is what pays for itself.}
+Depth-1 rollout (Rollout-d1) explores $44\%$ fewer nodes than the imitation
+policy alone (SGM $3{,}197$ vs.\ $5{,}733$) at the cost of roughly $34$\,s of
+additional inference, and is the best single configuration by node count.
+Adding attention-selected root Gomory cuts to rollout (Neural-Best, $3{,}235$
+nodes, $242$\,s) neither helps nor hurts materially: the cuts tighten the root
+LP bound and recover their own overhead but do not compound with the rollout's
+branching gain. Applied without rollout, cuts give only a $-6\%$ reduction
+($5{,}396$ nodes), indicating that on these instances the root LP is already
+close to what a single Gomory round can tighten.
 
-\textbf{(3) Rollout overhead is justified.} The depth-1 latent rollout
-(Rollout-d1) halves explored nodes relative to the imitation policy: SGM
-$3{,}197$ vs.\ $5{,}733$, a $\mathbf{44\%}$ reduction. The full model
-(Neural-Best), which adds attention-guided Gomory cuts, preserves this gain
-($3{,}235$ nodes, $242$\,s), confirming that Gomory cuts tighten the LP bound
-at the root and prune the tree without competing with the rollout's branching
-efficiency. Neural-Best thus achieves the best combined performance: rollout's
-node efficiency plus root cuts, in $242$\,s.
+\textbf{(3) Subtree-size weighting does not transfer to this scale.}
+On small instances the subtree-size penalty in the rollout score reduced nodes
+by $21\%$; at medium scale it reverses, increasing them from $3{,}197$ to
+$4{,}320$ ($+35\%$). The size head was trained on trajectories whose trees are
+orders of magnitude shallower than those explored here, so its predictions are
+extrapolations at medium scale. We report the row rather than tuning it away:
+it marks a concrete limit of the current training distribution.
 
-\textbf{(4) MF-Blend is the fastest.} Blending policy logits with
-most-fractional scores (MF-Blend) is the fastest neural configuration: $218$\,s
-with SGM $4{,}165$ nodes. It diversifies the candidate ranking at near-zero
-overhead, capturing a substantial fraction of the rollout's node reduction
-without the latent inference cost, and is attractive when wall time is
-the primary constraint.
+\textbf{(4) MF-Blend is the wall-time choice.}
+Blending policy logits with most-fractional scores (MF-Blend) is the fastest
+configuration ($218$\,s, $4{,}165$ nodes), capturing roughly $60\%$ of the
+rollout's node reduction at essentially zero inference overhead. Where wall time
+rather than tree size is the binding constraint, this is the configuration to
+deploy.
 
-\textbf{(5) Deeper rollout hurts.} Increasing rollout depth from 1 to 3
-(Neural-Best-d3) \emph{increases} SGM nodes to $3{,}697$ ($+14\%$ over d1)
-and adds $15$\,s per instance. The dynamics model is trained for single-step
-fidelity, and compounding its predictions over three steps accumulates enough
-error to misrank candidates. Depth~1 is thus not a computational shortcut
-but the \emph{correct} horizon given the model's current accuracy; improving
-multi-step dynamics fidelity is the direct path to deeper planning.
+\textbf{(5) Deeper rollout does not help at current dynamics fidelity.}
+Depth-3 rollout increases nodes to $3{,}697$ ($+14\%$ over depth-1) and costs
+$15$\,s more per instance. The dynamics model is trained for single-step
+fidelity; compounding three steps accumulates enough error to misrank
+candidates. Depth~1 is therefore the correct horizon \emph{given the current
+model}, and multi-step dynamics accuracy is the lever that would unlock deeper
+search.
 
-The hard tier results are currently being collected and will be reported in the
-final version (Table~\ref{tab:hard}).
+All neural configurations run with every unsafe prune disabled
+(Section~\ref{sec:exactness}), so the search is exact by construction and node
+counts are comparable across neural rows. The hard tier ($1000\times2000$) is
+in progress and will be reported in the final version (Table~\ref{tab:hard}).
 
-\begin{table}[t]
+\begin{table*}[t]
 \caption{Medium tier ($500\times1000$ Set Cover, 10 instances, $300$\,s limit).
 SGM = Shifted Geometric Mean (shift $\delta_n{=}10$ for nodes,
-$\delta_t{=}1$ for time). \dag{}: classical baselines timed out; SGM nodes
-are at the time limit, not at optimality proof. SCIP ran for $900$\,s and left
-a mean $16.7\%$ duality gap. Every neural variant closes all instances;
-no classical method closes any.}
+$\delta_t{=}1$ for time). The two node columns are \textbf{not directly
+comparable}: \emph{SGM Nodes at limit} (left, $\dagger$) are measured when the
+budget expires and are lower bounds on the tree a completed solve would need;
+\emph{SGM Nodes at term.} (right) are at actual termination. Classical baselines
+exhaust the $300$\,s budget on every instance; neural variants terminate on all
+10.}
 \label{tab:main}
 \begin{center}
-\begin{tabular}{lccc}
+\begin{tabular}{lcccc}
 \toprule
-Method & Solved & SGM Nodes & SGM Time (s) \\
+ & & \multicolumn{2}{c}{SGM Nodes} & \\
+\cmidrule(lr){3-4}
+Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) \\
 \midrule
-Most-fractional        &  0/10 & 4{,}873\dag & 301.4 \\
-Classical SB-1         &  0/10 & 4{,}605\dag & 301.3 \\
-Classical SB-4         &  0/10 & 3{,}024\dag & 301.0 \\
-Classical SB-8         &  0/10 & 2{,}710\dag & 300.8 \\
-SCIP (900\,s)          &  0/10 & ---         & ---   \\
+Most-fractional        &  0/10 & 4{,}873 & ---  & 301.4 \\
+Classical SB-1         &  0/10 & 4{,}605 & ---  & 301.3 \\
+Classical SB-4         &  0/10 & 3{,}024 & ---  & 301.0 \\
+Classical SB-8         &  0/10 & 2{,}710 & ---  & 300.8 \\
 \midrule
-Policy (imitation)     & 10/10 & 5{,}733     & 237.6 \\
-\quad + MF-blend       & 10/10 & 4{,}165     & \textbf{218.1} \\
-\quad + Cuts (attn)    & 10/10 & 5{,}396     & 240.4 \\
-\quad + Rollout-d1     & 10/10 & \textbf{3{,}197} & 271.4 \\
-\quad + Rollout-d1+Size& 10/10 & 4{,}320     & 258.8 \\
-\textbf{Neural-Best (d1)}& 10/10 & 3{,}235   & 242.4 \\
-\quad Neural-Best (d3) & 10/10 & 3{,}697     & 257.4 \\
+Policy (imitation)     & 10/10 & --- & 5{,}733     & 237.6 \\
+\quad + MF-blend       & 10/10 & --- & 4{,}165     & \textbf{218.1} \\
+\quad + Cuts (attn)    & 10/10 & --- & 5{,}396     & 240.4 \\
+\quad + Rollout-d1     & 10/10 & --- & \textbf{3{,}197} & 271.4 \\
+\quad + Rollout-d1+Size& 10/10 & --- & 4{,}320     & 258.8 \\
+\textbf{Neural-Best (d1)} & 10/10 & --- & 3{,}235  & 242.4 \\
+\quad Neural-Best (d3) & 10/10 & --- & 3{,}697     & 257.4 \\
 \bottomrule
 \end{tabular}
 \end{center}
-\end{table}
+\end{table*}
+
+% Figure: generated by tools/make_plots.py
+\IfFileExists{figures/medium_results.pdf}{%
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/medium_results}
+\caption{Medium tier ($500\times1000$ Set Cover, 10 instances, $300$\,s limit).
+\textbf{(a)} Classical rules (open markers, right-caret at $300$\,s wall) exhaust
+the budget on every instance; their node counts are measured \emph{at timeout}
+and are lower bounds on the tree a completed solve would require, not comparable
+to the neural counts. Neural variants (filled) terminate on all 10.
+\textbf{(b)} Node counts within the neural ablation ladder, all measured at
+termination and therefore directly comparable. Depth-1 latent rollout accounts
+for essentially all of the node reduction over imitation; adding root cuts
+(Neural-Best) preserves the gain.}
+\label{fig:medium}
+\end{figure*}}{}
 
 \begin{table}[t]
 \caption{Hard tier ($1000\times2000$ Set Cover, $300$\,s limit).
 Results are currently being collected and will be reported in the final version.}
 \label{tab:hard}
 \begin{center}
-\begin{tabular}{lccc}
+\begin{tabular}{lcccc}
 \toprule
-Method & Solved & SGM Nodes & SGM Time (s) \\
+ & & \multicolumn{2}{c}{SGM Nodes} & \\
+\cmidrule(lr){3-4}
+Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) \\
 \midrule
-\multicolumn{4}{c}{\emph{Results pending.}} \\
+\multicolumn{5}{c}{\emph{Results pending.}} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -799,49 +834,46 @@ Learned       & \textbf{6.80}\ ($-12.1\%$) & 6.87\ ($-11.2\%$) \\
 
 \subsection{Discussion}
 
-The results above map cleanly onto five takeaways.
+The results above map onto four takeaways about what the model does and does not
+yet achieve.
 
-\textbf{Solve-rate gap, not a node-count gap.} The dominant finding is not
-that neural solvers explore fewer nodes than classical ones; it is that they
-\emph{terminate} while classical solvers do not. All four classical baselines
-time out on every medium-tier instance, and SCIP --- given three times the
-budget --- still leaves a $16.7\%$ duality gap. The neural overhead is repaid
-not by being faster per node but by needing far fewer nodes to close the proof.
+\textbf{Termination is the primary gain; node counts must be read carefully.}
+Within a $300$\,s budget, every neural variant terminates on all 10 instances
+while every classical rule exhausts the budget. The neural efficiency advantage
+is $10$--$25\%$ in wall time, which is real but not dramatic; what makes it
+consequential is that it falls on the correct side of the budget cutoff. The
+classical node counts in Table~\ref{tab:main} (left column, measured at timeout)
+are lower bounds on what a completed solve would explore; SB-8's $2{,}710$ looks
+competitive with neural counts in the same column only because it is an
+incomplete count. Putting the two blocks in separate columns is therefore not a
+formatting choice but a semantic one.
 
-\textbf{Our solver proves optimality in 242s where SCIP needs $>$900s.}
-Neural-Best solves every instance in SGM $242$\,s, a $3.7\times$ wall-time
-advantage over SCIP's unsuccessful $900$\,s run. This is the headline
-practical result: CutWorld delivers certified optima on instances SCIP cannot
-close under any reasonable budget.
+\textbf{Depth-1 rollout is the single most powerful component.} The $44\%$
+SGM-node reduction from Rollout-d1 ($3{,}197$ vs.\ $5{,}733$) is the largest
+single-step gain in the ablation ladder. Adding root Gomory cuts (Neural-Best,
+$3{,}235$ nodes) does not reduce branching nodes further but tightens the LP
+bound at the root; the combination confirms that rollout and cuts are
+complementary. Cuts alone, without rollout, yield only $-6\%$ ($5{,}396$
+nodes), consistent with root cuts having limited leverage when the LP relaxation
+is already relatively tight.
 
-\textbf{Rollout overhead is justified: it halves nodes.} The latent rollout
-(Rollout-d1) reduces explored nodes by $44\%$ over the imitation policy
-($3{,}197$ vs.\ $5{,}733$), repaying its $\sim\!34$\,s additional inference
-cost in a comfortably smaller search tree. Neural-Best preserves this gain
-($3{,}235$ nodes) while additionally applying attention-guided Gomory cuts that
-tighten the LP bound at the root; the combination confirms that root cuts and
-rollout-guided branching are complementary, not competing.
+\textbf{The subtree-size head does not generalise to medium scale.}
+Rollout-d1+Size reverses its easy-tier gain, increasing nodes from $3{,}197$ to
+$4{,}320$ ($+35\%$). The head was trained on trajectories from small trees and
+is extrapolating beyond its distribution at medium scale; this is the sharpest
+evidence that the training distribution is a binding constraint for the planning
+components, and expanding it is the most direct path to generalisation.
 
-\textbf{MF-Blend is the fastest option.} Blending policy logits with
-most-fractional scores runs in SGM $218$\,s with $4{,}165$ nodes, making it
-the best choice when wall time is the primary constraint. It shows that a cheap
-signal-diversity trick captures a large share of the rollout's node reduction
-at a fraction of the cost, and is a natural baseline for any latent-rollout
-ablation.
-
-\textbf{Deeper rollout is actively harmful.} Depth-3 rollout increases nodes
-by $+14\%$ over depth-1 (SGM $3{,}697$ vs.\ $3{,}197$). The dynamics model is
-trained for one-step accuracy; compounding its predictions over three steps
-accumulates enough error to misrank candidates. The correct conclusion is not
-that planning depth should be capped at 1 indefinitely, but that improving
-multi-step dynamics fidelity --- through more aggressive latent overshooting,
-contrastive state grounding, or a larger Transformer --- is the direct lever
-for unlocking deeper planning. Learned cut selection at a tight budget
-(Table~\ref{tab:cuts}) provides complementary evidence that latent evaluation
-is most reliable when the candidate set is small and the imagination horizon is
-short. Together, these results map the current boundary of what a learned
-latent dynamics model can and cannot yet do inside an exact solver, while
-preserving optimality throughout.
+\textbf{Deeper rollout is actively harmful at current dynamics fidelity.}
+Depth-3 rollout ($3{,}697$ nodes, $+14\%$ over depth-1) confirms that the
+dynamics model's single-step fidelity does not compose cleanly over three steps.
+This is not a reason to avoid planning depth; it is a precise specification of
+what must improve --- multi-step dynamics accuracy --- before deeper planning
+helps. Learned cut selection at a tight budget (Table~\ref{tab:cuts}) provides
+parallel evidence: latent evaluation is most reliable on a small candidate set
+over a short horizon. Together, these results map where a latent dynamics model
+currently helps inside an exact solver and where it does not, while the
+exactness guarantee holds throughout.
 
 \subsection{Reproducibility}
 
