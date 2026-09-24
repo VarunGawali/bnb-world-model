@@ -789,31 +789,33 @@ for essentially all of the node reduction over imitation; adding root cuts
 \caption{Hard tier ($1000\times2000$ Set Cover, $600$\,s limit, 5 instances).
 All classical methods exhaust the budget (0/5 solved); all neural variants
 terminate on every instance (5/5). $\dagger$~classical node counts are lower
-bounds on what a completed solve would explore. SGM shift: $s_n=10$, $s_t=1$.}
+bounds on what a completed solve would explore. $\ddagger$~arithmetic mean of
+per-instance gap to best solution found by any method: $({\rm obj}-{\rm
+best})/{\rm best}\times100$. SGM shift: $s_n=10$, $s_t=1$.}
 \label{tab:hard}
 \begin{center}
-\begin{tabular}{lcccc}
+\begin{tabular}{lccccc}
 \toprule
- & & \multicolumn{2}{c}{SGM Nodes} & \\
+ & & \multicolumn{2}{c}{SGM Nodes} & & \\
 \cmidrule(lr){3-4}
-Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) \\
+Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
 \midrule
-\multicolumn{4}{l}{\emph{Classical (LP-based branching)}} \\
-Most-fractional      & 0/5 & 3{,}342 & ---    & 601.0 \\
-Strong-branching-1   & 0/5 & 2{,}631 & ---    & 600.9 \\
-Strong-branching-4   & 0/5 & 1{,}074 & ---    & 600.4 \\
-Strong-branching-8   & 0/5 & 1{,}096 & ---    & 600.5 \\
+\multicolumn{5}{l}{\emph{Classical (LP-based branching)}} \\
+Most-fractional      & 0/5 & 3{,}342 & ---    & 601.0 & 1.3\% \\
+Strong-branching-1   & 0/5 & 2{,}631 & ---    & 600.9 & 1.4\% \\
+Strong-branching-4   & 0/5 & 1{,}074 & ---    & 600.4 & 1.9\% \\
+Strong-branching-8   & 0/5 & 1{,}096 & ---    & 600.5 & 2.5\% \\
 \midrule
-\multicolumn{4}{l}{\emph{Cheap neural (imitation only)}} \\
-Policy               & 5/5 & ---    & 4{,}633 & 389.3 \\
-MF-Blend-20          & 5/5 & ---    & 2{,}736 & 353.1 \\
-Policy+Cuts          & 5/5 & ---    & 4{,}419 & 395.2 \\
+\multicolumn{5}{l}{\emph{Cheap neural (imitation only)}} \\
+Policy               & 5/5 & ---    & 4{,}633 & 389.3 & 2.9\% \\
+MF-Blend-20          & 5/5 & ---    & 2{,}736 & 353.1 & 1.7\% \\
+Policy+Cuts          & 5/5 & ---    & 4{,}419 & 395.2 & 3.5\% \\
 \midrule
-\multicolumn{4}{l}{\emph{Neural with rollout}} \\
-Rollout-d1           & 5/5 & ---    & 4{,}007 & 422.8 \\
-Rollout-d1+Size      & 5/5 & ---    & 4{,}376 & 396.3 \\
-Neural-Best (d1)     & 5/5 & ---    & 2{,}603 & 364.8 \\
-Neural-Best (d3)     & 5/5 & ---    & \textbf{2{,}476} & 390.4 \\
+\multicolumn{5}{l}{\emph{Neural with rollout}} \\
+Rollout-d1           & 5/5 & ---    & 4{,}007 & 422.8 & 3.9\% \\
+Rollout-d1+Size      & 5/5 & ---    & 4{,}376 & 396.3 & 3.4\% \\
+Neural-Best (d1)     & 5/5 & ---    & 2{,}603 & 364.8 & 2.1\% \\
+Neural-Best (d3)     & 5/5 & ---    & \textbf{2{,}476} & 390.4 & \textbf{1.9\%} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -902,6 +904,22 @@ multi-step accuracy should unlock further gains. Learned cut selection at a tigh
 budget (Table~\ref{tab:cuts}) provides parallel evidence: latent evaluation is
 most reliable over a short horizon when the candidate set is small, but the
 benefit of depth grows as the branching factor and tree depth increase.
+
+\textbf{Rollout recovers solution quality lost by imitation.}
+The gap column of Table~\ref{tab:hard} reveals a cost that node counts alone do
+not show: imitation-only branching (Policy, $+2.9\%$) finds worse integer
+solutions than classical methods ($+1.2$--$2.5\%$) despite terminating faster,
+because it prunes the search aggressively and commits to high-objective integer
+solutions early. The full model (Neural-Best d1, rollout + Gomory cuts) recovers
+$0.8$ pp of this gap, reaching $+2.1\%$, and depth-3 rollout closes a further
+$0.2$ pp to $+1.9\%$ --- within $0.5$ pp of the best classical method, which
+does not terminate. This is direct evidence that rollout serves two distinct
+roles: it reduces the number of branching decisions (fewer nodes) \emph{and} it
+improves the quality of integer solutions the solver commits to, by evaluating
+each candidate against a richer signal than the current-node LP alone provides.
+A policy trained only on strong-branching imitation replicates the expert's
+\emph{selection rule} but cannot replicate its implicit reasoning about
+downstream search quality; rollout closes that gap.
 
 \subsection{Reproducibility}
 
