@@ -375,16 +375,13 @@ ALL_METHODS_A = [
     "classical_sb1",
     "classical_sb4",
     "classical_sb8",
-    # Neural: cheap / no-rollout
+    # Neural: individual components
     "policy",
     "mf_blend_20",
-    "mf_blend_20_cuts_attn",
-    # Neural: rollout ladder (two depth × two size_weight rows)
     "rollout_d1",
     "rollout_d1_size1",
-    "rollout_d2_size1",
-    # Candidate headline: blend + rollout + size + cuts
-    "blend_rollout_d1_size1_cuts_attn",
+    # Neural best: all good components combined
+    "neural_best",
 ]
 
 ALL_METHODS_B = [
@@ -537,19 +534,7 @@ def main():
                 model, device, "policy", "none", False, 0.0, "bound", tl, nl))
         elif m == "mf_blend_20":
             solvers[m] = ("neural", _build_mf_blend(model, device, 0.20, tl, nl))
-        elif m == "mf_blend_20_cuts_attn":
-            from bnb_wm.solver.neural_bnb import NeuralBnBSolver
-            from bnb_wm.solver.config import SolverConfig
-            cfg = SolverConfig(
-                branch_mode="policy", cut_mode="attention",
-                ors_cascade=False, katz_weight=0.0,
-                mf_blend_alpha=0.20, node_selection="bound",
-                size_weight=0.0, ctg_weight=0.0,
-                cut_pool_max=cpm, cut_budget_cap=cpm,
-                primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
-            )
-            solvers[m] = ("neural", NeuralBnBSolver(model, device, cfg))
-        # ---- Neural: rollout ladder ----
+        # ---- Neural: rollout components ----
         elif m == "rollout_d1":
             solvers[m] = ("neural", build_neural(
                 model, device, "rollout", "none", False, 0.0, "bound", tl, nl,
@@ -565,19 +550,8 @@ def main():
                 primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
             )
             solvers[m] = ("neural", NeuralBnBSolver(model, device, cfg))
-        elif m == "rollout_d2_size1":
-            from bnb_wm.solver.neural_bnb import NeuralBnBSolver
-            from bnb_wm.solver.config import SolverConfig
-            cfg = SolverConfig(
-                branch_mode="rollout", cut_mode="none",
-                ors_cascade=False, katz_weight=0.0, node_selection="bound",
-                lookahead_depth=2, size_weight=1.0, ctg_weight=0.0,
-                cut_pool_max=cpm, cut_budget_cap=cpm,
-                primal_heuristic=True, time_limit=tl, node_limit=nl, exact=True,
-            )
-            solvers[m] = ("neural", NeuralBnBSolver(model, device, cfg))
-        # ---- Neural: candidate headline ----
-        elif m == "blend_rollout_d1_size1_cuts_attn":
+        # ---- Neural best: all good components combined ----
+        elif m == "neural_best":
             from bnb_wm.solver.neural_bnb import NeuralBnBSolver
             from bnb_wm.solver.config import SolverConfig
             cfg = SolverConfig(
