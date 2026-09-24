@@ -45,7 +45,14 @@ Group A (our harness — wall-clock and nodes both comparable):
   rollout_cuts_heur + max-violation cuts
   rollout_cuts_lat  + latent cut beam
   rollout_cuts_attn + attention-scored cuts (parameter-free)
-  neural_full       + cost-to-go node selection  ← headline
+  neural_full       best assembled config: rollout + heuristic cuts + best-bound  ← headline
+
+Leave-one-out ablation against neural_full:
+  neural_loo_no_rollout  policy + cuts (no lookahead)
+  neural_loo_no_cuts     rollout, no cuts
+  neural_loo_ors         neural_full + ORS cascade
+  neural_loo_katz        neural_full + Katz blend
+  neural_loo_ctg         neural_full + cost-to-go node selection
 
 Group B (SCIP harness — node counts only, never wall-clock vs Group A):
   scip_default      SCIP defaults
@@ -284,6 +291,12 @@ ALL_METHODS_A = [
     "rollout_cuts_lat",
     "rollout_cuts_attn",
     "neural_full",
+    # leave-one-out rows against neural_full
+    "neural_loo_no_rollout",
+    "neural_loo_no_cuts",
+    "neural_loo_ors",
+    "neural_loo_katz",
+    "neural_loo_ctg",
 ]
 
 ALL_METHODS_B = [
@@ -296,7 +309,9 @@ ALL_METHODS_B = [
 def method_needs_model(name):
     return name in ("policy", "rollout", "rollout_ors", "rollout_katz",
                     "rollout_cuts_heur", "rollout_cuts_lat", "rollout_cuts_attn",
-                    "neural_full")
+                    "neural_full",
+                    "neural_loo_no_rollout", "neural_loo_no_cuts",
+                    "neural_loo_ors", "neural_loo_katz", "neural_loo_ctg")
 
 
 def method_is_scip(name):
@@ -431,8 +446,30 @@ def main():
             solvers[m] = ("neural", build_neural(
                 model, device, "rollout", "attention", False, 0.0, "bound", tl, nl))
         elif m == "neural_full":
+            # best assembled config: rollout + heuristic cuts + best-bound node sel
             solvers[m] = ("neural", build_neural(
-                model, device, "rollout", "latent", True, 0.3, "cost_to_go", tl, nl))
+                model, device, "rollout", "heuristic", False, 0.0, "bound", tl, nl))
+        # ---- leave-one-out ablation against neural_full ----
+        elif m == "neural_loo_no_rollout":
+            # policy argmax + heuristic cuts (no rollout lookahead)
+            solvers[m] = ("neural", build_neural(
+                model, device, "policy", "heuristic", False, 0.0, "bound", tl, nl))
+        elif m == "neural_loo_no_cuts":
+            # rollout, no cuts
+            solvers[m] = ("neural", build_neural(
+                model, device, "rollout", "none", False, 0.0, "bound", tl, nl))
+        elif m == "neural_loo_ors":
+            # neural_full + ORS cascade
+            solvers[m] = ("neural", build_neural(
+                model, device, "rollout", "heuristic", True, 0.0, "bound", tl, nl))
+        elif m == "neural_loo_katz":
+            # neural_full + Katz blend
+            solvers[m] = ("neural", build_neural(
+                model, device, "rollout", "heuristic", False, 0.3, "bound", tl, nl))
+        elif m == "neural_loo_ctg":
+            # neural_full + cost-to-go node selection
+            solvers[m] = ("neural", build_neural(
+                model, device, "rollout", "heuristic", False, 0.0, "cost_to_go", tl, nl))
 
     # ---- generate instances ----
     rng = np.random.default_rng(args.seed)
@@ -479,11 +516,21 @@ def main():
                       f"t={row['wall_time']:>6.2f}s")
 
     # ---- summary table ----
+    LOO_METHODS = {"neural_loo_no_rollout", "neural_loo_no_cuts",
+                   "neural_loo_ors", "neural_loo_katz", "neural_loo_ctg"}
+    additive_methods = [m for m in methods_a if m in results and m not in LOO_METHODS]
+    loo_methods      = [m for m in methods_a if m in results and m in LOO_METHODS]
+
     print(f"\n{'='*75}")
     print(f"GROUP A — our harness  ({args.n_rows}×{args.n_cols}, "
           f"seed={args.seed}, n={args.n_instances})")
     print(f"  time_limit={tl}s  node_limit={nl}")
-    print_table(results, [m for m in methods_a if m in results], "nodes")
+    print("\n--- additive ablation ladder ---")
+    print_table(results, additive_methods, "nodes")
+
+    if loo_methods:
+        print("\n--- leave-one-out ablation (vs neural_full) ---")
+        print_table(results, ["neural_full"] + loo_methods, "nodes")
 
     if not args.no_scip and methods_b:
         print(f"\nGROUP B — SCIP  (node counts only)")
