@@ -228,7 +228,9 @@ class NeuralBnBSolver:
                 lp = self._pending_root_lp
                 self._pending_root_lp = None
             else:
-                lp = self._lp_solve(node.var_lb, node.var_ub, node.warm_basis)
+                remaining = cfg.time_limit - (time.perf_counter() - t0)
+                lp = self._lp_solve(node.var_lb, node.var_ub, node.warm_basis,
+                                    time_limit=max(remaining, 1.0))
             n_nodes += 1
 
             # Gate 3: infeasible / dominated
@@ -398,8 +400,8 @@ class NeuralBnBSolver:
     def _lp_init(self):
         self._lp = LPBackend(self._highs, self._A, self._b, self._c)
 
-    def _lp_solve(self, vlb, vub, warm_basis) -> _LP:
-        res = self._lp.solve(vlb, vub, warm_basis)
+    def _lp_solve(self, vlb, vub, warm_basis, time_limit: float = 1e30) -> _LP:
+        res = self._lp.solve(vlb, vub, warm_basis, time_limit=time_limit)
         self._timing["lp"] = self._lp.lp_time
         if not res.feasible:
             return _LP(False)
@@ -802,7 +804,10 @@ class NeuralBnBSolver:
 
         obj_before = lp.obj
         self._lp_commit_cuts(chosen)
-        lp2 = self._lp_solve(node.var_lb, node.var_ub, lp.basis)
+        remaining = cfg.time_limit - (time.perf_counter() - self._t0)
+        if remaining <= 0:
+            return lp, h_vars, z, frac_idx, False
+        lp2 = self._lp_solve(node.var_lb, node.var_ub, lp.basis, time_limit=remaining)
         if not lp2.feasible:
             return None, None, None, None, True
 

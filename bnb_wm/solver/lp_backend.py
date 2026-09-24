@@ -147,6 +147,7 @@ class LPBackend:
         h = hs.Highs()
         h.setOptionValue("output_flag", False)
         h.setOptionValue("presolve", "off")
+        h.setOptionValue("time_limit", 1e30)
 
         n, m = self._n, self._m0
         lb = np.zeros(n, dtype=np.float64)
@@ -185,6 +186,7 @@ class LPBackend:
         vlb: np.ndarray,
         vub: np.ndarray,
         warm_basis: Optional[tuple] = None,
+        time_limit: float = 1e30,
     ) -> LPResult:
         """
         Solve the LP for the given variable bounds.
@@ -219,6 +221,7 @@ class LPBackend:
             except Exception:
                 pass
 
+        h.setOptionValue("time_limit", float(time_limit))
         h.run()
         self.lp_count += 1
 
