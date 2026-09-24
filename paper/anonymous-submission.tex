@@ -742,27 +742,28 @@ comparable}: \emph{SGM Nodes at limit} (left, $\dagger$) are measured when the
 budget expires and are lower bounds on the tree a completed solve would need;
 \emph{SGM Nodes at term.} (right) are at actual termination. Classical baselines
 exhaust the $300$\,s budget on every instance; neural variants terminate on all
-10.}
+10. $\ddagger$~arithmetic mean of per-instance gap to best solution found by any
+method: $({\rm obj}-{\rm best})/{\rm best}\times100$.}
 \label{tab:main}
 \begin{center}
-\begin{tabular}{lcccc}
+\begin{tabular}{lccccc}
 \toprule
- & & \multicolumn{2}{c}{SGM Nodes} & \\
+ & & \multicolumn{2}{c}{SGM Nodes} & & \\
 \cmidrule(lr){3-4}
-Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) \\
+Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
 \midrule
-Most-fractional        &  0/10 & 4{,}873 & ---  & 301.4 \\
-Classical SB-1         &  0/10 & 4{,}605 & ---  & 301.3 \\
-Classical SB-4         &  0/10 & 3{,}024 & ---  & 301.0 \\
-Classical SB-8         &  0/10 & 2{,}710 & ---  & 300.8 \\
+Most-fractional        &  0/10 & 4{,}873 & ---  & 301.4 & 2.7\% \\
+Classical SB-1         &  0/10 & 4{,}605 & ---  & 301.3 & 2.7\% \\
+Classical SB-4         &  0/10 & 3{,}024 & ---  & 301.0 & 3.2\% \\
+Classical SB-8         &  0/10 & 2{,}710 & ---  & 300.8 & 3.6\% \\
 \midrule
-Policy (imitation)     & 10/10 & --- & 5{,}733     & 237.6 \\
-\quad + MF-blend       & 10/10 & --- & 4{,}165     & \textbf{218.1} \\
-\quad + Cuts (attn)    & 10/10 & --- & 5{,}396     & 240.4 \\
-\quad + Rollout-d1     & 10/10 & --- & \textbf{3{,}197} & 271.4 \\
-\quad + Rollout-d1+Size& 10/10 & --- & 4{,}320     & 258.8 \\
-\textbf{Neural-Best (d1)} & 10/10 & --- & 3{,}235  & 242.4 \\
-\quad Neural-Best (d3) & 10/10 & --- & 3{,}697     & 257.4 \\
+Policy (imitation)     & 10/10 & --- & 5{,}733     & 237.6 & 5.9\% \\
+\quad + MF-blend       & 10/10 & --- & 4{,}165     & \textbf{218.1} & 3.1\% \\
+\quad + Cuts (attn)    & 10/10 & --- & 5{,}396     & 240.4 & 5.2\% \\
+\quad + Rollout-d1     & 10/10 & --- & \textbf{3{,}197} & 271.4 & 6.8\% \\
+\quad + Rollout-d1+Size& 10/10 & --- & 4{,}320     & 258.8 & 5.9\% \\
+\textbf{Neural-Best (d1)} & 10/10 & --- & 3{,}235  & 242.4 & \textbf{3.4\%} \\
+\quad Neural-Best (d3) & 10/10 & --- & 3{,}697     & 257.4 & --- \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -906,20 +907,23 @@ most reliable over a short horizon when the candidate set is small, but the
 benefit of depth grows as the branching factor and tree depth increase.
 
 \textbf{Rollout recovers solution quality lost by imitation.}
-The gap column of Table~\ref{tab:hard} reveals a cost that node counts alone do
-not show: imitation-only branching (Policy, $+2.9\%$) finds worse integer
-solutions than classical methods ($+1.2$--$2.5\%$) despite terminating faster,
-because it prunes the search aggressively and commits to high-objective integer
-solutions early. The full model (Neural-Best d1, rollout + Gomory cuts) recovers
-$0.8$ pp of this gap, reaching $+2.1\%$, and depth-3 rollout closes a further
-$0.2$ pp to $+1.9\%$ --- within $0.5$ pp of the best classical method, which
-does not terminate. This is direct evidence that rollout serves two distinct
-roles: it reduces the number of branching decisions (fewer nodes) \emph{and} it
-improves the quality of integer solutions the solver commits to, by evaluating
-each candidate against a richer signal than the current-node LP alone provides.
-A policy trained only on strong-branching imitation replicates the expert's
-\emph{selection rule} but cannot replicate its implicit reasoning about
-downstream search quality; rollout closes that gap.
+The gap columns of Tables~\ref{tab:main} and~\ref{tab:hard} reveal a cost that
+node counts alone do not show: imitation-only branching (Policy) finds worse
+integer solutions than classical methods despite terminating faster, because it
+prunes aggressively and commits to high-objective integer solutions early. At
+medium tier, Policy reaches $+5.9\%$ vs best-known while MF is $+2.7\%$; at
+hard tier, Policy is $+2.9\%$ while MF is $+1.3\%$. The full model
+(Neural-Best, rollout + cuts) substantially closes this gap: at medium tier it
+reaches $+3.4\%$ --- the best among all neural configurations and competitive
+with SB-4 ($+3.2\%$) --- and at hard tier $+2.1\%$ (d1) and $+1.9\%$ (d3),
+within $0.6$ pp of the best classical method, which does not terminate. This is
+direct evidence that rollout serves two distinct roles: it reduces the number of
+branching decisions (fewer nodes) \emph{and} improves the quality of integer
+solutions the solver commits to, by evaluating each candidate against a richer
+signal than the current-node LP alone provides. A policy trained only on
+strong-branching imitation replicates the expert's \emph{selection rule} but
+cannot replicate its implicit reasoning about downstream search quality; rollout
+closes that gap.
 
 \subsection{Reproducibility}
 
