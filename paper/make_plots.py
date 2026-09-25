@@ -281,7 +281,7 @@ ax.axvline(policy_hard, linestyle="--", color="black",
 ax.set_yticks(y)
 ax.set_yticklabels([LABELS[m] for m in NEURAL_BAR])
 ax.invert_yaxis()
-ax.set_xlabel("SGM nodes  (shift=10, lower = fewer nodes)")
+ax.set_xlabel("Shifted geometric mean of B&B nodes")
 ax.set_title("Neural ablation: search effort at termination",
              loc="left", fontweight="bold")
 ax.legend(frameon=False, ncol=3, loc="lower right")
@@ -309,7 +309,7 @@ def effective_times(data, method):
         return np.full(len(data[method]["nodes"]), np.inf)
     return np.asarray(data[method]["time"], dtype=float)
 
-def performance_profile(data, methods, tau_max=4.0, n_tau=600):
+def performance_profile(data, methods, tau_max=1.4, n_tau=600):
     T    = np.vstack([effective_times(data, m) for m in methods]).T
     best = np.min(np.where(np.isfinite(T), T, np.inf), axis=1)
     tau  = np.linspace(1.0, tau_max, n_tau)
@@ -327,18 +327,19 @@ for ax, data, title in [
     tau, profiles = performance_profile(data, PROFILE_METHODS)
     for m in PROFILE_METHODS:
         ls = "--" if not data[m]["solved"] else "-"
-        ax.plot(tau, profiles[m], color=C[m], lw=1.8,
+        ax.plot(tau, profiles[m], color=C[m], lw=2.0,
                 linestyle=ls, label=LABELS[m])
 
     # annotate flat classical lines
-    ax.text(3.8, 0.03,
+    ax.text(1.39, 0.03,
             "Classical: all instances\nunsolved (τ = ∞)",
             ha="right", va="bottom", fontsize=7.5,
             color="#555555", style="italic")
 
     ax.set_title(title, loc="left", fontweight="bold")
     ax.set_xlabel(r"$\tau$  (factor over per-instance best time)")
-    ax.set_xlim(1.0, 4.0)
+    ax.set_xlim(1.0, 1.4)
+    ax.set_xticks([1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40])
     ax.set_ylim(-0.02, 1.05)
     ax.grid(True, alpha=0.18)
 
@@ -371,18 +372,23 @@ pol_all = np.concatenate([pol_med, pol_hard])
 rol_all = np.concatenate([rol_med, rol_hard])
 
 reduction      = 100 * (1 - rol_all / pol_all)
+med_reduction  = 100 * (1 - rol_med  / pol_med)
+hard_reduction = 100 * (1 - rol_hard / pol_hard)
 mean_r         = np.mean(reduction)
-median_r       = np.median(reduction)
+mean_med       = np.mean(med_reduction)
+mean_hard      = np.mean(hard_reduction)
 n_improved     = int(np.sum(rol_all < pol_all))
 n_total        = len(pol_all)
 
 print(f"\nPlot 4 — node reduction summary")
-print(f"  Mean:    {mean_r:.1f}%")
-print(f"  Median:  {median_r:.1f}%")
-print(f"  Min:     {reduction.min():.1f}%")
-print(f"  Max:     {reduction.max():.1f}%")
-print(f"  Improved: {n_improved}/{n_total}")
-print(f"  Per-instance reductions: {np.round(reduction,1)}")
+print(f"  Overall mean:  {mean_r:.1f}%")
+print(f"  Medium mean:   {mean_med:.1f}%")
+print(f"  Hard mean:     {mean_hard:.1f}%")
+print(f"  Min:           {reduction.min():.1f}%")
+print(f"  Max:           {reduction.max():.1f}%")
+print(f"  Improved:      {n_improved}/{n_total}")
+print(f"  Per-instance (medium): {np.round(med_reduction,1)}")
+print(f"  Per-instance (hard):   {np.round(hard_reduction,1)}")
 
 lo = 2500
 hi = 6900
@@ -409,20 +415,21 @@ for i, (x, y_) in enumerate(zip(pol_hard, rol_hard)):
     ax.annotate(f"H{i}", (x, y_), xytext=(5, 4),
                 textcoords="offset points", fontsize=7.5)
 
-# summary box
+# summary box — tier-split reductions
 summary = (
-    f"Mean reduction:    {mean_r:.1f}%\n"
-    f"Median reduction:  {median_r:.1f}%\n"
-    f"Instances reduced: {n_improved}/{n_total}"
+    f"Medium mean reduction: {mean_med:.1f}%\n"
+    f"Hard mean reduction:   {mean_hard:.1f}%\n"
+    f"Overall mean:          {mean_r:.1f}%\n"
+    f"Instances reduced:     {n_improved}/{n_total}"
 )
 ax.text(0.04, 0.96, summary, transform=ax.transAxes,
         va="top", ha="left", fontsize=8.5,
         bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
                   edgecolor="0.7", alpha=0.95))
 
-ax.set_xlabel("Policy nodes")
-ax.set_ylabel("Rollout-D1 nodes")
-ax.set_title("Per-instance rollout vs. imitation policy",
+ax.set_xlabel("Policy B&B nodes")
+ax.set_ylabel("Rollout-D1 B&B nodes")
+ax.set_title("Per-instance B&B node count: rollout vs. policy",
              loc="left", fontweight="bold")
 ax.set_xlim(lo, hi)
 ax.set_ylim(lo, hi)
