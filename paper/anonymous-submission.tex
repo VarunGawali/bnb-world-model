@@ -16,6 +16,7 @@
 
 \newtheorem{definition}{Definition}
 \newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
 
 \newcommand{\fix}{\marginpar{FIX}}
 \newcommand{\new}{\marginpar{NEW}}
@@ -48,16 +49,17 @@ variable's representation evolve under a candidate action, enabling the
 branching policy to be re-applied to imagined states for multi-step planning.
 Candidates are scored by a MuZero-style return combining predicted per-step
 rewards, a value estimate, and a cost-to-go penalty; the same latent drives
-Gomory cut selection and node ordering within a single unified model that
-provably preserves solver exactness. On medium-tier Set Cover ($500{\times}1000$, 300\,s budget), every neural
+node ordering and informs both a learned and a parameter-free Gomory cut
+selection rule within a single model that provably preserves solver exactness. On medium-tier Set Cover ($500{\times}1000$, 300\,s budget), every neural
 variant terminates on all instances while every classical branching rule in the
 same harness times out; a single-step latent rollout reduces explored nodes by
 44\% over the imitation policy (SGM 3{,}197 vs.\ 5{,}733), and deeper rollout
 (depth\,3) increases nodes by 14\%, confirming that short-horizon planning is
 the correct regime given current dynamics fidelity. We evaluate across medium and
-hard tiers against SCIP, pseudocost, strong branching, and classical heuristics,
-reporting optimality rate, nodes explored, wall-clock solving time, and cuts
-applied, with component-wise ablations isolating the contribution of each element.
+hard tiers against most-fractional and classical strong-branching heuristics at
+depths 1, 4, and 8, reporting optimality rate, nodes explored, wall-clock solving
+time, and cuts applied, with component-wise ablations isolating the contribution
+of each element.
 \end{abstract}
 
 % -----------------------------------------------------------------------
@@ -100,7 +102,7 @@ executing child LP solves. We encode each search node as a bipartite graph,
 reading out the graph-level state with a learned attention pool
 \citep{lee2019set} over variable embeddings that emphasizes structurally
 important variables rather than averaging uniformly, and train a causal
-Transformer \citep{teoh2024nextlatent} to predict how this state, alongside its
+Transformer to predict how this state, alongside its
 constituent per-variable embeddings, evolves under a candidate branching
 action. Because the model predicts fine-grained, per-variable representations
 rather than a static graph summary, the branching policy can be re-applied to
@@ -182,23 +184,38 @@ solver decision. Across branching and cutting alike, prior work scores a
 candidate either myopically or through an explicit, expensive look-ahead that
 the learned policy itself cannot invoke.
 
-CutWorld instead draws on model-based reinforcement learning. MuZero
+A complementary line of work introduces sequence models over the
+\emph{realized} branching history. \citet{zhang2026mambabranchin} encode the
+sequence of states and decisions from the root to the current node with a
+Mamba state-space model, training contrastively to distinguish productive and
+unproductive branching histories. This \emph{retrospective} approach captures
+how the search arrived at its current node, but still cannot see what a given
+candidate decision will cause downstream. CutWorld takes the opposite,
+\emph{prospective} stance: given the current node, it simulates the unrealized
+consequences of a candidate before committing to it, recovering part of strong
+branching's look-ahead signal directly rather than from historical pattern.
+The two axes are complementary rather than competing --- a Mamba-style history
+encoder could feed the initial state into CutWorld's dynamics model --- and
+differ in scope: \citet{zhang2026mambabranchin} addresses branching-variable
+selection only, whereas CutWorld additionally handles cut selection and node
+ordering from the same latent.
+
+CutWorld draws on model-based reinforcement learning. MuZero
 \citep{schrittwieser2020mastering} plans with a learned dynamics model without
 reconstructing observations, and Dreamer \citep{hafner2020dream} learns
-behaviors by imagination in latent space. Recent work on compact world models
-\citep{teoh2024nextlatent} shows that predicting next latents in a learned
+behaviors by imagination in latent space. Predicting next latents in a learned
 embedding space, rather than reconstructing raw observations, yields efficient
-and accurate forward models; our DynamicsTransformer follows this design, and
-we adopt latent overshooting as a training-time stabilizer to keep the learned
-forward model faithful across multiple steps even though the deployed solver
-plans with a single-step rollout. We bring this inside Branch-and-Cut,
-combining the bipartite representation of \citet{gasse2019exact} with a
-learned latent forward model: rather than ranking candidates by a static score
-or paying for explicit LP look-ahead, we \emph{imagine} the immediate
-consequence a decision induces and recover part of strong branching's
-look-ahead signal at the cost of a single cheap latent transition per
-candidate. A single such model drives branching, cut selection, and node
-ordering, whereas prior methods learn each decision in isolation.
+forward models; our DynamicsTransformer follows this design, and we adopt
+latent overshooting as a training-time stabilizer to keep the learned forward
+model faithful across multiple steps even though the deployed solver plans with
+a single-step rollout. We bring this inside Branch-and-Cut, combining the
+bipartite representation of \citet{gasse2019exact} with a learned latent
+forward model: rather than ranking candidates by a static score or paying for
+explicit LP look-ahead, we \emph{imagine} the immediate consequence a decision
+induces and recover part of strong branching's look-ahead signal at the cost
+of a single cheap latent transition per candidate. A single such model drives
+branching, cut selection, and node ordering, whereas prior methods learn each
+decision in isolation.
 
 % -----------------------------------------------------------------------
 \section{Background and Problem Formulation}
@@ -236,22 +253,17 @@ pass, and the reward and node-count signals above become the learning targets fo
 the model's reward and cost-to-go heads (Section~\ref{sec:method}).
 
 \label{sec:exactness}
-\begin{proposition}[Exactness]
+\begin{remark}[Exactness]
 \label{prop:exact}
 For any branching variable chosen among the fractional candidates, any subset of
 globally valid cuts added at any node, and any ordering of the open nodes,
-Branch-and-Cut returns a global optimum. Consequently CutWorld preserves the
-solver's exactness guarantee for every setting of the learned policy.
-\end{proposition}
-\begin{proof}[Proof sketch]
-Branching on a fractional $x_j$ into $x_j=0$ and $x_j=1$ partitions the
-integer feasible set exhaustively, so no integer solution is lost. A globally
-valid cut is satisfied by every integer-feasible point, so adding it removes no
-feasible solution. Node ordering changes only the sequence in which subproblems
-are explored, not the bound-and-integrality pruning rule, hence not the final
-incumbent. The learned model only selects among these correctness-preserving
-options, so the incumbent at termination is a global optimum.
-\end{proof}
+Branch-and-Cut returns a global optimum: branching partitions the integer
+feasible set exhaustively, globally valid cuts preserve every integer-feasible
+point, and node ordering affects only search sequence, not the
+bound-and-integrality pruning rule. CutWorld selects only among these
+correctness-preserving options, so it preserves the solver's exactness guarantee
+for every setting of the learned policy.
+\end{remark}
 
 Our validity requirement drives the cut design in Section~\ref{sec:method}: we
 generate Gomory fractional cuts, which are valid by construction, and let the
@@ -387,7 +399,7 @@ re-solves the LP and re-encodes a fresh $z,\{h_i\}$ (top loop), and the
 chosen branch variable's children are pushed back onto the queue as new
 B\&C nodes (bottom loop). No gate or head ever alters an LP bound or a
 feasibility test, so solver exactness is unaffected
-(Proposition~\ref{prop:exact}).}
+(Remark~\ref{prop:exact}).}
 \label{fig:arch}
 \end{figure*}
 
@@ -625,10 +637,9 @@ curriculum detailed in Section~\ref{sec:training}:
 
 We evaluate on Set Cover instances across easy, medium, and hard difficulty
 tiers, collecting strong-branching trajectories for training. We compare against
-a spectrum of branching rules: the trivial \emph{most-fractional} heuristic,
-\emph{classical strong branching} at look-ahead depths 1, 4, and 8 (SB-1/4/8),
-and \emph{SCIP}'s default reliability-pseudocost branching (the strong solver
-baseline). We also report the \emph{imitation} policy and several ablation
+a spectrum of branching rules: the trivial \emph{most-fractional} heuristic and
+\emph{classical strong branching} at look-ahead depths 1, 4, and 8 (SB-1/4/8).
+We also report the \emph{imitation} policy and several ablation
 variants of CutWorld. We report four metrics per method on a common held-out
 instance set: the fraction of instances closed to \emph{optimality} within the
 time limit, the Shifted Geometric Mean (SGM) of explored \emph{nodes} (shift
@@ -684,7 +695,7 @@ fidelity.
 \subsection{Results}
 \label{sec:results}
 
-Table~\ref{tab:main} and Figure~\ref{fig:medium} report the medium tier
+Table~\ref{tab:main} reports the medium tier
 ($500\times1000$ Set Cover, 10 instances, $300$\,s limit). All methods run
 inside the \emph{same} branch-and-bound harness, differing only in the
 branching rule and cut policy, so the comparison isolates those components.
@@ -759,9 +770,9 @@ method \emph{within the same time budget}: $({\rm obj}-{\rm best})/{\rm best}\ti
 Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
 \midrule
 Most-fractional        &  0/10 & 4{,}873 & ---  & 301.4 & 1.2\% \\
-Classical SB-1         &  0/10 & 4{,}605 & ---  & 301.3 & 1.1\% \\
+Classical SB-1         &  0/10 & 4{,}605 & ---  & 301.3 & \textbf{1.1\%} \\
 Classical SB-4         &  0/10 & 3{,}024 & ---  & 301.0 & 1.5\% \\
-Classical SB-8         &  0/10 & 2{,}710 & ---  & 300.8 & 2.0\% \\
+Classical SB-8         &  0/10 & \textbf{2{,}710} & ---  & \textbf{300.8} & 2.0\% \\
 \midrule
 Policy (imitation)     & 10/10 & --- & 5{,}733     & 237.6 & 4.3\% \\
 \quad + MF-blend       & 10/10 & --- & 4{,}165     & \textbf{218.1} & 1.6\% \\
@@ -808,14 +819,14 @@ best}\times100$. SGM shift: $s_n=10$, $s_t=1$.}
 Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
 \midrule
 \multicolumn{5}{l}{\emph{Classical (LP-based branching)}} \\
-Most-fractional      & 0/5 & 3{,}342 & ---    & 601.0 & 0.6\% \\
+Most-fractional      & 0/5 & 3{,}342 & ---    & 601.0 & \textbf{0.6\%} \\
 Strong-branching-1   & 0/5 & 2{,}631 & ---    & 600.9 & 0.7\% \\
-Strong-branching-4   & 0/5 & 1{,}074 & ---    & 600.4 & 1.2\% \\
+Strong-branching-4   & 0/5 & \textbf{1{,}074} & ---    & \textbf{600.4} & 1.2\% \\
 Strong-branching-8   & 0/5 & 1{,}096 & ---    & 600.5 & 1.8\% \\
 \midrule
 \multicolumn{5}{l}{\emph{Cheap neural (imitation only)}} \\
 Policy               & 5/5 & ---    & 4{,}633 & 389.3 & 2.2\% \\
-MF-Blend-20          & 5/5 & ---    & 2{,}736 & 353.1 & 1.0\% \\
+MF-Blend-20          & 5/5 & ---    & 2{,}736 & \textbf{353.1} & 1.0\% \\
 Policy+Cuts          & 5/5 & ---    & 4{,}419 & 395.2 & 2.8\% \\
 \midrule
 \multicolumn{5}{l}{\emph{Neural with rollout}} \\
@@ -931,6 +942,22 @@ strong-branching imitation replicates the expert's \emph{selection rule} but
 cannot replicate its implicit reasoning about downstream search quality; rollout
 closes that gap.
 
+\textbf{On Transformer vs.\ SSM for latent dynamics.}
+A natural question is why CutWorld uses a causal Transformer rather than a
+Mamba/SSM backbone, given that \citet{zhang2026mambabranchin} explicitly choose
+Mamba over Transformer for branching because Transformers OOM at their target
+trajectory lengths and run 10--50$\times$ slower at inference. The key
+architectural difference is in the task: Mamba-Branching autoregressively models
+a \emph{long realized branching history} (sequences of hundreds of steps), which
+is where quadratic self-attention is prohibitive. CutWorld's DynamicsTransformer
+has a different job --- predicting a \emph{single} next-latent transition, with
+trajectory context used only for positional conditioning over a maximum of 512
+tokens. Single-step latent prediction is a short, fixed-horizon regression, not
+a long-horizon autoregressive generation task, and the causal Transformer's
+strong inductive bias for attending to relevant prior context at modest sequence
+lengths fits this use case well. An SSM replacement is a worthwhile future
+ablation, particularly at trajectory lengths exceeding the 512-token cap.
+
 \subsection{Reproducibility}
 
 Experiments were run on NVIDIA RTX 5000 (16\,GB) GPUs under CUDA~13.2, using
@@ -1016,9 +1043,11 @@ stages except dynamics, patience 12). Planning rollout: top-$k=3$ candidates,
 depth $K=1$ (primary evaluated configuration), discount $\gamma=0.95$,
 branching factor $b=2$ as configurable defaults; the primary evaluated
 configuration uses a shallow lookahead depth of 1 (both branch directions),
-a size-based penalty weight of 1.0 in place of the cost-to-go term, a
-policy/most-fractional rank blend of $\alpha=0.20$, the attention
-cut-selection rule, cost-to-go-node ordering by predicted bound, and a primal
+\texttt{size\_weight=0.0} (the subtree-size penalty is gated off: the
+size head extrapolates beyond its training distribution at medium and hard
+scale, reversing its easy-tier gain, as Section~\ref{sec:results} reports),
+\texttt{ctg\_weight=1.0}, a policy/most-fractional rank blend of $\alpha=0.20$,
+the attention cut-selection rule, cost-to-go node ordering, and a primal
 heuristic invoked every 50 nodes and at the root. Training data:
 1{,}000 randomly generated Set Cover instances ($500\times1000$, constraint
 density $0.05$), split 80/10/10 into train/validation/test, with
@@ -1030,12 +1059,86 @@ strong-branching trajectories collected using the HiGHS LP solver.
 Variable and constraint node feature descriptions for the HiGHS bipartite graph
 representation to be included in the camera-ready version.
 
-\section{Proof of Proposition~\ref{prop:exact}}
-\label{app:proof}
+\section{ICLR Paper Checklist}
+\label{app:checklist}
 
-The full formal proof of the exactness guarantee follows directly from the
-constructive argument given in Section~\ref{sec:method}: branching exhausts the
-integer feasible set, globally valid cuts preserve all integer-feasible points,
-and node ordering is search-order-only.
+\begin{enumerate}
+
+\item \textbf{Claims.}
+\textit{Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope?}
+
+Yes. The abstract and introduction claim (a) a latent dynamics model for B\&C that replaces child LP solves with a cheap forward pass, (b) a unified model driving branching, cut selection, and node ordering with an exactness guarantee, (c) 44\% node reduction via depth-1 latent rollout on medium-tier Set Cover, and (d) 100\% solve rate on instances that time out all classical rules. All claims are supported directly by Tables~1--3 and the ablation in Section~5.3. The ``unified model'' language in the abstract is qualified to acknowledge that the deployed cut-selection rule is a parameter-free attention heuristic; the learned cut pointer head is evaluated separately in Table~3.
+
+\item \textbf{Limitations.}
+\textit{Does the paper discuss the limitations of the work?}
+
+Yes. Section~5.5 explicitly reports two failure modes: (a) the subtree-size head does not generalize beyond easy-tier trees, reversing its gain at medium and hard scale (Section~5.5, point 3); (b) depth-3 rollout increases nodes at medium tier due to compounding dynamics error (Section~5.5, point 5). The Conclusion reiterates both as open directions.
+
+\item \textbf{Theory.}
+\textit{Does the paper include theoretical claims (e.g., theorems, propositions)?}
+
+Yes. Remark~1 states that CutWorld preserves Branch-and-Cut's exactness guarantee. The remark is a standard property of Branch-and-Cut --- any selection among valid branching variables, globally valid cuts, and node orderings is correctness-preserving --- and its justification is self-contained in the remark body.
+
+\item \textbf{Experimental result reproducibility.}
+\textit{Does the paper describe the experimental setup well enough to reproduce the main results?}
+
+Yes. Section~5.1 specifies the problem class, instance sizes, time budgets, and metrics. Section~5.2 and Appendix~A list all training hyperparameters, learning rates, epoch caps, and early-stopping patience. The supplementary archive contains instance generation code, the trajectory collector, model code, training scripts, and random seeds.
+
+\item \textbf{Open access to data and code.}
+\textit{Is code submitted with the paper?}
+
+Yes. The anonymized supplementary zip archive contains all code and data generation scripts necessary to reproduce every experiment in the paper.
+
+\item \textbf{Experimental setting / details.}
+\textit{Does the paper specify all the information needed to run the experiments?}
+
+Yes. Hardware (NVIDIA RTX 5000, CUDA 13.2), framework (PyTorch + PyTorch Geometric), instance parameterization ($500\!\times\!1000$ and $1000\!\times\!2000$, density 0.05, 1,000 training instances), data split (80/10/10), and all solver hyperparameters are reported in Section~5.2 and Appendix~A.
+
+\item \textbf{Experiment statistical significance.}
+\textit{Are the results accompanied by error bars?}
+
+No. Results are reported over 10 medium-tier and 5 hard-tier instances at a single random seed per instance. We report SGM aggregates rather than per-instance means with confidence intervals. Multiple seeds and significance testing are identified as open work.
+
+\item \textbf{Experiments compute resources.}
+\textit{Does the paper report the compute resources used to run the experiments?}
+
+Partially. Section~5.6 reports the GPU model (NVIDIA RTX 5000, 16\,GB). Total GPU-hours for training and evaluation are not quantified; this will be added in the camera-ready version.
+
+\item \textbf{Code of ethics.}
+\textit{Does the research presented in the paper involve potential risks?}
+
+No. The work concerns combinatorial optimization methodology with no human subjects, sensitive data, or direct societal risk. See the Ethics Statement.
+
+\item \textbf{Broader impacts.}
+\textit{Does the paper discuss the broader impact of the presented work?}
+
+The Ethics Statement addresses the primary application domain (logistics, scheduling, resource allocation) and notes no identified negative societal impact.
+
+\item \textbf{Safeguards.}
+\textit{Does the paper describe safeguards to protect sensitive or private data?}
+
+Not applicable. All data is synthetically generated.
+
+\item \textbf{Licenses for existing assets.}
+\textit{Does the paper cite and use existing assets appropriately?}
+
+Yes. The bipartite encoder design follows \citet{gasse2019exact}; GATv2 is from \citet{brody2022how}; HiGHS is used as the LP solver and is open-source (MIT license). All third-party assets used are cited in the text.
+
+\item \textbf{New assets.}
+\textit{Does the paper report the license for new assets?}
+
+The code and generated instance sets released with this paper will be licensed under MIT; final license details will be included in the camera-ready repository.
+
+\item \textbf{Crowdsourcing and human subjects.}
+\textit{Does the paper involve crowdsourcing or experiments with human subjects?}
+
+No.
+
+\item \textbf{Institutional review.}
+\textit{Does any experiment in the paper require institutional review board (IRB) approval?}
+
+No.
+
+\end{enumerate}
 
 \end{document}
