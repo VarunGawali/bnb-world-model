@@ -589,8 +589,9 @@ constraints that are simultaneously loose and connected to fractional variables
 representations without any additional learned parameters. Training the
 pointer head requires cut-quality labels produced by an external solver, which
 are not always available at the scale needed for Phase~5; the reported results
-therefore use the attention rule as the deployed selection mechanism, with the
-learned pointer head evaluated separately in Table~\ref{tab:cuts}.
+therefore use the attention rule as the deployed selection mechanism; the
+learned pointer head is an ablation evaluated via the gap columns of
+Tables~\ref{tab:main} and~\ref{tab:hard}.
 
 \subsection{Learning Objectives}
 \label{sec:objectives}
@@ -868,33 +869,18 @@ fastest neural method on each instance.}
 
 \subsection{Cut Selection}
 
-We isolate the learned cut-selection head in our own neural Branch-and-Cut
-solver, where the model controls which of the (globally valid) root Gomory cuts
-are added. All three modes --- no cuts, max-violation selection, and learned
-selection --- draw from the \emph{same} valid cut pool, so the comparison
-isolates the selection rule; every solve is verified to reach the true optimum
-(matching SCIP). Table~\ref{tab:cuts} reports mean explored nodes over 30 Set
-Cover instances under a cut budget of one and two cuts per node.
-
-\begin{table}[t]
-\caption{Cut-selection ablation on Set Cover (30 instances, all closed to
-optimality). Valid cuts reduce explored nodes, and under the tightest budget of
-a single cut per node the learned head selects a more effective cut than the
-max-violation heuristic ($-12.1\%$ vs.\ $-8.6\%$); as the budget loosens both
-rules capture most of the benefit and converge.}
-\label{tab:cuts}
-\begin{center}
-\begin{tabular}{lcc}
-\toprule
-Selection rule & Nodes ($\le\!1$ cut) & Nodes ($\le\!2$ cuts) \\
-\midrule
-No cuts       & 7.73               & 7.73               \\
-Max-violation & 7.07\ ($-8.6\%$)  & 6.87\ ($-11.2\%$) \\
-Learned       & \textbf{6.80}\ ($-12.1\%$) & 6.87\ ($-11.2\%$) \\
-\bottomrule
-\end{tabular}
-\end{center}
-\end{table}
+The contribution of root Gomory cut selection is visible directly in
+Tables~\ref{tab:main} and~\ref{tab:hard}. Adding attention-selected cuts to
+the imitation policy (Policy$+$Cuts) yields a modest $-6\%$ node reduction at
+medium tier ($5{,}396$ vs.\ $5{,}733$), consistent with the root LP already
+being relatively tight on these instances. The more consequential effect is on
+\emph{solution quality}: combining cuts with depth-1 rollout (Neural-Best)
+reduces the primal gap from $5.2\%$ (Rollout-d1 alone) to $1.9\%$ at medium
+tier and from $3.2\%$ to $1.4\%$ at hard tier, closing most of the distance to
+classical methods that never terminate. This confirms that root cuts and
+rollout serve complementary roles --- rollout shrinks the tree, cuts tighten
+the LP bound and steer the solver toward better integer solutions --- and that
+their combination is what drives the solution-quality recovery.
 
 \subsection{Discussion}
 
@@ -955,10 +941,10 @@ dynamics model --- even if imperfect --- provides a richer planning signal than
 a single-step value estimate, and the gain from better candidate selection
 outweighs the compounding approximation error. This suggests that dynamics
 fidelity, not rollout depth \emph{per se}, is the binding constraint; improving
-multi-step accuracy should unlock further gains. Learned cut selection at a tight
-budget (Table~\ref{tab:cuts}) provides parallel evidence: latent evaluation is
-most reliable over a short horizon when the candidate set is small, but the
-benefit of depth grows as the branching factor and tree depth increase.
+multi-step accuracy should unlock further gains. The gap-column evidence in Tables~\ref{tab:main} and~\ref{tab:hard} provides
+parallel support: latent evaluation is most reliable over a short horizon when
+the candidate set is small, but the benefit of depth grows as the branching
+factor and tree depth increase.
 
 \textbf{Rollout recovers solution quality lost by imitation.}
 The gap columns of Tables~\ref{tab:main} and~\ref{tab:hard} reveal a cost that
