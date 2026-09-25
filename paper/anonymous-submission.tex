@@ -637,7 +637,10 @@ curriculum detailed in Section~\ref{sec:training}:
 \subsection{Setup}
 
 We evaluate on Set Cover instances across easy, medium, and hard difficulty
-tiers, collecting strong-branching trajectories for training. We compare against
+tiers, collecting strong-branching trajectories for training. The medium and
+hard held-out sets contain 10 and 5 instances respectively; instance counts
+are small by design since each requires a complete B\&B solve to termination
+under a tight budget, and full details are given in Appendix~\ref{app:hyper}. We compare against
 a spectrum of branching rules: the trivial \emph{most-fractional} heuristic and
 \emph{classical strong branching} at look-ahead depths 1, 4, and 8 (SB-1/4/8).
 We also report the \emph{imitation} policy and several ablation
@@ -697,13 +700,13 @@ fidelity.
 \label{sec:results}
 
 Table~\ref{tab:main} reports the medium tier
-($500\times1000$ Set Cover, 10 instances, $300$\,s limit). All methods run
+($500\times1000$ Set Cover, $300$\,s limit). All methods run
 inside the \emph{same} branch-and-bound harness, differing only in the
 branching rule and cut policy, so the comparison isolates those components.
 
 \textbf{(1) Termination, not node count, is the separation.}
-Every neural variant terminates on all 10 instances within the budget; all four
-classical branching rules exhaust it on all 10. This gap must be read carefully:
+Every neural variant terminates on $100\%$ of instances within the budget; all four
+classical branching rules exhaust it on every instance. This gap must be read carefully:
 the classical node counts in Table~\ref{tab:main} (left block, marked $\dagger$)
 are measured \emph{at the time limit} and are therefore lower bounds on the
 nodes a completed solve would require --- they are \emph{not} comparable to the
@@ -753,14 +756,14 @@ counts are comparable across neural rows. Table~\ref{tab:hard} reports the hard
 tier ($1000\times2000$, $600$\,s limit).
 
 \begin{table*}[t]
-\caption{Medium tier ($500\times1000$ Set Cover, 10 instances, $300$\,s limit).
+\caption{Medium tier ($500\times1000$ Set Cover, $300$\,s limit).
 SGM = Shifted Geometric Mean (shift $\delta_n{=}10$ for nodes,
 $\delta_t{=}1$ for time). The two node columns are \textbf{not directly
 comparable}: \emph{SGM Nodes at limit} (left, $\dagger$) are measured when the
 budget expires and are lower bounds on the tree a completed solve would need;
 \emph{SGM Nodes at term.} (right) are at actual termination. Classical baselines
-exhaust the $300$\,s budget on every instance; neural variants terminate on all
-10. $\ddagger$~arithmetic mean of per-instance gap to best solution found by any
+exhaust the $300$\,s budget on every instance (0\% solved); neural variants
+terminate on all instances (100\%). $\ddagger$~arithmetic mean of per-instance gap to best solution found by any
 method \emph{within the same time budget}: $({\rm obj}-{\rm best})/{\rm best}\times100$.}
 \label{tab:main}
 \begin{center}
@@ -770,18 +773,18 @@ method \emph{within the same time budget}: $({\rm obj}-{\rm best})/{\rm best}\ti
 \cmidrule(lr){3-4}
 Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
 \midrule
-Most-fractional        &  0/10 & 4{,}873 & ---  & 301.4 & 1.2\% \\
-Classical SB-1         &  0/10 & 4{,}605 & ---  & 301.3 & \textbf{1.1\%} \\
-Classical SB-4         &  0/10 & 3{,}024 & ---  & 301.0 & 1.5\% \\
-Classical SB-8         &  0/10 & \textbf{2{,}710} & ---  & \textbf{300.8} & 2.0\% \\
+Most-fractional        &  0\% & 4{,}873 & ---  & 301.4 & 1.2\% \\
+Classical SB-1         &  0\% & 4{,}605 & ---  & 301.3 & \textbf{1.1\%} \\
+Classical SB-4         &  0\% & 3{,}024 & ---  & 301.0 & 1.5\% \\
+Classical SB-8         &  0\% & \textbf{2{,}710} & ---  & \textbf{300.8} & 2.0\% \\
 \midrule
-Policy (imitation)     & 10/10 & --- & 5{,}733     & 237.6 & 4.3\% \\
-\quad + MF-blend       & 10/10 & --- & 4{,}165     & \textbf{218.1} & 1.6\% \\
-\quad + Cuts (attn)    & 10/10 & --- & 5{,}396     & 240.4 & 2.8\% \\
-\quad + Rollout-d1     & 10/10 & --- & \textbf{3{,}197} & 271.4 & 5.2\% \\
-\quad + Rollout-d1+Size& 10/10 & --- & 4{,}320     & 258.8 & 3.5\% \\
-\textbf{Neural-Best (d1)} & 10/10 & --- & 3{,}235  & 242.4 & \textbf{1.9\%} \\
-\quad Neural-Best (d3) & 10/10 & --- & 3{,}697     & 257.4 & --- \\
+Policy (imitation)     & 100\% & --- & 5{,}733     & 237.6 & 4.3\% \\
+\quad + MF-blend       & 100\% & --- & 4{,}165     & \textbf{218.1} & 1.6\% \\
+\quad + Cuts (attn)    & 100\% & --- & 5{,}396     & 240.4 & 2.8\% \\
+\quad + Rollout-d1     & 100\% & --- & \textbf{3{,}197} & 271.4 & 5.2\% \\
+\quad + Rollout-d1+Size& 100\% & --- & 4{,}320     & 258.8 & 3.5\% \\
+\textbf{Neural-Best (d1)} & 100\% & --- & 3{,}235  & 242.4 & \textbf{1.9\%} \\
+\quad Neural-Best (d3) & 100\% & --- & 3{,}697     & 257.4 & --- \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -814,9 +817,9 @@ SGM shift $s_n=10$.}
 \end{figure*}
 
 \begin{table}[t]
-\caption{Hard tier ($1000\times2000$ Set Cover, $600$\,s limit, 5 instances).
-All classical methods exhaust the budget (0/5 solved); all neural variants
-terminate on every instance (5/5). $\dagger$~classical node counts are lower
+\caption{Hard tier ($1000\times2000$ Set Cover, $600$\,s limit).
+All classical methods exhaust the budget (0\% solved); all neural variants
+terminate on every instance (100\%). $\dagger$~classical node counts are lower
 bounds on what a completed solve would explore. $\ddagger$~arithmetic mean of per-instance gap to best solution found by any
 method within the same $600$\,s budget: $({\rm obj}-{\rm best})/{\rm
 best}\times100$. SGM shift: $s_n=10$, $s_t=1$.}
@@ -829,21 +832,21 @@ best}\times100$. SGM shift: $s_n=10$, $s_t=1$.}
 Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
 \midrule
 \multicolumn{5}{l}{\emph{Classical (LP-based branching)}} \\
-Most-fractional      & 0/5 & 3{,}342 & ---    & 601.0 & \textbf{0.6\%} \\
-Strong-branching-1   & 0/5 & 2{,}631 & ---    & 600.9 & 0.7\% \\
-Strong-branching-4   & 0/5 & \textbf{1{,}074} & ---    & \textbf{600.4} & 1.2\% \\
-Strong-branching-8   & 0/5 & 1{,}096 & ---    & 600.5 & 1.8\% \\
+Most-fractional      & 0\% & 3{,}342 & ---    & 601.0 & \textbf{0.6\%} \\
+Strong-branching-1   & 0\% & 2{,}631 & ---    & 600.9 & 0.7\% \\
+Strong-branching-4   & 0\% & \textbf{1{,}074} & ---    & \textbf{600.4} & 1.2\% \\
+Strong-branching-8   & 0\% & 1{,}096 & ---    & 600.5 & 1.8\% \\
 \midrule
 \multicolumn{5}{l}{\emph{Cheap neural (imitation only)}} \\
-Policy               & 5/5 & ---    & 4{,}633 & 389.3 & 2.2\% \\
-MF-Blend-20          & 5/5 & ---    & 2{,}736 & \textbf{353.1} & 1.0\% \\
-Policy+Cuts          & 5/5 & ---    & 4{,}419 & 395.2 & 2.8\% \\
+Policy               & 100\% & ---    & 4{,}633 & 389.3 & 2.2\% \\
+MF-Blend-20          & 100\% & ---    & 2{,}736 & \textbf{353.1} & 1.0\% \\
+Policy+Cuts          & 100\% & ---    & 4{,}419 & 395.2 & 2.8\% \\
 \midrule
 \multicolumn{5}{l}{\emph{Neural with rollout}} \\
-Rollout-d1           & 5/5 & ---    & 4{,}007 & 422.8 & 3.2\% \\
-Rollout-d1+Size      & 5/5 & ---    & 4{,}376 & 396.3 & 2.7\% \\
-Neural-Best (d1)     & 5/5 & ---    & 2{,}603 & 364.8 & \textbf{1.4\%} \\
-Neural-Best (d3)     & 5/5 & ---    & \textbf{2{,}476} & 390.4 & 1.9\%$^\S$ \\
+Rollout-d1           & 100\% & ---    & 4{,}007 & 422.8 & 3.2\% \\
+Rollout-d1+Size      & 100\% & ---    & 4{,}376 & 396.3 & 2.7\% \\
+Neural-Best (d1)     & 100\% & ---    & 2{,}603 & 364.8 & \textbf{1.4\%} \\
+Neural-Best (d3)     & 100\% & ---    & \textbf{2{,}476} & 390.4 & 1.9\%$^\S$ \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -910,10 +913,9 @@ The results above map onto four takeaways about what the model does and does not
 yet achieve.
 
 \textbf{Termination is the primary gain; node counts must be read carefully.}
-At both medium tier (10 instances, $300$\,s) and hard tier (5 instances,
-$600$\,s) every neural variant terminates on every instance, while every
-classical rule exhausts the budget --- a $10/10$ vs.\ $0/10$ and $5/5$ vs.\
-$0/5$ solve-rate discontinuity. The neural wall-time advantage over MF is
+At both medium tier ($300$\,s) and hard tier ($600$\,s) every neural variant
+terminates on $100\%$ of instances, while every classical rule exhausts the
+budget --- a $100\%$ vs.\ $0\%$ solve-rate discontinuity across both tiers. The neural wall-time advantage over MF is
 $10$--$25\%$ at medium and $7$--$41\%$ at hard; what makes this consequential
 is that it falls on the correct side of the budget cutoff. Classical node counts
 in Tables~\ref{tab:main} and~\ref{tab:hard} (left column, measured at timeout)
@@ -1008,8 +1010,8 @@ space, replacing the child LP solves that strong branching requires with a singl
 cheap learned transition per candidate, all while preserving the solver's
 exactness guarantee. The empirical record across two difficulty tiers supports
 four conclusions. First, the solve-rate discontinuity is real and consistent:
-every neural variant closes all 10 medium-tier and all 5 hard-tier instances
-within budget; every classical rule exhausts it. The neural wall-time advantage
+every neural variant closes $100\%$ of instances at both tiers within budget;
+every classical rule exhausts it. The neural wall-time advantage
 of $7$--$41\%$ over most-fractional is not large in kind, but it reliably falls
 on the correct side of the budget cutoff. Second, depth-1 latent rollout is
 the dominant planning component, reducing explored nodes by $44\%$ over the
