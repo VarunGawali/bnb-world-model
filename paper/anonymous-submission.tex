@@ -323,7 +323,7 @@ model \emph{select} among them rather than invent inequalities.
 \node[small, right=5mm of confchk] (topk) {Top-$K$\\candidates};
 \node[small, right=5mm of topk, minimum width=30mm] (roll)
   {Rollout each candidate:\\unroll dynamics, re-apply $\pi$\\
-   $\sum\gamma^{j-1}\hat r_j - w_sS - w_cC$};
+   $\sum\gamma^{j-1}\hat r_j + \gamma^{K-1}V - w_cC$};
 \node[small, right=5mm of roll] (argmax) {$\arg\max$\\$\to$ branch var};
 
 \draw[arr] (pscore) -- (leafchk);
@@ -444,19 +444,19 @@ latent is decoded with a residual connection to limit multi-step drift:
 \end{equation}
 Predicting a delta rather than an absolute latent keeps long rollouts from
 wandering. A per-variable module predicts how each variable embedding evolves.
-Exploiting the linearity of its first layer, the update decomposes as
+The update is a two-layer MLP (layers $3d\!\to\!2d\!\to\!d$, GELU) applied to
+the concatenated input $[h_i^{\,t}\,\|\,z_{t+1}\,\|\,a_t]$:
 \begin{equation}
   h_i^{\,t+1} = \mathrm{LN}\!\bigl(
-    h_i^{\,t} + W_h(h_i^{\,t}) + W_z(z_{t+1}) + W_a(a_t)
-  \bigr),
+    h_i^{\,t} + \mathrm{MLP}_h([h_i^{\,t} \,\|\, z_{t+1} \,\|\, a_t])
+  \bigr).
   \label{eq:varupdate}
 \end{equation}
-where $W_h$, $W_z$, $W_a$ are linear maps. Because $W_z(z_{t+1})$ and
-$W_a(a_t)$ are identical across variables, they are computed once and
-broadcast-added to the per-variable term $W_h(h_i^{\,t})$, reducing the
-per-step cost from $O(V{\cdot}3d^2)$ to $O(V{\cdot}d^2)$. Predicting
-per-variable embeddings~\eqref{eq:varupdate}, rather than only the graph
-summary $z$, is what lets the branching policy be re-applied to an
+Because $z_{t+1}$ and $a_t$ are shared across all variables, they are computed
+once and broadcast-expanded before the single batched MLP call, keeping the
+per-step cost proportional to $V$ rather than requiring $V$ independent forward
+passes. Predicting per-variable embeddings~\eqref{eq:varupdate}, rather than only
+the graph summary $z$, is what lets the branching policy be re-applied to an
 \emph{imagined} state during planning. We ground the latent with a linear head
 $\hat{b}_{t+1}=w_b^\top z_{t+1}$ that predicts the node's normalized dual
 bound, tying the imagined latent to a real solver quantity, and a reward head
@@ -528,13 +528,19 @@ Algorithm~\ref{alg:select} summarizes candidate selection.
 \label{alg:select}
 \begin{algorithmic}[1]
 \State \textbf{Input:} node latent $z$, variable embeddings $\{h_i\}$,
-       fractional set $\mathcal{F}$, depth $K$, factor $b$
-\State $\mathcal{C}\gets \textsc{TopK}_k\bigl(\pi(\cdot\mid z,\{h_i\}),\,\mathcal{F}\bigr)$
+       fractional set $\mathcal{F}$, depth $K$, factor $b$, weight $\lambda$
+\State $\pi_c \gets \pi(\cdot\mid z,\{h_i\})$ over $\mathcal{F}$
+\If{$\max_c \pi_c \ge \theta$} \Return $\arg\max_c \pi_c$ \EndIf
+        \Comment{confident early exit}
+\State $\mathcal{C}\gets \textsc{TopK}_k(\pi_c,\,\mathcal{F})$
 \For{each candidate $c\in\mathcal{C}$}
   \State $R(c)\gets \textsc{Rollout}(z,\{h_i\},c,K,b)$
          \Comment{Eq.~\eqref{eq:return}}
 \EndFor
-\State \Return $\arg\max_{c\in\mathcal{C}} R(c)$
+\State $\hat\pi(c)\gets\mathrm{standardize}(\pi_c)$,\quad
+       $\hat R(c)\gets\mathrm{standardize}(R(c))$
+\State \Return $\arg\max_{c\in\mathcal{C}}\bigl[\hat\pi(c)+\lambda\,\hat R(c)\bigr]$
+       \Comment{policy-anchored; $\lambda{=}0$ recovers policy}
 \end{algorithmic}
 \end{algorithm}
 
@@ -731,8 +737,8 @@ search.
 
 All neural configurations run with every unsafe prune disabled
 (Section~\ref{sec:exactness}), so the search is exact by construction and node
-counts are comparable across neural rows. The hard tier ($1000\times2000$) is
-in progress and will be reported in the final version (Table~\ref{tab:hard}).
+counts are comparable across neural rows. Table~\ref{tab:hard} reports the hard
+tier ($1000\times2000$, $600$\,s limit).
 
 \begin{table*}[t]
 \caption{Medium tier ($500\times1000$ Set Cover, 10 instances, $300$\,s limit).
