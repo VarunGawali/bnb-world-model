@@ -747,7 +747,7 @@ model}, and multi-step dynamics accuracy is the lever that would unlock deeper
 search.
 
 All neural configurations run with every unsafe prune disabled
-(Section~\ref{sec:exactness}), so the search is exact by construction and node
+(Section~\ref{sec:exactness}), so branching and cut decisions never alter LP bounds or feasibility tests, and node
 counts are comparable across neural rows. Table~\ref{tab:hard} reports the hard
 tier ($1000\times2000$, $600$\,s limit).
 
