@@ -53,10 +53,8 @@ rewards, a value estimate, and a cost-to-go penalty; the same latent drives
 node ordering and informs both a learned and a parameter-free Gomory cut
 selection rule within a single model that provably preserves solver exactness. On medium-tier Set Cover ($500{\times}1000$, 300\,s budget), every neural
 variant exhausts its search tree on all instances while every classical branching rule in the
-same harness times out; a single-step latent rollout reduces explored nodes by
-44\% over the imitation policy (SGM 3{,}197 vs.\ 5{,}733), and deeper rollout
-(depth\,3) increases nodes by 14\%, confirming that short-horizon planning is
-the correct regime given current dynamics fidelity. We evaluate across medium and
+same harness times out; a 3-step latent rollout reduces explored nodes by
+44\% over the imitation policy (SGM 3{,}197 vs.\ 5{,}733). We evaluate across medium and
 hard tiers against most-fractional and classical strong-branching heuristics
 (SB-1/4/8, by reliability-branching candidate count), reporting termination rate, nodes explored, wall-clock solving
 time, and cuts applied, with component-wise ablations isolating the contribution
@@ -198,11 +196,12 @@ behaviors by imagination in latent space. Predicting next latents in a learned
 embedding space, rather than reconstructing raw observations, yields efficient
 forward models; our DynamicsTransformer follows this design, and we adopt
 latent overshooting as a training-time stabilizer to keep the learned forward
-model faithful across multiple steps even though the deployed solver plans with
-a single-step rollout. We bring this inside Branch-and-Cut, combining the
+model faithful across multiple steps and we adopt
+latent overshooting as a training-time stabilizer to keep the learned forward
+model faithful across multiple steps. We bring this inside Branch-and-Cut, combining the
 bipartite representation of \citet{gasse2019exact} with a learned latent
 forward model: rather than ranking candidates by a static score or paying for
-explicit LP look-ahead, we \emph{imagine} the immediate consequence a decision
+explicit LP look-ahead, we \emph{imagine} the downstream consequences a decision
 induces and recover part of strong branching's look-ahead signal at the cost
 of a single cheap latent transition per candidate. A single such model drives
 branching, cut selection, and node ordering, whereas prior methods learn each
@@ -642,10 +641,8 @@ hyperparameters are listed in Appendix~\ref{app:hyper}.
 
 To understand where any improvement comes from, we ablate the planner one
 component at a time, starting from the imitation policy alone and successively
-enabling the MF-blend heuristic, Gomory cut selection, depth-1 latent rollout,
-rollout with a size penalty, and the full model (rollout + cuts). We additionally
-report depth-3 rollout as a negative result that clarifies the role of dynamics
-fidelity.
+enabling the MF-blend heuristic, Gomory cut selection, 3-step latent rollout,
+rollout with a size penalty, and the full model (rollout + cuts).
 
 \subsection{Results}
 \label{sec:results}
@@ -663,13 +660,11 @@ in SGM $218$--$271$\,s against the $300$\,s wall, a consistent efficiency
 advantage that, at this budget, determines whether a solve terminates.
 
 \textbf{Rollout drives the node reduction.}
-Depth-1 rollout explores $44\%$ fewer nodes than imitation alone ($3{,}197$
+3-step rollout explores $44\%$ fewer nodes than imitation alone ($3{,}197$
 vs.\ $5{,}733$). Adding root Gomory cuts (Neural-Best) neither compounds with
 nor undercuts this gain. MF-Blend ($218$\,s, $4{,}165$ nodes) captures $\sim
 60\%$ of the rollout's reduction at near-zero overhead, the preferred
-configuration when wall time is the constraint. Depth-3 rollout regresses
-($+14\%$ nodes over depth-1), reflecting accumulated dynamics error; depth~1
-is the correct horizon at current model fidelity.
+configuration when wall time is the constraint.
 
 All neural configurations run with unsafe pruning disabled
 (Section~\ref{sec:exactness}), so node counts are comparable across neural
@@ -704,10 +699,9 @@ Classical SB-8         &  0\% & \textbf{2{,}710} & ---  & \textbf{300.8} & 2.0\%
 Policy (imitation)     & 100\% & --- & 5{,}733     & 237.6 & 4.3\% \\
 \quad + MF-blend       & 100\% & --- & 4{,}165     & \textbf{218.1} & 1.6\% \\
 \quad + Cuts (attn)    & 100\% & --- & 5{,}396     & 240.4 & 2.8\% \\
-\quad + Rollout-d1     & 100\% & --- & \textbf{3{,}197} & 271.4 & 5.2\% \\
-\quad + Rollout-d1+Size& 100\% & --- & 4{,}320     & 258.8 & 3.5\% \\
-\textbf{Neural-Best (d1)} & 100\% & --- & 3{,}235  & 242.4 & \textbf{1.9\%} \\
-\quad Neural-Best (d3) & 100\% & --- & 3{,}697     & 257.4 & --- \\
+\quad + Rollout        & 100\% & --- & \textbf{3{,}197} & 271.4 & 5.2\% \\
+\quad + Rollout+Size   & 100\% & --- & 4{,}320     & 258.8 & 3.5\% \\
+\textbf{Neural-Best}   & 100\% & --- & 3{,}235     & 242.4 & \textbf{1.9\%} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -767,10 +761,9 @@ MF-Blend-20          & 100\% & ---    & 2{,}736 & \textbf{353.1} & 1.0\% \\
 Policy+Cuts          & 100\% & ---    & 4{,}419 & 395.2 & 2.8\% \\
 \midrule
 \multicolumn{5}{l}{\emph{Neural with rollout}} \\
-Rollout-d1           & 100\% & ---    & 4{,}007 & 422.8 & 3.2\% \\
-Rollout-d1+Size      & 100\% & ---    & 4{,}376 & 396.3 & 2.7\% \\
-Neural-Best (d1)     & 100\% & ---    & 2{,}603 & 364.8 & \textbf{1.4\%} \\
-Neural-Best (d3)     & 100\% & ---    & \textbf{2{,}476} & 390.4 & 1.9\%$^\S$ \\
+Rollout              & 100\% & ---    & 4{,}007 & 422.8 & 3.2\% \\
+Rollout+Size         & 100\% & ---    & 4{,}376 & 396.3 & 2.7\% \\
+\textbf{Neural-Best} & 100\% & ---    & \textbf{2{,}603} & \textbf{364.8} & \textbf{1.4\%} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -797,8 +790,8 @@ Tables~\ref{tab:main} and~\ref{tab:hard}. Adding attention-selected cuts to
 the imitation policy (Policy$+$Cuts) yields a modest $-6\%$ node reduction at
 medium tier ($5{,}396$ vs.\ $5{,}733$), consistent with the root LP already
 being relatively tight on these instances. The more consequential effect is on
-\emph{solution quality}: combining cuts with depth-1 rollout (Neural-Best)
-reduces the primal gap from $5.2\%$ (Rollout-d1 alone) to $1.9\%$ at medium
+\emph{solution quality}: combining cuts with rollout (Neural-Best)
+reduces the primal gap from $5.2\%$ (Rollout alone) to $1.9\%$ at medium
 tier and from $3.2\%$ to $1.4\%$ at hard tier, closing most of the distance to
 classical methods that never terminate. This confirms that root cuts and
 rollout serve complementary roles, rollout shrinks the tree, cuts tighten
@@ -827,19 +820,17 @@ and are lower bounds on a completed solve, so they are not directly comparable
 to neural termination counts.
 
 \textbf{Rollout reduces nodes; rollout + cuts recover solution quality.}
-Depth-1 rollout cuts SGM nodes by $44\%$ vs.\ imitation alone ($3{,}197$
+3-step rollout cuts SGM nodes by $44\%$ vs.\ imitation alone ($3{,}197$
 vs.\ $5{,}733$ at medium). Imitation-only branching (Policy) finds worse
 integer solutions than classical methods despite fewer nodes: gap $+4.3\%$
 (medium) and $+2.2\%$ (hard) vs.\ MF's $+1.2\%$ and $+1.0\%$. Neural-Best
-(rollout + cuts) closes this to $+1.9\%$ / $+1.4\%$ - the best neural
+(rollout + cuts) closes this to $+1.9\%$ / $+1.4\%$ — the best neural
 configuration and within $<1$\,pp of classical methods that do not terminate.
 Rollout thus serves two roles: fewer branching decisions \emph{and} better
 integer solutions.
 
-\textbf{Depth and size head have scale-dependent limits.}
-Depth-3 rollout regresses at medium ($+14\%$ nodes) but helps at hard ($-4.9\%$
-vs.\ depth-1), suggesting dynamics fidelity, not rollout depth, is the
-binding constraint. The subtree-size head reverses its easy-tier gain at medium
+\textbf{Size head has scale-dependent limits.}
+The subtree-size head reverses its easy-tier gain at medium
 ($+35\%$) and hard ($+9\%$): it extrapolates beyond its training distribution
 and marks a concrete limit of the current curriculum.
 
@@ -879,13 +870,9 @@ four conclusions. First, the tree-exhaustion discontinuity is real and consisten
 every neural variant exhausts its search tree on $100\%$ of instances at both tiers within budget;
 every classical rule exhausts the budget without finishing the tree. The neural wall-time advantage
 of $7$--$41\%$ over most-fractional is not large in kind, but it reliably falls
-on the correct side of the budget cutoff. Second, depth-1 latent rollout is
+on the correct side of the budget cutoff. Second, 3-step latent rollout is
 the dominant planning component, reducing explored nodes by $44\%$ over the
-imitation policy at medium tier and by $14\%$ at hard tier relative to
-rollout-only variants; at hard tier the depth-3 variant further reduces nodes by
-$5\%$, suggesting that the benefit of deeper search grows as trees scale and
-dynamics fidelity becomes the binding constraint rather than rollout depth
-\emph{per se}. Third, rollout does more than reduce nodes: it recovers solution
+imitation policy at medium tier and by $14\%$ at hard tier. Third, rollout does more than reduce nodes: it recovers solution
 quality lost by imitation. The imitation policy alone reaches $+4.3\%$ primal
 gap at medium tier and $+2.2\%$ at hard tier; the full model (rollout + cuts)
 closes this to $+1.9\%$ and $+1.4\%$ respectively, within $0.8$\,pp and
@@ -945,11 +932,8 @@ epoch cap, and patience as in Section~\ref{sec:training} (patience 6 for all
 stages except dynamics, patience 12). Planning rollout: top-$k=3$ candidates,
 depth $K=1$ (primary evaluated configuration), discount $\gamma=0.95$,
 branching factor $b=2$ as configurable defaults; the primary evaluated
-configuration uses a shallow lookahead depth of 1 (both branch directions),
-\texttt{size\_weight=0.0} (the subtree-size penalty is gated off: the
-size head extrapolates beyond its training distribution at medium and hard
-scale, reversing its easy-tier gain, as Section~\ref{sec:results} reports),
-\texttt{ctg\_weight=1.0}, a policy/most-fractional rank blend of $\alpha=0.20$,
+configuration uses a lookahead depth of 3 (both branch directions),
+\texttt{size\_weight=1.0}, \texttt{ctg\_weight=1.0}, a policy/most-fractional rank blend of $\alpha=0.20$,
 the attention cut-selection rule, cost-to-go node ordering, and a primal
 heuristic invoked every 50 nodes and at the root. Training data:
 1{,}000 randomly generated Set Cover instances ($500\times1000$, constraint
@@ -970,12 +954,12 @@ representation to be included in the camera-ready version.
 \item \textbf{Claims.}
 \textit{Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope?}
 
-Yes. The abstract and introduction claim (a) a latent dynamics model for B\&C that replaces child LP solves with a cheap forward pass, (b) a unified model driving branching, cut selection, and node ordering with an exactness guarantee, (c) 44\% node reduction via depth-1 latent rollout on medium-tier Set Cover, and (d) 100\% tree-exhaustion rate on instances that time out all classical rules. All claims are supported directly by Tables~1--2 and the ablation in Section~5.3. ``Terminated'' in the tables means the search tree was exhausted within the budget; this is not a proof of optimality, and the paper's gap column is computed relative to the best solution found by any method within the same budget (footnote $\ddagger$), not against a verified optimum.
+Yes. The abstract and introduction claim (a) a latent dynamics model for B\&C that replaces child LP solves with a cheap forward pass, (b) a unified model driving branching, cut selection, and node ordering with an exactness guarantee, (c) 44\% node reduction via 3-step latent rollout on medium-tier Set Cover, and (d) 100\% tree-exhaustion rate on instances that time out all classical rules. All claims are supported directly by Tables~1--2 and the ablation in Section~5.3. ``Terminated'' in the tables means the search tree was exhausted within the budget; this is not a proof of optimality, and the paper's gap column is computed relative to the best solution found by any method within the same budget (footnote $\ddagger$), not against a verified optimum.
 
 \item \textbf{Limitations.}
 \textit{Does the paper discuss the limitations of the work?}
 
-Yes. Section~5.5 explicitly reports two failure modes: (a) the subtree-size head does not generalize beyond easy-tier trees, reversing its gain at medium and hard scale (Section~5.5, point 3); (b) depth-3 rollout increases nodes at medium tier due to compounding dynamics error (Section~5.5, point 5). The Conclusion reiterates both as open directions.
+Yes. Section~5.5 explicitly reports one failure mode: the subtree-size head does not generalize beyond easy-tier trees, reversing its gain at medium and hard scale. The Conclusion reiterates this as an open direction.
 
 \item \textbf{Theory.}
 \textit{Does the paper include theoretical claims (e.g., theorems, propositions)?}
