@@ -364,10 +364,8 @@ query vector over the per-variable embeddings to produce the graph-level
 summary, emphasising the variables most relevant at this node:
 \begin{equation}
   \bigl(\{h_i\}_{i=1}^{n},\, z\bigr) = \mathrm{Enc}(s_t),
-  \qquad h_i,\, z \in \mathbb{R}^{d}.
+  \qquad h_i,\, z \in \mathbb{R}^{d};\quad a = h_v.
 \end{equation}
-Feature statistics are held in fixed registered buffers rather than BatchNorm. The embedding of an action that branches on variable
-$v$ is $a = h_v$.
 
 \subsection{Latent Dynamics}
 
@@ -383,12 +381,11 @@ branch direction:
 where $a_\tau = h_{v_\tau}$ is the embedding of the branched variable and
 $d_\tau \in \{+1,-1\}$ is the branch direction. Conditioning on direction is
 what lets a single model represent both children of a node. The next graph
-latent is decoded with a residual connection to limit multi-step drift:
+latent is decoded with a residual connection:
 \begin{equation}
   z_{t+1} = \mathrm{LN}\!\bigl(z_t + W_{\mathrm{out}}\,\mathrm{TF}(u_{0:t})\bigr).
 \end{equation}
-Predicting a delta rather than an absolute latent keeps long rollouts from
-wandering. A per-variable module predicts how each variable embedding evolves.
+A per-variable module predicts how each variable embedding evolves.
 The update is a two-layer MLP (layers $3d\!\to\!2d\!\to\!d$, GELU) applied to
 the concatenated input $[h_i^{\,t}\,\|\,z_{t+1}\,\|\,a_t]$:
 \begin{equation}
@@ -397,9 +394,8 @@ the concatenated input $[h_i^{\,t}\,\|\,z_{t+1}\,\|\,a_t]$:
   \bigr).
   \label{eq:varupdate}
 \end{equation}
- Predicting per-variable embeddings~\eqref{eq:varupdate}, rather than only
-the graph summary $z$, is what lets the branching policy be re-applied to an
-\emph{imagined} state during planning. We ground the latent with a linear head
+Predicting per-variable embeddings~\eqref{eq:varupdate} lets the branching
+policy be re-applied to an imagined state during planning. We ground the latent with a linear head
 $\hat{b}_{t+1}=w_b^\top z_{t+1}$ that predicts the node's normalized dual
 bound, tying the imagined latent to a real solver quantity, and a reward head
 $\hat{r}_{t}=w_r^\top z_{t+1}$ that predicts the per-step dual-bound
@@ -416,11 +412,8 @@ global average:
   C(z) &= \mathrm{softplus}\bigl(\mathrm{MLP}_C([z \,\|\,
            \bar{h}_{\mathrm{frac}}])\bigr),
 \end{align}
-where each MLP has layers $2d \to d \to d/2 \to 1$ and $C$ predicts
-$\log(1+\text{remaining nodes})$. Its regression target is the Monte-Carlo
-return $T-t$ read directly off a length-$T$ trajectory, the number of steps
-still to come, which requires \emph{no} assumption that the trajectory is
-depth-first ordered, unlike a subtree-size target. The branching policy is a
+where $C$ predicts $\log(1+\text{remaining nodes})$ with a Monte-Carlo target
+$T-t$ read directly from each trajectory. The branching policy is a
 pointer network scoring each fractional variable jointly against the graph
 context:
 \begin{equation}
@@ -448,10 +441,7 @@ leaf, and penalizes predicted remaining work:
        - w_c\sum_{j=1}^{K}\gamma^{\,j-1}\hat{C}(z_j).
   \label{eq:return}
 \end{equation}
-We expand a shallow tree of branching factor $b$ (the top-$b$ actions at each
-step, child returns averaged); $b\!=\!1$ recovers a single greedy rollout.
-Rather than branching on $\arg\max_c R(c)$, which lets a single noisy rollout
-override a confident policy, we use a \emph{policy-anchored} rule: over the
+We use a \emph{policy-anchored} rule: over the
 candidate set we standardize the policy scores and the returns and select
 $c^\star=\arg\max_c\bigl[\hat{\pi}(c)+\lambda\,\hat{R}(c)\bigr]$, so the
 latent lookahead refines the policy's ranking instead of replacing it
@@ -486,24 +476,17 @@ Algorithm~\ref{alg:select} summarizes candidate selection.
 \subsection{Cutting-Plane Selection}
 
 The model performs cut \emph{selection}; validity is guaranteed by the
-generator, not the learner. We generate a pool of Gomory fractional cuts at the
-root from the LP optimal basis. Writing the relaxation in standard form. all
-variables nonneg\-ative, with the box $0\le x\le 1$ lifted into explicit rows
-$x_j+t_j=1$ so every nonbasic variable rests at its lower bound, each basic
-structural variable $x_j$ with a fractional value $\bar{b}$ and tableau row
-$x_j+\sum_{k\in\mathcal{N}}\alpha_k v_k=\bar{b}$ yields the valid inequality
-$\sum_{k\in\mathcal{N}}\mathrm{frac}(\alpha_k)\,v_k \ge \mathrm{frac}(\bar{b})$,
-which we express in the structural variables by substituting the slack
-definitions. Derived from globally valid rows with no branching bounds applied,
-these cuts hold for \emph{every} integer-feasible solution and are safely
-inherited by all descendants of the node, genuine Branch-and-Cut rather than
-cut-and-branch.
+generator. We generate a pool of Gomory fractional cuts at the root from the
+LP optimal basis: each fractional basic variable yields one cut derived from
+its tableau row. Because these cuts come from globally valid rows with no
+branching bounds applied, they hold for every integer-feasible solution and
+are safely inherited by all descendants, making the approach genuine
+Branch-and-Cut rather than cut-and-branch.
 
 \subsection{Learning Objectives}
 \label{sec:objectives}
 
-Table~\ref{tab:losses} summarises the supervised objective for each head;
-all are optimized in the five-phase curriculum of Section~\ref{sec:training}.
+Table~\ref{tab:losses} summarises each head's objective.
 
 \begin{table}[h]
 \centering
@@ -527,7 +510,6 @@ Cost-to-go $S$ & Huber & $\log(1{+}(T{-}t))$, Monte-Carlo steps remaining. \\
 Subtree size $C$ & Huber & $\log(1{+}\text{subtree size})$ from B\&C traces. \\
 Integrality $\iota$ & BCE$^+$ & Leaf / non-leaf label. \\
 Value-consistency$^\dagger$ & MSE & $\|V(\tilde z)-V(z)\|^2$, keeping $V$ reliable on imagined states. \\
-Cut head & BCE$^+$ & External-solver cut-selection label. \\
 \bottomrule
 \end{tabular}
 \end{table}
