@@ -52,13 +52,13 @@ Candidates are scored by a MuZero-style return combining predicted per-step
 rewards, a value estimate, and a cost-to-go penalty; the same latent drives
 node ordering and informs both a learned and a parameter-free Gomory cut
 selection rule within a single model that provably preserves solver exactness. On medium-tier Set Cover ($500{\times}1000$, 300\,s budget), every neural
-variant terminates on all instances while every classical branching rule in the
+variant exhausts its search tree on all instances while every classical branching rule in the
 same harness times out; a single-step latent rollout reduces explored nodes by
 44\% over the imitation policy (SGM 3{,}197 vs.\ 5{,}733), and deeper rollout
 (depth\,3) increases nodes by 14\%, confirming that short-horizon planning is
 the correct regime given current dynamics fidelity. We evaluate across medium and
-hard tiers against most-fractional and classical strong-branching heuristics at
-depths 1, 4, and 8, reporting optimality rate, nodes explored, wall-clock solving
+hard tiers against most-fractional and classical strong-branching heuristics
+(SB-1/4/8, by reliability-branching candidate count), reporting termination rate, nodes explored, wall-clock solving
 time, and cuts applied, with component-wise ablations isolating the contribution
 of each element.
 \end{abstract}
@@ -597,17 +597,18 @@ hard held-out sets contain 10 and 5 instances respectively; instance counts
 are small by design since each requires a complete B\&B solve to termination
 under a tight budget, and full details are given in Appendix~\ref{app:hyper}. We compare against
 a spectrum of branching rules: the trivial \emph{most-fractional} heuristic and
-\emph{classical strong branching} at look-ahead depths 1, 4, and 8 (SB-1/4/8).
-We also report the \emph{imitation} policy and several ablation
+\emph{classical strong branching} with reliability-branching candidate counts of
+1, 4, and 8 (SB-1/4/8). We also report the \emph{imitation} policy and several ablation
 variants of CutWorld. We report four metrics per method on a common held-out
-instance set: the fraction of instances closed to \emph{optimality} within the
-time limit, the Shifted Geometric Mean (SGM) of explored \emph{nodes} (shift
-$\delta_n=10$) and wall-clock \emph{time} (shift $\delta_t=1$), and the number
-of \emph{cutting planes} applied. Optimality is reported first because a
-reduction in nodes is only a genuine improvement when the instance is actually
-solved: a method that is slow per node can appear to explore fewer nodes merely
-by timing out. On tiers where baselines
-time out, SGM nodes are computed at the time limit (marked $\dagger$).
+instance set: the fraction of instances \emph{terminated} within the time limit
+(neural methods exhaust their search tree; classical methods time out without
+exhausting theirs), the Shifted Geometric Mean (SGM) of explored \emph{nodes}
+(shift $\delta_n=10$) and wall-clock \emph{time} (shift $\delta_t=1$), and the
+number of \emph{cutting planes} applied. Termination rate is reported first
+because a reduction in nodes is only a genuine improvement when the solver
+finishes its tree: a method that is slow per node can appear to explore fewer
+nodes merely by timing out. On tiers where baselines time out, SGM nodes are
+computed at the time limit (marked $\dagger$).
 
 \subsection{Training Details}
 \label{sec:training}
@@ -654,8 +655,8 @@ $300$\,s limit). All methods share the same B\&B harness; only the branching
 rule and cut policy differ.
 
 \textbf{Termination is the primary separation.}
-Every neural variant terminates on $100\%$ of instances; all four classical
-rules exhaust the budget. The classical node counts (marked $\dagger$) are
+Every neural variant exhausts its search tree on $100\%$ of instances; all four classical
+rules exhaust the time budget. The classical node counts (marked $\dagger$) are
 measured at the time limit and are lower bounds on a completed solve, so they
 are not directly comparable to neural termination counts. Neural solves finish
 in SGM $218$--$271$\,s against the $300$\,s wall, a consistent efficiency
@@ -682,16 +683,18 @@ $\delta_t{=}1$ for time). The two node columns are \textbf{not directly
 comparable}: \emph{SGM Nodes at limit} (left, $\dagger$) are measured when the
 budget expires and are lower bounds on the tree a completed solve would need;
 \emph{SGM Nodes at term.} (right) are at actual termination. Classical baselines
-exhaust the $300$\,s budget on every instance (0\% solved); neural variants
-terminate on all instances (100\%). $\ddagger$~arithmetic mean of per-instance gap to best solution found by any
-method \emph{within the same time budget}: $({\rm obj}-{\rm best})/{\rm best}\times100$.}
+exhaust the $300$\,s budget on every instance (0\% terminated); neural variants
+exhaust their search tree on all instances (100\%). $\ddagger$~arithmetic mean of per-instance gap to best solution found by any
+method \emph{within the same time budget}: $({\rm obj}-{\rm best})/{\rm best}\times100$.
+$\S$~``Terminated'' for neural methods means the search tree was exhausted;
+this is not a proof of optimality.}
 \label{tab:main}
 \begin{center}
 \begin{tabular}{lccccc}
 \toprule
  & & \multicolumn{2}{c}{SGM Nodes} & & \\
 \cmidrule(lr){3-4}
-Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
+Method & Term.$^\S$ & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
 \midrule
 Most-fractional        &  0\% & 4{,}873 & ---  & 301.4 & 1.2\% \\
 Classical SB-1         &  0\% & 4{,}605 & ---  & 301.3 & \textbf{1.1\%} \\
@@ -738,24 +741,25 @@ SGM shift $s_n=10$.}
 
 \begin{table}[t]
 \caption{Hard tier ($1000\times2000$ Set Cover, $600$\,s limit).
-All classical methods exhaust the budget (0\% solved); all neural variants
-terminate on every instance (100\%). $\dagger$~classical node counts are lower
+All classical methods exhaust the budget (0\% terminated); all neural variants
+exhaust their search tree (100\%). $\dagger$~classical node counts are lower
 bounds on what a completed solve would explore. $\ddagger$~arithmetic mean of per-instance gap to best solution found by any
 method within the same $600$\,s budget: $({\rm obj}-{\rm best})/{\rm
-best}\times100$. SGM shift: $s_n=10$, $s_t=1$.}
+best}\times100$. $\S$~``Terminated'' for neural methods means the search tree
+was exhausted; this is not a proof of optimality. SGM shift: $s_n=10$, $s_t=1$.}
 \label{tab:hard}
 \begin{center}
 \begin{tabular}{lccccc}
 \toprule
  & & \multicolumn{2}{c}{SGM Nodes} & & \\
 \cmidrule(lr){3-4}
-Method & Solved & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
+Method & Term.$^\S$ & at limit$^\dagger$ & at term. & SGM Time (s) & Gap$^\ddagger$ \\
 \midrule
 \multicolumn{5}{l}{\emph{Classical (LP-based branching)}} \\
 Most-fractional      & 0\% & 3{,}342 & ---    & 601.0 & \textbf{0.6\%} \\
-Strong-branching-1   & 0\% & 2{,}631 & ---    & 600.9 & 0.7\% \\
-Strong-branching-4   & 0\% & \textbf{1{,}074} & ---    & \textbf{600.4} & 1.2\% \\
-Strong-branching-8   & 0\% & 1{,}096 & ---    & 600.5 & 1.8\% \\
+SB-1                 & 0\% & 2{,}631 & ---    & 600.9 & 0.7\% \\
+SB-4                 & 0\% & \textbf{1{,}074} & ---    & \textbf{600.4} & 1.2\% \\
+SB-8                 & 0\% & 1{,}096 & ---    & 600.5 & 1.8\% \\
 \midrule
 \multicolumn{5}{l}{\emph{Cheap neural (imitation only)}} \\
 Policy               & 100\% & ---    & 4{,}633 & 389.3 & 2.2\% \\
@@ -815,9 +819,9 @@ $33.6\%$ overall.}
 \end{figure}
 
 \textbf{Termination is the primary gain.}
-Every neural variant closes $100\%$ of instances at both tiers; every classical
-rule exhausts the budget. The neural wall-time advantage is $10$--$25\%$ at
-medium and $7$--$41\%$ at hard, enough to determine whether a solve
+Every neural variant exhausts its search tree on $100\%$ of instances at both tiers; every classical
+rule exhausts the time budget without finishing the tree. The neural wall-time advantage is $10$--$25\%$ at
+medium and $7$--$41\%$ at hard — enough to determine whether a solve
 terminates. Classical node counts (marked $\dagger$) are measured at timeout
 and are lower bounds on a completed solve, so they are not directly comparable
 to neural termination counts.
@@ -838,6 +842,16 @@ vs.\ depth-1), suggesting dynamics fidelity, not rollout depth, is the
 binding constraint. The subtree-size head reverses its easy-tier gain at medium
 ($+35\%$) and hard ($+9\%$): it extrapolates beyond its training distribution
 and marks a concrete limit of the current curriculum.
+
+\textbf{Termination criterion and optimality.}
+Neural methods terminate by exhausting the search tree rather than proving a
+dual-bound gap of zero. In practice, LP-infeasible nodes are silently pruned
+from the heap, which can empty the heap before the tree is truly complete.
+The 100\% termination rate should therefore be read as a statement about
+tree-traversal efficiency under the budget, not as a claim of proven optimality.
+The gap column (footnote $\ddagger$) reports solution quality relative to the
+best feasible solution found by any method within the same time budget; no
+verified optima exist for these instances within the evaluated time limits.
 
 \textbf{Transformer vs.\ SSM.}
 Unlike \citet{zhang2026mambabranchin}, which autoregressively models long
@@ -861,9 +875,9 @@ plans branching, node selection, and root Gomory cut selection jointly in latent
 space, replacing the child LP solves that strong branching requires with a single
 cheap learned transition per candidate, all while preserving the solver's
 exactness guarantee. The empirical record across two difficulty tiers supports
-four conclusions. First, the solve-rate discontinuity is real and consistent:
-every neural variant closes $100\%$ of instances at both tiers within budget;
-every classical rule exhausts it. The neural wall-time advantage
+four conclusions. First, the tree-exhaustion discontinuity is real and consistent:
+every neural variant exhausts its search tree on $100\%$ of instances at both tiers within budget;
+every classical rule exhausts the budget without finishing the tree. The neural wall-time advantage
 of $7$--$41\%$ over most-fractional is not large in kind, but it reliably falls
 on the correct side of the budget cutoff. Second, depth-1 latent rollout is
 the dominant planning component, reducing explored nodes by $44\%$ over the
@@ -956,7 +970,7 @@ representation to be included in the camera-ready version.
 \item \textbf{Claims.}
 \textit{Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope?}
 
-Yes. The abstract and introduction claim (a) a latent dynamics model for B\&C that replaces child LP solves with a cheap forward pass, (b) a unified model driving branching, cut selection, and node ordering with an exactness guarantee, (c) 44\% node reduction via depth-1 latent rollout on medium-tier Set Cover, and (d) 100\% solve rate on instances that time out all classical rules. All claims are supported directly by Tables~1--3 and the ablation in Section~5.3. The ``unified model'' language in the abstract is qualified to acknowledge that the deployed cut-selection rule is a parameter-free attention heuristic; the learned cut pointer head is evaluated separately in Table~3.
+Yes. The abstract and introduction claim (a) a latent dynamics model for B\&C that replaces child LP solves with a cheap forward pass, (b) a unified model driving branching, cut selection, and node ordering with an exactness guarantee, (c) 44\% node reduction via depth-1 latent rollout on medium-tier Set Cover, and (d) 100\% tree-exhaustion rate on instances that time out all classical rules. All claims are supported directly by Tables~1--2 and the ablation in Section~5.3. ``Terminated'' in the tables means the search tree was exhausted within the budget; this is not a proof of optimality, and the paper's gap column is computed relative to the best solution found by any method within the same budget (footnote $\ddagger$), not against a verified optimum.
 
 \item \textbf{Limitations.}
 \textit{Does the paper discuss the limitations of the work?}
