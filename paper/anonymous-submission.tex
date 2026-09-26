@@ -622,9 +622,9 @@ Policy (imitation)     & 100\% & --- & 5{,}733     & 237.6 & 4.3\% \\
 \begin{subfigure}[t]{0.41\textwidth}
   \includegraphics[width=\textwidth]{plot2_neural_ablation}
   \caption{SGM B\&B node counts for the neural ablation ladder, measured at
-  termination and therefore directly comparable. Depth-1 latent rollout
+  termination and therefore directly comparable. 3-step latent rollout
   accounts for the dominant node reduction over imitation; Neural-Best adds
-  root Gomory cuts on top. Neural-Best-D3 has no medium-tier bar (no data).}
+  root Gomory cuts on top.}
   \label{fig:ablation}
 \end{subfigure}
 \caption{Benchmark overview. \textbf{(a)} node vs.\ time scatter for all
@@ -756,7 +756,7 @@ is the most direct path to closing this gap. We view CutWorld as the first
 realized instance of a broader agenda: learned dynamics models for optimization,
 in which a solver's sequential decisions are planned in imagination rather than
 resolved by fixed heuristics. Branch-and-Cut is the hardest setting for this
-idea --- exact tree search under a strict correctness constraint --- yet the
+idea, exact tree search under a strict correctness constraint, yet the
 core pattern holds. The same machinery applies wherever a solver makes a
 sequence of discrete choices, and extending it to improvement search, where a
 forward model imagines the effect of re-optimizing a chosen neighborhood, is a
