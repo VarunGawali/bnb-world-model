@@ -804,9 +804,8 @@ $10^{-4}$, gradient clipping at 1.0, cosine learning-rate schedule, automatic
 mixed precision on GPU; five-stage curriculum with per-stage learning rate,
 epoch cap, and patience as in Section~\ref{sec:training} (patience 6 for all
 stages except dynamics, patience 12). Planning rollout: top-$k=3$ candidates,
-depth $K=1$ (primary evaluated configuration), discount $\gamma=0.95$,
-branching factor $b=2$ as configurable defaults; the primary evaluated
-configuration uses a lookahead depth of 3 (both branch directions),
+lookahead depth $K=3$, discount $\gamma=0.95$,
+branching factor $b=2$;
 \texttt{size\_weight=1.0}, \texttt{ctg\_weight=1.0}, a policy/most-fractional rank blend of $\alpha=0.20$,
 the attention cut-selection rule, cost-to-go node ordering, and a primal
 heuristic invoked every 50 nodes and at the root. Training data:
