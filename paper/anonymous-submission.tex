@@ -789,12 +789,6 @@ tokens. This is a short, fixed-horizon regression, not long-horizon generation,
 and a causal Transformer fits the task well. An SSM replacement remains a
 worthwhile ablation at longer trajectories.
 
-\subsection{Reproducibility}
-
-Experiments were run on NVIDIA RTX 5000 (16\,GB) GPUs under CUDA~13.2, using
-PyTorch and PyTorch Geometric. All seeds, hyperparameters, and source code are
-provided as supplementary material.
-
 % -----------------------------------------------------------------------
 \section{Conclusion}
 
@@ -834,7 +828,8 @@ trajectory collector, model code, training scripts, and random seeds used to
 produce every result in this paper are included in the anonymized supplementary
 zip archive. Instance generation follows the Set Cover parameterization
 described in Section~\ref{sec:method}; no external proprietary datasets are
-used.
+used. Experiments were run on NVIDIA RTX~5000 (16\,GB) GPUs under CUDA~13.2
+with PyTorch and PyTorch Geometric.
 
 \subsubsection*{Ethics Statement}
 
