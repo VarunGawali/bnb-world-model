@@ -577,13 +577,11 @@ cut-and-branch.
 \label{sec:objectives}
 
 Table~\ref{tab:losses} summarises the supervised objective for each head;
-all are optimized in the five-phase curriculum of Section~\ref{sec:training}.
+all are optimized in the four-phase curriculum of Section~\ref{sec:training}.
 
 \begin{table}[h]
 \centering
-\caption{Per-head training objectives.  BCE$^+$ = weighted binary
-cross-entropy with positive-class weight equal to the negative-to-positive
-ratio.  $\dagger$~Joint fine-tuning phase only.}
+\caption{Per-head training objectives.  BCE$^+$ = weighted binary cross-entropy with positive-class weight equal to the negative-to-positive ratio.  $\dagger$~Joint fine-tuning phase only.}
 \label{tab:losses}
 \setlength{\tabcolsep}{5pt}
 \small
@@ -601,7 +599,6 @@ Cost-to-go $S$ & Huber & $\log(1{+}(T{-}t))$, Monte-Carlo steps remaining. \\
 Subtree size $C$ & Huber & $\log(1{+}\text{subtree size})$ from B\&C traces. \\
 Integrality $\iota$ & BCE$^+$ & Leaf / non-leaf label. \\
 Value-consistency$^\dagger$ & MSE & $\|V(\tilde z)-V(z)\|^2$, keeping $V$ reliable on imagined states. \\
-Cut head & BCE$^+$ & External-solver cut-selection label. \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -635,7 +632,7 @@ time out, SGM nodes are computed at the time limit (marked $\dagger$).
 
 The objectives of Section~\ref{sec:objectives} are optimized with AdamW
 (weight decay $10^{-4}$, gradient clipping at 1.0, cosine learning-rate
-schedule, mixed precision on GPU) in a five-stage curriculum, each stage
+schedule, mixed precision on GPU) in a four-stage curriculum, each stage
 warm-started from the previous stage's checkpoint and early-stopped on its own
 validation metric: (1)~\emph{policy imitation}, training the encoder and
 policy head jointly (LR $10^{-3}$, up to 30 epochs, patience 6, selected by
@@ -643,24 +640,20 @@ validation top-1 accuracy); (2)~\emph{value}, training only the value head
 with the encoder and policy frozen (LR $5{\times}10^{-4}$, up to 25 epochs,
 patience 6, selected by validation Spearman correlation); (3)~\emph{dynamics},
 training the dynamics model and its two auxiliary heads with the encoder
-frozen by default (optionally fine-tuned jointly), under the overshoot
-curriculum that ramps the unroll horizon from 1 to 3 steps over the first
-60\% of training (LR $5{\times}10^{-4}$, up to 60 epochs, patience 12 to
-absorb the transient loss increase as the horizon grows, selected by
-validation dynamics loss); (4)~\emph{joint fine-tuning} of every component
-(LR $10^{-4}$, up to 25 epochs, patience 6, selected by validation top-1
-accuracy) under the weighted objective
+frozen, under the overshoot curriculum that ramps the unroll horizon from 1 to
+3 steps over the first 60\% of training (LR $5{\times}10^{-4}$, up to 60
+epochs, patience 12 to absorb the transient loss increase as the horizon
+grows, selected by validation dynamics loss); and (4)~\emph{joint fine-tuning}
+of every component (LR $10^{-4}$, up to 25 epochs, patience 6, selected by
+validation top-1 accuracy) under the weighted objective
 \begin{equation}
   L = L_{\pi} + 0.5\,L_V + 0.1\,L_{\mathrm{int}} + 0.1\,L_{\mathrm{consist}}
       + 0.3\,L_S + 0.5\,L_C,
 \end{equation}
 combining the policy, value, integrality, value-consistency, subtree-size, and
-cost-to-go losses; and (5)~\emph{cut selection}, training only the
-cutting-plane head with the encoder frozen (LR $5{\times}10^{-4}$, up to 20
-epochs, patience 6, selected by validation cut-selection loss). Class
-imbalance in the leaf and cut labels is corrected with a positive-class weight
-equal to the negative-to-positive ratio. Full hyperparameters are listed in
-Appendix~\ref{app:hyper}.
+cost-to-go losses. Class imbalance in the integrality label is corrected with
+a positive-class weight equal to the negative-to-positive ratio. Full
+hyperparameters are listed in Appendix~\ref{app:hyper}.
 
 \subsection{Ablation}
 
@@ -1034,7 +1027,7 @@ Training configuration: hidden dimension 128; GNN layers~3, attention heads~4
 (head dimension 32, concatenated to 128); Transformer layers~4, heads~4, FFN
 width~512 ($4d$), max sequence length~512; optimizer AdamW, weight decay
 $10^{-4}$, gradient clipping at 1.0, cosine learning-rate schedule, automatic
-mixed precision on GPU; five-stage curriculum with per-stage learning rate,
+mixed precision on GPU; four-stage curriculum with per-stage learning rate,
 epoch cap, and patience as in Section~\ref{sec:training} (patience 6 for all
 stages except dynamics, patience 12). Planning rollout: top-$k=3$ candidates,
 depth $K=1$ (primary evaluated configuration), discount $\gamma=0.95$,
