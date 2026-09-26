@@ -667,61 +667,31 @@ fidelity.
 \subsection{Results}
 \label{sec:results}
 
-Table~\ref{tab:main} reports the medium tier
-($500\times1000$ Set Cover, $300$\,s limit). All methods run
-inside the \emph{same} branch-and-bound harness, differing only in the
-branching rule and cut policy, so the comparison isolates those components.
+Table~\ref{tab:main} reports the medium tier ($500\times1000$ Set Cover,
+$300$\,s limit). All methods share the same B\&B harness; only the branching
+rule and cut policy differ.
 
-\textbf{(1) Termination, not node count, is the separation.}
-Every neural variant terminates on $100\%$ of instances within the budget; all four
-classical branching rules exhaust it on every instance. This gap must be read carefully:
-the classical node counts in Table~\ref{tab:main} (left block, marked $\dagger$)
-are measured \emph{at the time limit} and are therefore lower bounds on the
-nodes a completed solve would require --- they are \emph{not} comparable to the
-neural counts at termination. The margin is not large in absolute time: neural
-solves finish in SGM $218$--$271$\,s against a $300$\,s wall, a $10$--$25\%$
-efficiency advantage that happens to fall on either side of this particular
-budget. The correct reading is not a discontinuity in kind but a consistent
-efficiency advantage that, at this budget, determines whether a solve terminates.
+\textbf{Termination is the primary separation.}
+Every neural variant terminates on $100\%$ of instances; all four classical
+rules exhaust the budget. The classical node counts (marked $\dagger$) are
+measured at the time limit and are lower bounds on a completed solve, so they
+are not directly comparable to neural termination counts. Neural solves finish
+in SGM $218$--$271$\,s against the $300$\,s wall — a consistent efficiency
+advantage that, at this budget, determines whether a solve terminates.
 
-\textbf{(2) The latent rollout is what pays for itself.}
-Depth-1 rollout (Rollout-d1) explores $44\%$ fewer nodes than the imitation
-policy alone (SGM $3{,}197$ vs.\ $5{,}733$) at the cost of roughly $34$\,s of
-additional inference, and is the best single configuration by node count.
-Adding attention-selected root Gomory cuts to rollout (Neural-Best, $3{,}235$
-nodes, $242$\,s) neither helps nor hurts materially: the cuts tighten the root
-LP bound and recover their own overhead but do not compound with the rollout's
-branching gain. Applied without rollout, cuts give only a $-6\%$ reduction
-($5{,}396$ nodes), indicating that on these instances the root LP is already
-close to what a single Gomory round can tighten.
+\textbf{Rollout drives the node reduction.}
+Depth-1 rollout explores $44\%$ fewer nodes than imitation alone ($3{,}197$
+vs.\ $5{,}733$). Adding root Gomory cuts (Neural-Best) neither compounds with
+nor undercuts this gain. MF-Blend ($218$\,s, $4{,}165$ nodes) captures $\sim
+60\%$ of the rollout's reduction at near-zero overhead — the preferred
+configuration when wall time is the constraint. Depth-3 rollout regresses
+($+14\%$ nodes over depth-1), reflecting accumulated dynamics error; depth~1
+is the correct horizon at current model fidelity.
 
-\textbf{(3) Subtree-size weighting does not transfer to this scale.}
-On small instances the subtree-size penalty in the rollout score reduced nodes
-by $21\%$; at medium scale it reverses, increasing them from $3{,}197$ to
-$4{,}320$ ($+35\%$). The size head was trained on trajectories whose trees are
-orders of magnitude shallower than those explored here, so its predictions are
-extrapolations at medium scale. We report the row rather than tuning it away:
-it marks a concrete limit of the current training distribution.
-
-\textbf{(4) MF-Blend is the wall-time choice.}
-Blending policy logits with most-fractional scores (MF-Blend) is the fastest
-configuration ($218$\,s, $4{,}165$ nodes), capturing roughly $60\%$ of the
-rollout's node reduction at essentially zero inference overhead. Where wall time
-rather than tree size is the binding constraint, this is the configuration to
-deploy.
-
-\textbf{(5) Deeper rollout does not help at current dynamics fidelity.}
-Depth-3 rollout increases nodes to $3{,}697$ ($+14\%$ over depth-1) and costs
-$15$\,s more per instance. The dynamics model is trained for single-step
-fidelity; compounding three steps accumulates enough error to misrank
-candidates. Depth~1 is therefore the correct horizon \emph{given the current
-model}, and multi-step dynamics accuracy is the lever that would unlock deeper
-search.
-
-All neural configurations run with every unsafe prune disabled
-(Section~\ref{sec:exactness}), so branching and cut decisions never alter LP bounds or feasibility tests, and node
-counts are comparable across neural rows. Table~\ref{tab:hard} reports the hard
-tier ($1000\times2000$, $600$\,s limit).
+All neural configurations run with unsafe pruning disabled
+(Section~\ref{sec:exactness}), so node counts are comparable across neural
+rows. Table~\ref{tab:hard} reports the hard tier ($1000\times2000$, $600$\,s
+limit).
 
 \begin{table*}[t]
 \caption{Medium tier ($500\times1000$ Set Cover, $300$\,s limit).
