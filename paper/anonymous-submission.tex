@@ -225,7 +225,7 @@ model \emph{select} among them rather than invent inequalities.
   small/.style={draw, rounded corners, align=center, minimum height=6mm,
               inner sep=2pt, font=\scriptsize},
   lat/.style={align=center, font=\footnotesize},
-  panel/.style={draw, dashed, rounded corners, inner xsep=4pt, inner ysep=7mm},
+  panel/.style={draw, dashed, rounded corners, inner xsep=4pt, inner ysep=5mm},
   ptitle/.style={font=\scriptsize\bfseries, anchor=south west},
   arr/.style={-{Latex[length=1.8mm]}, thick},
   thinarr/.style={-{Latex[length=1.4mm]}},
@@ -253,7 +253,7 @@ model \emph{select} among them rather than invent inequalities.
 \node[ptitle] at (panelA.north west) {(a) Encoder, heads, dynamics};
 
 % ---------- Panel (b): cut decision ----------
-\node[small, below=20mm of inp] (pool) {Gomory pool\\{\scriptsize root, valid}};
+\node[small, below=14mm of inp] (pool) {Gomory pool\\{\scriptsize root, valid}};
 \node[small, right=7mm of pool] (viol) {Violated\\cuts};
 \node[small, right=7mm of viol] (attn) {Attention\\{\scriptsize param-free}};
 \node[small, right=7mm of attn] (commit) {Commit\\{\scriptsize re-solve, re-encode}};
@@ -266,7 +266,7 @@ model \emph{select} among them rather than invent inequalities.
 \node[ptitle] at (panelB.north west) {(b) Cut decision\ {\normalfont\scriptsize(gated by $\iota$, budget, gain)}};
 
 % ---------- Panel (c): branch selection ----------
-\node[small, below=42mm of pool] (pscore) {$\pi(h_i,z)$\\{\scriptsize +Katz/mf blend}};
+\node[small, below=18mm of pool] (pscore) {$\pi(h_i,z)$\\{\scriptsize +Katz/mf blend}};
 \node[small, right=5mm of pscore] (leafchk) {$\iota$ leaf?\\{\scriptsize yes: argmax $\pi$}};
 \node[small, right=5mm of leafchk] (confchk) {$\pi$ confident?\\{\scriptsize yes: argmax $\pi$}};
 \node[small, right=5mm of confchk] (topk) {Top-$K$\\candidates};
