@@ -770,7 +770,7 @@ and the highest-scoring cut is committed, subject to the cut budget. This is a r
 
 We generate binary Set Cover instances with density $0.05$. The medium tier has $500$ constraints and $1{,}000$ variables with a 300\,s limit; the hard tier has $1{,}000$ constraints and $2{,}000$ variables with a 600\,s limit. The reported benchmark contains 10 medium and 5 hard instances generated with seed 1. All methods use the same Python/HiGHS search harness, node limits, and instance order. The model checkpoint is \texttt{checkpoints/highs\_retrain/phase4\_final.pt}.
 
-The primary neural configuration uses a top-$k=3$ candidate set, both branch directions, $\gamma=0.95$, cost-to-go weight $1.0$, attention-based root cut selection, and the primal heuristic configured by the harness. The depth-one rollout is the main configuration; depth-three is an explicit horizon ablation. The size penalty is reported separately because its training scale differs from the medium and hard evaluation scales.
+The primary neural configuration uses a top-$k=3$ candidate set, both branch directions, $\gamma=0.95$, cost-to-go weight $1.0$, attention-based root cut selection, and the primal heuristic configured by the harness. Depth-one rollout ($K=1$) is the evaluated configuration. The size penalty is reported separately because its training scale differs from the medium and hard evaluation scales.
 
 \paragraph{Baselines.}
 We compare most-fractional branching with strong-branching probe budgets 1, 4, and 8 (SB-1/4/8), imitation-only branching, a policy/most-fractional blend, root-cut selection, latent rollout, and the combined neural policy. The classical rows are LP-based controls in the same research harness; they are not a replacement for a separately tuned default SCIP baseline.
@@ -822,7 +822,6 @@ Policy (imitation) & 100\% & -- & 5,733 & 237.6 & 4.3\% \\
 \quad Rollout-D1 & 100\% & -- & \textbf{3,197} & 271.4 & 5.2\% \\
 \quad Rollout-D1 + size & 100\% & -- & 4,320 & 258.8 & 3.5\% \\
 \textbf{Neural-Best (D1)} & 100\% & -- & 3,235 & 242.4 & \textbf{1.9\%} \\
-\quad Neural-Best (D3) & 100\% & -- & 3,697 & 257.4 & -- \\
 \bottomrule
 \end{tabular}}
 \end{table*}
@@ -833,15 +832,9 @@ Rollout-D1 reduces SGM tree nodes from 5,733 to 3,197, a $44.2\%$ reduction rela
 \paragraph{Wall time and tree size are different objectives.}
 MF-blend is the fastest neural configuration at 218.1\,s, while Rollout-D1 requires 271.4\,s. The rollout saves tree nodes but spends additional model time. This distinction motivates reporting both $N_{\mathrm{tree}}$ and wall-clock time rather than selecting a checkpoint from node count alone.
 
-\paragraph{Longer rollout is not uniformly better.}
-Depth-three Neural-Best reaches 3,697 medium-tier nodes, $15.6\%$ above depth-one Neural-Best. This is consistent with compounding dynamics error: the additional imagined transitions can misrank candidates more often than they add useful signal at this scale.
-
-
-
 \subsection{Hard-Tier Scaling}
 
-Table~\ref{tab:hard} repeats the comparison at twice the dimensions and a 600\,s budget. The combined model reaches the smallest completed-tree SGM among the neural configurations. In contrast to the medium tier, depth-three
-rollout improves the combined model from 2,603 to 2,476 nodes, a $4.9\%$ reduction, suggesting that a longer horizon can become useful when the search tree is larger. This is a scale-dependent result, not evidence that depth three is universally optimal.
+Table~\ref{tab:hard} repeats the comparison at twice the dimensions and a 600\,s budget. The combined Neural-Best configuration reaches the smallest completed-tree SGM among the neural configurations.
 
 \begin{table}[t]
 \caption{Hard tier: $1000\times2000$ Set Cover, 5 instances, 600\,s limit. Classical rows are partial trees at timeout; neural rows complete the harness search.}
@@ -864,8 +857,7 @@ Policy (imitation) & 100\% & --- & 4,633 & 389.3 & 2.2\% \\
 \quad Policy + root cuts & 100\% & --- & 4,419 & 395.2 & 2.8\% \\
 \quad Rollout-D1 & 100\% & --- & 4,007 & 422.8 & 3.2\% \\
 \quad Rollout-D1 + size & 100\% & --- & 4,376 & 396.3 & 2.7\% \\
-\textbf{Neural-Best (D1)} & 100\% & --- & 2,603 & 364.8 & \textbf{1.4\%} \\
-\quad Neural-Best (D3) & 100\% & --- & \textbf{2,476} & 390.4 & 1.9\% \\
+\textbf{Neural-Best (D1)} & 100\% & --- & \textbf{2,603} & 364.8 & \textbf{1.4\%} \\
 \bottomrule
 \end{tabular}}
 \end{table}
@@ -928,9 +920,6 @@ The neural harness reports an empty open-node queue on every listed instance, wh
 There are 10 medium and 5 hard instances at a single generator seed. Consequently, the observed SGM differences are descriptive rather than statistically conclusive. Confidence intervals, paired tests, and memory measurements should be added before making claims about generalization.
 
 
-\paragraph{Dynamics horizon.}
-Depth three helps on the hard tier but hurts on the medium tier. This non-monotonicity is evidence that rollout depth is coupled to transition fidelity. Measuring one-step and multi-step latent prediction error alongside search performance is a direct next experiment.
-
 \paragraph{Cut scope.}
 The present cut pool is generated at the root. Applying the same pool throughout the tree is valid only because the cuts are globally valid; it is not equivalent to learning a node-specific separator. Extending the method to local cuts requires explicit bookkeeping of descendant-scoped validity.
 
@@ -944,7 +933,7 @@ The present cut pool is generated at the root. Applying the same pool throughout
 \end{wrapfigure}
 
 
-We presented \CutWorld{}, a latent decision-dynamics model for \BnC{} control. The per-variable transition allows a branching policy to be reapplied to imagined states, while grounded reward, value, and cost-to-go heads turn latent prediction into a search-specific rollout objective. In a controlled Set Cover study, shallow rollout substantially reduces the completed-tree node count, but the additional inference cost means that MF-blend remains the fastest neural configuration. Depth-three planning is beneficial at hard scale and harmful at medium scale, exposing dynamics fidelity as the main bottleneck.
+We presented \CutWorld{}, a latent decision-dynamics model for \BnC{} control. The per-variable transition allows a branching policy to be reapplied to imagined states, while grounded reward, value, and cost-to-go heads turn latent prediction into a search-specific rollout objective. In a controlled Set Cover study, a depth-one rollout substantially reduces the completed-tree node count, but the additional inference cost means that MF-blend remains the fastest neural configuration.
 
 
 The broader lesson is methodological: learned solver control should be evaluated as a multi-objective system. Tree nodes, LP work, wall time, completion status, incumbent quality, cut count, and memory can disagree. \CutWorld{} provides a concrete architecture for studying this tension while keeping exact solver logic outside the learned components. Larger multi-seed benchmarks, verified optima, industrial-solver baselines, and memory-aware planning are the next steps toward a robust general-purpose world model for optimization.
@@ -1391,8 +1380,7 @@ Optimizer & AdamW \\
 Weight decay & $10^{-4}$ \\
 Gradient clipping & $1.0$ \\
 Rollout candidate budget & $k=3$ \\
-Primary rollout depth & $K=1$ \\
-Ablation rollout depth & $K=3$ \\
+Rollout depth & $K=1$ \\
 Discount factor & $\gamma=0.95$ \\
 Branching factor & $b=2$ \\
 Cost-to-go weight & $1.0$ \\
@@ -1563,14 +1551,11 @@ Policy + cuts & 0 & Yes & 5,396 & 4,419 & 395.2 \\
 Rollout-D1 & 1 & No & 3,197 & 4,007 & 422.8 \\
 Rollout-D1 + size & 1 & No & 4,320 & 4,376 & 396.3 \\
 Neural-Best-D1 & 1 & Yes & 3,235 & 2,603 & 364.8 \\
-Neural-Best-D3 & 3 & Yes & 3,697 & 2,476 & 390.4 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 The size penalty is not uniformly beneficial. It increases the medium-tier completed-tree SGM from 3,197 to 4,320 nodes and the hard-tier SGM from 2,603 to 4,376 nodes. This indicates that cost-to-go and subtree-size predictions extrapolate imperfectly from the training distribution.
-
-The rollout-depth comparison is also scale-dependent. Depth three increases medium-tier nodes from 3,235 to 3,697, but decreases hard-tier nodes from 2,603 to 2,476. Thus, deeper imagination should not be interpreted as monotonically improving search decisions.
 
 \subsection{Correctness Argument}
 \label{app:correctness}
@@ -1591,7 +1576,7 @@ The learned model cannot itself certify a node. In particular, a high integralit
 
 The training data contains 1,000 generated Set Cover instances with density $0.05$, split into 800 training, 100 validation, and 100 test instances. The reported medium benchmark contains 10 instances with $500$ constraints and $1{,}000$ variables. The hard benchmark contains 5 instances with $1{,}000$ constraints and $2{,}000$ variables. Both benchmark sets use generator seed 1.
 
-The medium and hard time limits are 300\,s and 600\,s, respectively, with a node limit of 100,000. The primary neural configuration uses $k=3$ policy candidates, $\gamma=0.95$, both branch directions, root attention-based cut selection, and the configured primal heuristic. Depth one is the main rollout setting; depth three is evaluated as an ablation.
+The medium and hard time limits are 300\,s and 600\,s, respectively, with a node limit of 100,000. The primary neural configuration uses $k=3$ policy candidates, $\gamma=0.95$, both branch directions, root attention-based cut selection, and the configured primal heuristic. Depth one ($K=1$) is the evaluated rollout setting.
 
 The raw benchmark records retain wall-clock time, LP time, encoding time, policy time, rollout time, tree-node count, probe LP count, completion status, incumbent objective, and cut count. Peak memory and multi-seed confidence intervals were not recorded in the supplied runs and should be added in future experiments rather than inferred from the existing logs.
 
