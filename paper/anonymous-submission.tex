@@ -181,37 +181,18 @@ selection, and node ordering from a single latent.
 % -----------------------------------------------------------------------
 \section{Background and Problem Formulation}
 
-A (binary) Mixed-Integer Program minimizes a linear objective over integer
-variables subject to linear constraints,
-\begin{equation}
-  \min_{x}\ c^\top x \quad \text{s.t.}\quad Ax \ge b,\quad x \in \{0,1\}^n,
-\end{equation}
-with $c\in\mathbb{R}^n$, $A\in\mathbb{R}^{m\times n}$, $b\in\mathbb{R}^m$.
-Set Cover is the case $A\in\{0,1\}^{m\times n}$, $b=\mathbf{1}$.
+A (binary) Mixed-Integer Program minimizes $c^\top x$ subject to $Ax\ge b$,
+$x\in\{0,1\}^n$. Set Cover is the case $A\in\{0,1\}^{m\times n}$,
+$b=\mathbf{1}$. Branch-and-Cut solves an LP relaxation at each node; if
+fractional it either adds a valid cut $\alpha^\top x\ge\beta$ or branches on a
+fractional variable $x_j$, creating subproblems $x_j{=}0$ and $x_j{=}1$.
 
-Branch-and-Cut solves the LP relaxation at each node; if the solution is
-fractional it either adds valid cutting planes $\alpha^\top x \ge \beta$ that
-tighten the relaxation, or branches on a fractional variable $x_j$ into the
-subproblems $x_j=0$ and $x_j=1$. The number of nodes explored before optimality
-is proved is governed by these two choices.
-
-We model the search as an MDP $(\mathcal{S},\mathcal{A},P,R,\gamma)$: a state
-$s_t$ is a search node (its LP relaxation as a constraint-variable graph); an
-action $a_t$ selects a fractional variable to branch on or a cut to add; the
-transition $P$ is the solver's deterministic response (child LPs, tightened
-relaxation); and the per-step reward $r_t$ is the dual-bound improvement, a
-dense proxy for progress. The ultimate objective is to prove optimality in as
-few explored nodes as possible.
-
-The transition $P$ is realized by the solver itself, solving child LPs and
-re-optimizing, so evaluating the downstream effect of an action costs as much as
-taking it, which is why prior learned policies avoid look-ahead. CutWorld's
-central idea is to learn a latent surrogate for $P$: an encoder maps states to a
-latent, and a learned dynamics model predicts how that latent transitions under
-an action, so a decision's consequences can be \emph{imagined} without invoking
-the solver. This turns look-ahead from an expensive oracle into a cheap forward
-pass, and the reward and node-count signals above become the learning targets for
-the model's reward and cost-to-go heads (Section~\ref{sec:method}).
+We model the search as an MDP: a state $s_t$ is a search node; an action $a_t$
+branches on a variable or adds a cut; the reward $r_t$ is the dual-bound
+improvement. Evaluating the true transition requires solving child LPs, so
+prior methods avoid look-ahead. CutWorld learns a latent surrogate: an encoder
+maps $s_t$ to a latent, and a dynamics model predicts the transition without
+invoking the solver, turning look-ahead into a cheap forward pass.
 
 \label{sec:exactness}
 \begin{remark}[Exactness]
@@ -766,16 +747,6 @@ their combination is what drives the solution-quality recovery.
 
 \subsection{Discussion}
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=0.85\columnwidth]{plot4_rollout_vs_policy}
-\caption{Per-instance B\&B node count: Rollout-D1 vs.\ Policy (imitation
-baseline). Each point is one benchmark instance; points below the diagonal
-indicate rollout reduces branching nodes. The inset reports the mean
-node-count reduction: $43.7\%$ on medium tier, $13.4\%$ on hard tier,
-$33.6\%$ overall.}
-\label{fig:rollout_vs_policy}
-\end{figure}
 
 \textbf{Termination is the primary gain.}
 Every neural variant exhausts its search tree on $100\%$ of instances at both tiers; every classical
