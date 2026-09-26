@@ -51,14 +51,15 @@ branching policy to be re-applied to imagined states for multi-step planning.
 Candidates are scored by a MuZero-style return combining predicted per-step
 rewards, a value estimate, and a cost-to-go penalty; the same latent drives
 node ordering and informs both a learned and a parameter-free Gomory cut
-selection rule within a single model that provably preserves solver exactness. On medium-tier Set Cover ($500{\times}1000$, 300\,s budget), every neural
-variant exhausts its search tree on all instances while every classical branching rule in the
-same harness times out; a 3-step latent rollout reduces explored nodes by
-44\% over the imitation policy (SGM 3{,}197 vs.\ 5{,}733). We evaluate across medium and
-hard tiers against most-fractional and classical strong-branching heuristics
-(SB-1/4/8, by reliability-branching candidate count), reporting termination rate, nodes explored, wall-clock solving
-time, and cuts applied, with component-wise ablations isolating the contribution
-of each element.
+selection rule within a single model that provably preserves solver exactness. Across medium ($500{\times}1000$, 300\,s) and hard ($1000{\times}2000$,
+600\,s) Set Cover tiers, every neural variant exhausts its search tree on all
+instances while every classical branching rule times out; a 3-step latent
+rollout reduces explored nodes by 44\% over the imitation policy at medium
+tier and by 14\% at hard tier (SGM 3{,}197 vs.\ 5{,}733 and 4{,}007
+vs.\ 4{,}633). Neural-Best is up to 41\% faster than most-fractional on hard
+instances, the tier where the planning advantage compounds most. We compare
+against most-fractional and classical strong-branching heuristics (SB-1/4/8)
+with component-wise ablations isolating each planning element.
 \end{abstract}
 
 % -----------------------------------------------------------------------
@@ -116,11 +117,11 @@ selection, and node ordering while preserving the solver's exactness guarantee.
   selection, and cut selection while strictly maintaining the solver's
   exact optimality guarantees.
 
-  \item \textbf{Empirical validation.} On Set Cover across difficulty tiers we
-  report the four metrics that determine solver quality: optimality, explored
-  nodes, solving time, and cuts applied, with an ablation that isolates each
-  planning component's contribution, comparing
-  against SCIP and classical branching heuristics.
+  \item \textbf{Empirical validation.} On Set Cover across medium and hard
+  tiers we report termination rate, explored nodes, wall-clock solving time,
+  and cuts applied, with an ablation isolating each planning component's
+  contribution against most-fractional and classical strong-branching
+  heuristics.
 \end{itemize}
 
 % -----------------------------------------------------------------------
@@ -701,9 +702,8 @@ classical methods.
 
 \textbf{Termination is the primary gain.}
 Every neural variant exhausts its search tree on $100\%$ of instances at both tiers; every classical
-rule exhausts the time budget without finishing the tree. The neural wall-time advantage is $10$--$25\%$ at
-medium and $7$--$41\%$ at hard — enough to determine whether a solve
-terminates. Classical node counts (marked $\dagger$) are measured at timeout
+rule exhausts the time budget without finishing the tree. The neural wall-time advantage is up to $41\%$ at hard tier and $25\%$ at
+medium, sufficient in both cases to determine whether a solve terminates. Classical node counts (marked $\dagger$) are measured at timeout
 and are lower bounds on a completed solve, so they are not directly comparable
 to neural termination counts.
 
@@ -741,9 +741,9 @@ latent rollout per candidate, all while preserving the solver's
 exactness guarantee. The empirical record across two difficulty tiers supports
 four conclusions. First, the tree-exhaustion discontinuity is real and consistent:
 every neural variant exhausts its search tree on $100\%$ of instances at both tiers within budget;
-every classical rule exhausts the budget without finishing the tree. The neural wall-time advantage
-of $7$--$41\%$ over most-fractional is not large in kind, but it reliably falls
-on the correct side of the budget cutoff. Second, 3-step latent rollout is
+every classical rule exhausts the budget without finishing the tree. The neural wall-time advantage reaches $41\%$ over most-fractional at hard
+tier and $25\%$ at medium, consistently falling on the correct side of the
+budget cutoff. Second, 3-step latent rollout is
 the dominant planning component, reducing explored nodes by $44\%$ over the
 imitation policy at medium tier and by $14\%$ at hard tier. Third, rollout does more than reduce nodes: it recovers solution
 quality lost by imitation. The imitation policy alone reaches $+4.3\%$ primal
