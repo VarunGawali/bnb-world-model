@@ -573,26 +573,6 @@ these cuts hold for \emph{every} integer-feasible solution and are safely
 inherited by all descendants of the node --- genuine Branch-and-Cut rather than
 cut-and-branch.
 
-A pointer head scores each candidate cut $\ell$ against the node latent. Each
-cut is represented by a 6-dimensional feature vector $\phi_\ell$ encoding
-violation, efficacy, density, parallelism, objective cutoff, and support
-fraction:
-\begin{equation}
-  \rho_\ell = w^\top\tanh\!\bigl(W_k\,\mathrm{MLP}(\phi_\ell)+W_z z\bigr),
-\end{equation}
-and cuts with $\sigma(\rho_\ell)>\tau$ are added, replacing fixed heuristics
-such as maximum violation. As a parameter-free fallback, cuts and constraints
-are each embedded as coefficient-weighted sums of $\{h_i\}$ over their
-variable support, and cuts are scored by their cross-attention alignment with
-constraints that are simultaneously loose and connected to fractional variables
---- a geometrically grounded selection rule that exploits the encoder's
-representations without any additional learned parameters. Training the
-pointer head requires cut-quality labels produced by an external solver, which
-are not always available at the scale needed for Phase~5; the reported results
-therefore use the attention rule as the deployed selection mechanism; the
-learned pointer head is an ablation evaluated via the gap columns of
-Tables~\ref{tab:main} and~\ref{tab:hard}.
-
 \subsection{Learning Objectives}
 \label{sec:objectives}
 
