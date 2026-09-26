@@ -1353,13 +1353,12 @@ We have taken several steps to support reproducibility of our work. An anonymize
 
 The encoder uses a hidden dimension $d=128$, three GATv2 layers, and four attention heads. The latent dynamics model uses four causal Transformer layers, four attention heads, a feed-forward width of $4d=512$, and a maximum sequence length of 512. The optimizer is AdamW with weight decay $10^{-4}$, gradient clipping at 1.0, cosine learning-rate schedules, and automatic mixed precision on GPU.
 
-Training follows a five-stage curriculum:
+Training follows a four-stage curriculum:
 \begin{enumerate}
     \item policy imitation;
     \item value prediction;
     \item latent dynamics and overshooting;
-    \item joint fine-tuning;
-    \item root cut selection.
+    \item joint fine-tuning.
 \end{enumerate}
 Each stage is warm-started from the preceding checkpoint. The reported checkpoint is \texttt{checkpoints/highs\_retrain/phase4\_final.pt}.
 
@@ -1480,11 +1479,9 @@ We additionally train on model-generated multi-step predictions:
   \left\|\widehat z_{t+k}-z_{t+k}\right\|_2^2 .
   \label{eq:overshoot}
 \end{equation}
-The integrality and cut objectives are weighted binary cross-entropies,
+The integrality objective is a weighted binary cross-entropy,
 \begin{equation}
-  \mathcal{L}_{\mathrm{int}}=\operatorname{BCE}^{+}(p_{\mathrm{leaf}},y_{\mathrm{leaf}}),
-  \qquad
-  \mathcal{L}_{\mathrm{cut}}=\operatorname{BCE}^{+}(\rho,y_{\mathrm{cut}}).
+  \mathcal{L}_{\mathrm{int}}=\operatorname{BCE}^{+}(p_{\mathrm{leaf}},y_{\mathrm{leaf}}).
   \label{eq:bce}
 \end{equation}
 The joint objective used in the reported checkpoint is
@@ -1499,7 +1496,7 @@ The joint objective used in the reported checkpoint is
   +0.5\mathcal{L}_{\mathrm{dyn}},
   \label{eq:joint-loss}
 \end{equation}
-where $\mathcal{L}_{\mathrm{cons}}$ aligns value predictions on real and imagined states. Training proceeds through policy, value, dynamics, joint, and cut-selection stages, warm-starting each stage from the previous checkpoint.
+where $\mathcal{L}_{\mathrm{cons}}$ aligns value predictions on real and imagined states. Training proceeds through the four stages listed above, warm-starting each stage from the previous checkpoint.
 
 \subsection{Evaluation Metrics}
 \label{app:metrics}
