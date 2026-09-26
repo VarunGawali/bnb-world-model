@@ -519,52 +519,31 @@ Value-consistency$^\dagger$ & MSE & $\|V(\tilde z)-V(z)\|^2$, keeping $V$ reliab
 
 \subsection{Setup}
 
-We evaluate on Set Cover instances across easy, medium, and hard difficulty
-tiers, collecting strong-branching trajectories for training. The medium and
-hard held-out sets contain 10 and 5 instances respectively; instance counts
-are small by design since each requires a complete B\&B solve to termination
-under a tight budget, and full details are given in Appendix~\ref{app:hyper}. We compare against
-a spectrum of branching rules: the trivial \emph{most-fractional} heuristic and
-\emph{classical strong branching} with reliability-branching candidate counts of
-1, 4, and 8 (SB-1/4/8). We also report the \emph{imitation} policy and several ablation
-variants of CutWorld. We report four metrics per method on a common held-out
-instance set: the fraction of instances \emph{terminated} within the time limit
-(neural methods exhaust their search tree; classical methods time out without
-exhausting theirs), the Shifted Geometric Mean (SGM) of explored \emph{nodes}
-(shift $\delta_n=10$) and wall-clock \emph{time} (shift $\delta_t=1$), and the
-number of \emph{cutting planes} applied. Termination rate is reported first
-because a reduction in nodes is only a genuine improvement when the solver
-finishes its tree: a method that is slow per node can appear to explore fewer
-nodes merely by timing out. On tiers where baselines time out, SGM nodes are
-computed at the time limit (marked $\dagger$).
+We evaluate on Set Cover instances across easy, medium, and hard tiers,
+collecting strong-branching trajectories for training (full instance and
+hyperparameter details in Appendix~\ref{app:hyper}). Baselines are
+most-fractional and classical strong branching with reliability-branching
+candidate counts of 1, 4, and 8 (SB-1/4/8), plus the imitation policy and
+CutWorld ablation variants. Metrics: termination rate (neural methods exhaust
+their search tree; classical time out), SGM nodes (shift $\delta_n{=}10$),
+SGM wall time (shift $\delta_t{=}1$), and cutting planes. Termination is
+reported first because node counts are only comparable across methods that
+both finish their trees; classical SGM nodes are measured at the time limit
+and marked $\dagger$.
 
 \subsection{Training Details}
 \label{sec:training}
 
-The objectives of Section~\ref{sec:objectives} are optimized with AdamW
-(weight decay $10^{-4}$, gradient clipping at 1.0, cosine learning-rate
-schedule, mixed precision on GPU) in a four-stage curriculum, each stage
-warm-started from the previous stage's checkpoint and early-stopped on its own
-validation metric: (1)~\emph{policy imitation}, training the encoder and
-policy head jointly (LR $10^{-3}$, up to 30 epochs, patience 6, selected by
-validation top-1 accuracy); (2)~\emph{value}, training only the value head
-with the encoder and policy frozen (LR $5{\times}10^{-4}$, up to 25 epochs,
-patience 6, selected by validation Spearman correlation); (3)~\emph{dynamics},
-training the dynamics model and its two auxiliary heads with the encoder
-frozen, under the overshoot curriculum that ramps the unroll horizon from 1 to
-3 steps over the first 60\% of training (LR $5{\times}10^{-4}$, up to 60
-epochs, patience 12 to absorb the transient loss increase as the horizon
-grows, selected by validation dynamics loss); and (4)~\emph{joint fine-tuning}
-of every component (LR $10^{-4}$, up to 25 epochs, patience 6, selected by
-validation top-1 accuracy) under the weighted objective
+Training uses AdamW with cosine LR schedule and mixed precision. The
+curriculum has four stages, each warm-started from the previous checkpoint and
+early-stopped on its own validation metric: (1)~\emph{policy imitation},
+(2)~\emph{value}, (3)~\emph{dynamics} with a latent-overshooting horizon
+ramped from 1 to 3 steps, and (4)~\emph{joint fine-tuning} under
 \begin{equation}
   L = L_{\pi} + 0.5\,L_V + 0.1\,L_{\mathrm{int}} + 0.1\,L_{\mathrm{consist}}
-      + 0.3\,L_S + 0.5\,L_C,
+      + 0.3\,L_S + 0.5\,L_C.
 \end{equation}
-combining the policy, value, integrality, value-consistency, subtree-size, and
-cost-to-go losses. Class imbalance in the integrality label is corrected with
-a positive-class weight equal to the negative-to-positive ratio. Full
-hyperparameters are listed in Appendix~\ref{app:hyper}.
+Full hyperparameters are in Appendix~\ref{app:hyper}.
 
 \subsection{Ablation}
 
@@ -579,14 +558,6 @@ rollout with a size penalty, and the full model (rollout + cuts).
 Table~\ref{tab:main} reports the medium tier ($500\times1000$ Set Cover,
 $300$\,s limit). All methods share the same B\&B harness; only the branching
 rule and cut policy differ.
-
-\textbf{Termination is the primary separation.}
-Every neural variant exhausts its search tree on $100\%$ of instances; all four classical
-rules exhaust the time budget. The classical node counts (marked $\dagger$) are
-measured at the time limit and are lower bounds on a completed solve, so they
-are not directly comparable to neural termination counts. Neural solves finish
-in SGM $218$--$271$\,s against the $300$\,s wall, a consistent efficiency
-advantage that, at this budget, determines whether a solve terminates.
 
 \textbf{Rollout drives the node reduction.}
 3-step rollout explores $44\%$ fewer nodes than imitation alone ($3{,}197$
@@ -721,11 +692,9 @@ medium tier ($5{,}396$ vs.\ $5{,}733$), consistent with the root LP already
 being relatively tight on these instances. The more consequential effect is on
 \emph{solution quality}: combining cuts with rollout (Neural-Best)
 reduces the primal gap from $5.2\%$ (Rollout alone) to $1.9\%$ at medium
-tier and from $3.2\%$ to $1.4\%$ at hard tier, closing most of the distance to
-classical methods that never terminate. This confirms that root cuts and
-rollout serve complementary roles, rollout shrinks the tree, cuts tighten
-the LP bound and steer the solver toward better integer solutions, and that
-their combination is what drives the solution-quality recovery.
+tier and from $3.2\%$ to $1.4\%$ at hard tier — rollout shrinks the tree,
+cuts tighten the LP bound, and together they close most of the gap to
+classical methods.
 
 \subsection{Discussion}
 
@@ -754,22 +723,13 @@ The subtree-size head reverses its easy-tier gain at medium
 and marks a concrete limit of the current curriculum.
 
 \textbf{Termination criterion and optimality.}
-Neural methods terminate by exhausting the search tree rather than proving a
-dual-bound gap of zero. In practice, LP-infeasible nodes are silently pruned
-from the heap, which can empty the heap before the tree is truly complete.
-The 100\% termination rate should therefore be read as a statement about
-tree-traversal efficiency under the budget, not as a claim of proven optimality.
-The gap column (footnote $\ddagger$) reports solution quality relative to the
-best feasible solution found by any method within the same time budget; no
-verified optima exist for these instances within the evaluated time limits.
-
-\textbf{Transformer vs.\ SSM.}
-Unlike \citet{zhang2026mambabranchin}, which autoregressively models long
-realized branching histories (hundreds of steps), CutWorld's DynamicsTransformer
-predicts a single next-latent transition with trajectory context capped at 512
-tokens. This is a short, fixed-horizon regression, not long-horizon generation,
-and a causal Transformer fits the task well. An SSM replacement remains a
-worthwhile ablation at longer trajectories.
+Neural methods terminate by exhausting the search tree, not by proving a
+dual-bound gap of zero; LP-infeasible nodes are silently pruned, so the heap
+can empty before the tree is truly complete. The 100\% termination rate
+reflects tree-traversal efficiency, not proven optimality. The gap column
+($\ddagger$) is relative to the best feasible solution found by any method
+within the same time budget; no verified optima exist within the evaluated
+limits.
 
 % -----------------------------------------------------------------------
 \section{Conclusion}
