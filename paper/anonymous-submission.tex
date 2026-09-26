@@ -119,8 +119,8 @@ preserved.
   \item \textbf{A latent dynamics model for Branch-and-Cut.} We learn a
   solver's decision dynamics, so that branching and cutting are \emph{planned
   in imagination} rather than chosen by fixed heuristics, replacing the child
-  LP solves that strong branching requires with a single learned latent
-  transition per candidate.
+  LP solves that strong branching requires with a short latent rollout
+  per candidate.
 
   \item \textbf{Unified control with exactness guarantees.} We show that a
   single latent model can simultaneously drive variable branching, node
@@ -203,7 +203,7 @@ bipartite representation of \citet{gasse2019exact} with a learned latent
 forward model: rather than ranking candidates by a static score or paying for
 explicit LP look-ahead, we \emph{imagine} the downstream consequences a decision
 induces and recover part of strong branching's look-ahead signal at the cost
-of a single cheap latent transition per candidate. A single such model drives
+of a short latent rollout per candidate. A single such model drives
 branching, cut selection, and node ordering, whereas prior methods learn each
 decision in isolation.
 
@@ -863,8 +863,8 @@ provided as supplementary material.
 
 We have presented CutWorld, a latent dynamics model for Branch-and-Cut that
 plans branching, node selection, and root Gomory cut selection jointly in latent
-space, replacing the child LP solves that strong branching requires with a single
-cheap learned transition per candidate, all while preserving the solver's
+space, replacing the child LP solves that strong branching requires with a short
+latent rollout per candidate, all while preserving the solver's
 exactness guarantee. The empirical record across two difficulty tiers supports
 four conclusions. First, the tree-exhaustion discontinuity is real and consistent:
 every neural variant exhausts its search tree on $100\%$ of instances at both tiers within budget;
