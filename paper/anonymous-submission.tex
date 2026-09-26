@@ -355,7 +355,7 @@ Assume that (i) every branching variable is selected from the current fractional
 \node[small, right=5mm of leafchk] (confchk) {$\pi$ confident?\\{\scriptsize yes: argmax $\pi$}};
 \node[small, right=5mm of confchk] (topk) {Top-$K$\\candidates};
 \node[small, right=4mm of topk, minimum width=26mm] (roll)
-  {Rollout:\\$\sum\gamma^{j-1}\hat r_j + \gamma^{K-1}V$\\$- w_cC$};
+  {Rollout:\\$\sum\gamma^{j-1}\hat r_j + \gamma^{K}V$\\$- w_cC$};
 \node[small, right=5mm of roll] (argmax) {$\arg\max$\\$\to$ branch var};
 
 \draw[arr] (pscore) -- (leafchk);
@@ -940,7 +940,7 @@ The present cut pool is generated at the root. Applying the same pool throughout
     \centering
     \includegraphics[width=0.45\columnwidth]{plot4_rollout_vs_policy}
     \caption{Per-instance tree-node comparison between Rollout-D1 and imitation. Points below the diagonal indicate fewer nodes under rollout.}
-    \label{fig:profiles}
+    \label{fig:scatter}
 \end{wrapfigure}
 
 
