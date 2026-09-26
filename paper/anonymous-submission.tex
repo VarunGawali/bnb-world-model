@@ -832,91 +832,38 @@ $33.6\%$ overall.}
 \label{fig:rollout_vs_policy}
 \end{figure}
 
-The results above map onto four takeaways about what the model does and does not
-yet achieve.
+\textbf{Termination is the primary gain.}
+Every neural variant closes $100\%$ of instances at both tiers; every classical
+rule exhausts the budget. The neural wall-time advantage is $10$--$25\%$ at
+medium and $7$--$41\%$ at hard — enough to determine whether a solve
+terminates. Classical node counts (marked $\dagger$) are measured at timeout
+and are lower bounds on a completed solve, so they are not directly comparable
+to neural termination counts.
 
-\textbf{Termination is the primary gain; node counts must be read carefully.}
-At both medium tier ($300$\,s) and hard tier ($600$\,s) every neural variant
-terminates on $100\%$ of instances, while every classical rule exhausts the
-budget --- a $100\%$ vs.\ $0\%$ solve-rate discontinuity across both tiers. The neural wall-time advantage over MF is
-$10$--$25\%$ at medium and $7$--$41\%$ at hard; what makes this consequential
-is that it falls on the correct side of the budget cutoff. Classical node counts
-in Tables~\ref{tab:main} and~\ref{tab:hard} (left column, measured at timeout)
-are lower bounds on what a completed solve would explore; SB-8's $2{,}710$
-(medium) and $1{,}096$ (hard) look competitive with neural counts in the same
-column only because they are incomplete counts from a timed-out run. Putting the
-two blocks in separate columns is therefore not a formatting choice but a
-semantic one.
+\textbf{Rollout reduces nodes; rollout + cuts recover solution quality.}
+Depth-1 rollout cuts SGM nodes by $44\%$ vs.\ imitation alone ($3{,}197$
+vs.\ $5{,}733$ at medium). Imitation-only branching (Policy) finds worse
+integer solutions than classical methods despite fewer nodes: gap $+4.3\%$
+(medium) and $+2.2\%$ (hard) vs.\ MF's $+1.2\%$ and $+1.0\%$. Neural-Best
+(rollout + cuts) closes this to $+1.9\%$ / $+1.4\%$ — the best neural
+configuration and within $<1$\,pp of classical methods that do not terminate.
+Rollout thus serves two roles: fewer branching decisions \emph{and} better
+integer solutions.
 
-\textbf{Rollout and cuts are complementary.} At medium tier, depth-1 rollout
-reduces SGM nodes by $44\%$ ($3{,}197$ vs.\ $5{,}733$); this is the largest
-single-step gain in the ablation ladder. Adding root Gomory cuts (Neural-Best,
-$3{,}235$ nodes) does not reduce branching nodes further but tightens the LP
-bound at the root, cutting wall time. Cuts alone, without rollout, yield only
-$-6\%$ ($5{,}396$ nodes), consistent with root cuts having limited leverage when
-the LP relaxation is already relatively tight. At hard tier the pattern
-persists: Neural-Best ($2{,}603$) improves on both MF-Blend-20 ($2{,}736$) and
-Rollout-d1 ($4{,}007$), confirming that blending rollout-scored branching with
-learned cut selection at the root transfers across scale.
+\textbf{Depth and size head have scale-dependent limits.}
+Depth-3 rollout regresses at medium ($+14\%$ nodes) but helps at hard ($-4.9\%$
+vs.\ depth-1), suggesting dynamics fidelity — not rollout depth per se — is the
+binding constraint. The subtree-size head reverses its easy-tier gain at medium
+($+35\%$) and hard ($+9\%$): it extrapolates beyond its training distribution
+and marks a concrete limit of the current curriculum.
 
-\textbf{The subtree-size head does not generalise beyond easy tier.}
-Rollout-d1+Size reverses its easy-tier gain at both medium ($4{,}320$,
-$+35\%$ over Rollout-d1) and hard tier ($4{,}376$, $+9\%$). The head was
-trained on trajectories from small trees and is extrapolating beyond its
-distribution; this is the sharpest evidence that the training distribution is a
-binding constraint for the planning components, and expanding it is the most
-direct path to generalisation.
-
-\textbf{Deeper rollout reverses direction across scale.}
-At medium tier, depth-3 rollout increases nodes by $+14\%$ ($3{,}697$ vs
-$3{,}197$), suggesting that cumulative dynamics error outweighs the planning
-benefit on trees of moderate size. At hard tier the ranking reverses: Neural-Best
-(d3) reaches $2{,}476$ nodes vs $2{,}603$ for the depth-1 counterpart
-($-4.9\%$) and $4{,}007$ for rollout-d1 alone ($-38\%$). The most plausible
-explanation is a scale threshold: on larger trees the per-step fidelity of the
-dynamics model --- even if imperfect --- provides a richer planning signal than
-a single-step value estimate, and the gain from better candidate selection
-outweighs the compounding approximation error. This suggests that dynamics
-fidelity, not rollout depth \emph{per se}, is the binding constraint; improving
-multi-step accuracy should unlock further gains. The gap-column evidence in Tables~\ref{tab:main} and~\ref{tab:hard} provides
-parallel support: latent evaluation is most reliable over a short horizon when
-the candidate set is small, but the benefit of depth grows as the branching
-factor and tree depth increase.
-
-\textbf{Rollout recovers solution quality lost by imitation.}
-The gap columns of Tables~\ref{tab:main} and~\ref{tab:hard} reveal a cost that
-node counts alone do not show: imitation-only branching (Policy) finds worse
-integer solutions than classical methods despite terminating faster, because it
-prunes aggressively and commits to high-objective integer solutions early. At
-medium tier, Policy reaches $+4.3\%$ vs best-known while MF is $+1.2\%$; at
-hard tier, Policy is $+2.2\%$ while MF is $+1.0\%$. The full model
-(Neural-Best, rollout + cuts) substantially closes this gap: at medium tier it
-reaches $+1.9\%$ --- the best among all neural configurations and within $0.8$
-pp of MF --- and at hard tier $+1.4\%$ (d1) and $+1.9\%$ (d3),
-within $0.7$ pp of the best classical method, which does not terminate. This is
-direct evidence that rollout serves two distinct roles: it reduces the number of
-branching decisions (fewer nodes) \emph{and} improves the quality of integer
-solutions the solver commits to, by evaluating each candidate against a richer
-signal than the current-node LP alone provides. A policy trained only on
-strong-branching imitation replicates the expert's \emph{selection rule} but
-cannot replicate its implicit reasoning about downstream search quality; rollout
-closes that gap.
-
-\textbf{On Transformer vs.\ SSM for latent dynamics.}
-A natural question is why CutWorld uses a causal Transformer rather than a
-Mamba/SSM backbone, given that \citet{zhang2026mambabranchin} explicitly choose
-Mamba over Transformer for branching because Transformers OOM at their target
-trajectory lengths and run 10--50$\times$ slower at inference. The key
-architectural difference is in the task: Mamba-Branching autoregressively models
-a \emph{long realized branching history} (sequences of hundreds of steps), which
-is where quadratic self-attention is prohibitive. CutWorld's DynamicsTransformer
-has a different job --- predicting a \emph{single} next-latent transition, with
-trajectory context used only for positional conditioning over a maximum of 512
-tokens. Single-step latent prediction is a short, fixed-horizon regression, not
-a long-horizon autoregressive generation task, and the causal Transformer's
-strong inductive bias for attending to relevant prior context at modest sequence
-lengths fits this use case well. An SSM replacement is a worthwhile future
-ablation, particularly at trajectory lengths exceeding the 512-token cap.
+\textbf{Transformer vs.\ SSM.}
+Unlike \citet{zhang2026mambabranchin}, which autoregressively models long
+realized branching histories (hundreds of steps), CutWorld's DynamicsTransformer
+predicts a single next-latent transition with trajectory context capped at 512
+tokens. This is a short, fixed-horizon regression, not long-horizon generation,
+and a causal Transformer fits the task well. An SSM replacement remains a
+worthwhile ablation at longer trajectories.
 
 \subsection{Reproducibility}
 
