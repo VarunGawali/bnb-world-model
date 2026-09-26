@@ -36,30 +36,30 @@
 \maketitle
 
 \begin{abstract}
-Modern Mixed-Integer Programming solvers rely on Branch-and-Cut, which must
-make sequential decisions: which variable to branch on, which cuts to add,
-which node to explore, at every step of an exponentially large search tree.
-Because each decision reshapes the subsequent search, methods that score
-candidates from the current node alone are blind to the very signal that makes
-their target expert, strong branching, effective. We present CutWorld, a latent dynamics model that learns to simulate the downstream consequences of
-Branch-and-Cut decisions in latent space, replacing expensive LP solves with a
-single cheap forward pass. Our model encodes each search node as a bipartite
-graph using a GATv2 network with learned cross-attention pooling, then rolls
-forward a causal Transformer to predict how both the global state and each
-variable's representation evolve under a candidate action, enabling the
-branching policy to be re-applied to imagined states for multi-step planning.
-Candidates are scored by a MuZero-style return combining predicted per-step
-rewards, a value estimate, and a cost-to-go penalty; the same latent drives
-node ordering and informs both a learned and a parameter-free Gomory cut
-selection rule within a single model that provably preserves solver exactness. Across medium ($500{\times}1000$, 300\,s) and hard ($1000{\times}2000$,
-600\,s) Set Cover tiers, every neural variant exhausts its search tree on all
-instances while every classical branching rule times out; a 3-step latent
-rollout reduces explored nodes by 44\% over the imitation policy at medium
-tier and by 14\% at hard tier (SGM 3{,}197 vs.\ 5{,}733 and 4{,}007
-vs.\ 4{,}633). Neural-Best is up to 41\% faster than most-fractional on hard
-instances, the tier where the planning advantage compounds most. We compare
-against most-fractional and classical strong-branching heuristics (SB-1/4/8)
-with component-wise ablations isolating each planning element.
+Branch-and-Cut solvers repeatedly choose a branching variable, a cutting plane,
+and an open search node. These choices reshape an exponentially large search
+tree, but standard learned branching rules score candidates only from the current
+relaxation. We present CutWorld, a latent decision-dynamics model that plans
+over candidate branching actions without solving their child linear programs.
+A bipartite GATv2 encoder maps the current relaxation to a global latent and
+per-variable embeddings. A causal Transformer then predicts the latent successor
+and its variable embeddings conditioned on a candidate and branch direction,
+allowing the policy to be re-applied to imagined states. We combine the
+resulting rollout value with predicted dual-bound progress and cost-to-go, and
+use the shared representation for node ordering and root Gomory-cut selection.
+Because the learned components only select among valid branches, globally valid
+cuts, and open-node orderings, they do not alter feasibility or bound tests.
+On fixed Set Cover benchmarks, neural configurations exhaust their search tree
+on $100\%$ of medium instances ($500{\times}1000$, 300\,s) and $100\%$ of hard
+instances ($1000{\times}2000$, 600\,s) in the same solver harness, while every
+classical rule times out. A 3-step latent rollout reduces the medium-tier
+shifted-geometric-mean node count by $44\%$ relative to imitation
+(SGM~$3{,}197$ vs.\ $5{,}733$); at hard scale, combining rollout and root cuts
+reaches SGM~$2{,}603$ nodes versus $4{,}633$ for imitation. We report
+termination rate, tree-node counts, wall-clock time, and cuts, and explicitly
+separate completed-tree measurements from timeout lower bounds. The benchmark
+is a controlled feasibility study; its small, single-seed evaluation does not
+establish statistical superiority over industrial MIP solvers.
 \end{abstract}
 
 % -----------------------------------------------------------------------
