@@ -576,41 +576,35 @@ cut-and-branch.
 \subsection{Learning Objectives}
 \label{sec:objectives}
 
-Each component has a supervised objective, optimized in the five-phase
-curriculum detailed in Section~\ref{sec:training}:
-\begin{itemize}
-  \item \textbf{Policy:} a convex combination
-  $\alpha\,\mathrm{CE}(\arg\max)+(1{-}\alpha)\,\mathrm{KL}(p_{\mathrm{SB}}\,\|\,\pi)$,
-  $\alpha=0.5$, of hard cross-entropy against the strong-branching argmax and a
-  soft KL term against $p_{\mathrm{SB}}=\mathrm{softmax}$ of the (per-node
-  standardized) strong-branching scores; the hard term anchors the top-1
-  choice while the soft term carries the full ranking signal.
-  \item \textbf{Value:} Huber loss against the normalized dual bound.
-  \item \textbf{Dynamics:} an MSE-plus-cosine loss on the one-step latent
-  prediction $z_{t+1}$; an analogous MSE-plus-cosine reconstruction loss on
-  $h_i^{\,t+1}$; Huber grounding losses on the two auxiliary heads $\hat{b}$
-  (normalized dual bound) and $\hat{r}$ (per-step reward); and a
-  \emph{latent-overshooting} loss that re-derives the same terms from the
-  model's own free-running predictions over a horizon ramped from 1 to 3 steps
-  across training, weighted by $1/k$, to curb compounding error.
-  \item \textbf{Cost-to-go:} Huber loss on $\log(1{+}(T{-}t))$, where the
-  target $T-t$ is the Monte-Carlo number of steps remaining in the trajectory.
-  \item \textbf{Subtree size:} Huber loss on $\log(1{+}\text{subtree size})$
-  from realized Branch-and-Cut traces; used during joint fine-tuning to shape
-  the rollout's size penalty rather than as a standalone solver-time signal.
-  \item \textbf{Integrality:} weighted binary cross-entropy against a
-  leaf/non-leaf label, with positive-class weight equal to the
-  negative-to-positive ratio.
-  \item \textbf{Value-consistency} (joint phase only): $\lVert
-  V(\tilde{z})-V(z)\rVert^2$, aligning the value head's output on the
-  dynamics-predicted latent $\tilde{z}$ to its output on the true encoder
-  latent $z$ for the same node, so $V$ stays reliable when queried on imagined
-  states during planning.
-  \item \textbf{Cutting-plane head:} weighted binary cross-entropy against a
-  label indicating whether a candidate cut was selected by an external solver
-  and improved the LP bound; positive-class weight equal to the
-  negative-to-positive ratio.
-\end{itemize}
+Table~\ref{tab:losses} summarises the supervised objective for each head;
+all are optimized in the five-phase curriculum of Section~\ref{sec:training}.
+
+\begin{table}[h]
+\centering
+\caption{Per-head training objectives.  BCE$^+$ = weighted binary
+cross-entropy with positive-class weight equal to the negative-to-positive
+ratio.  $\dagger$~Joint fine-tuning phase only.}
+\label{tab:losses}
+\setlength{\tabcolsep}{5pt}
+\small
+\begin{tabular}{llp{6.2cm}}
+\toprule
+\textbf{Head} & \textbf{Loss} & \textbf{Target / notes} \\
+\midrule
+Policy $\pi$ & $0.5\,\mathrm{CE}{+}0.5\,\mathrm{KL}$ &
+  CE against SB argmax; KL against $\mathrm{softmax}$ of standardized SB scores. \\
+Value $V$ & Huber & Normalized dual bound. \\
+Dynamics $z',h_i'$ & MSE\,+\,cosine & One-step latent / per-variable embeddings;
+  auxiliary Huber on $\hat{b},\hat{r}$; latent-overshooting over horizon
+  $1\!\to\!3$ (weight $1/k$). \\
+Cost-to-go $S$ & Huber & $\log(1{+}(T{-}t))$, Monte-Carlo steps remaining. \\
+Subtree size $C$ & Huber & $\log(1{+}\text{subtree size})$ from B\&C traces. \\
+Integrality $\iota$ & BCE$^+$ & Leaf / non-leaf label. \\
+Value-consistency$^\dagger$ & MSE & $\|V(\tilde z)-V(z)\|^2$, keeping $V$ reliable on imagined states. \\
+Cut head & BCE$^+$ & External-solver cut-selection label. \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % -----------------------------------------------------------------------
 \section{Experiments}
