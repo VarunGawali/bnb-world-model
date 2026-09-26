@@ -278,10 +278,10 @@ model \emph{select} among them rather than invent inequalities.
 \begin{figure*}[t]
 \centering
 \begin{tikzpicture}[
-  node distance=4mm and 6mm,
-  box/.style={draw, rounded corners, align=center, minimum height=8mm,
+  node distance=3mm and 4mm,
+  box/.style={draw, rounded corners, align=center, minimum height=7mm,
               inner sep=2pt, font=\footnotesize},
-  small/.style={draw, rounded corners, align=center, minimum height=7mm,
+  small/.style={draw, rounded corners, align=center, minimum height=6mm,
               inner sep=2pt, font=\scriptsize},
   lat/.style={align=center, font=\footnotesize},
   panel/.style={draw, dashed, rounded corners, inner xsep=4pt, inner ysep=7mm},
@@ -297,9 +297,9 @@ model \emph{select} among them rather than invent inequalities.
 \node[box] (inp) {B\&C node\\{\scriptsize bipartite graph}};
 \node[box, right=of inp] (enc) {GATv2 Encoder\\{\scriptsize +CrossAttnPool}};
 \node[lat, right=8mm of enc] (z) {$z,\{h_i\}$};
-\node[box, above right=3mm and 8mm of z, minimum width=32mm] (heads)
+\node[box, above right=3mm and 6mm of z, minimum width=28mm] (heads)
   {$\pi,V,S,C$ (heads)\\$\iota(\text{depth},n_{\text{frac}})$\ \ $\hat b,\hat r$};
-\node[box, below right=3mm and 8mm of z, minimum width=32mm] (dyn)
+\node[box, below right=3mm and 6mm of z, minimum width=28mm] (dyn)
   {Dynamics (Causal TF)\\{\scriptsize step$(z,a,\text{dir})\to z',h_i'$}};
 
 \draw[arr] (inp) -- (enc);
@@ -335,9 +335,8 @@ model \emph{select} among them rather than invent inequalities.
 \node[small, right=5mm of pscore] (leafchk) {$\iota$ leaf?\\{\scriptsize yes: argmax $\pi$}};
 \node[small, right=5mm of leafchk] (confchk) {$\pi$ confident?\\{\scriptsize yes: argmax $\pi$}};
 \node[small, right=5mm of confchk] (topk) {Top-$K$\\candidates};
-\node[small, right=5mm of topk, minimum width=30mm] (roll)
-  {Rollout each candidate:\\unroll dynamics, re-apply $\pi$\\
-   $\sum\gamma^{j-1}\hat r_j + \gamma^{K-1}V - w_cC$};
+\node[small, right=4mm of topk, minimum width=26mm] (roll)
+  {Rollout:\\$\sum\gamma^{j-1}\hat r_j + \gamma^{K-1}V$\\$- w_cC$};
 \node[small, right=5mm of roll] (argmax) {$\arg\max$\\$\to$ branch var};
 
 \draw[arr] (pscore) -- (leafchk);
@@ -350,25 +349,25 @@ model \emph{select} among them rather than invent inequalities.
 \node[ptitle] at (panelC.north west) {(c) Branch selection};
 
 % ---------- Cross-panel interconnections ----------
-\coordinate (rbus) at ($(panelC.east)+(7mm,0)$);
+\coordinate (rbus) at ($(panelC.east)+(4mm,0)$);
 \draw[reuse] (dyn.east) -- (dyn.east -| rbus)
              -- (latent.east -| rbus) -- (latent.east);
 \draw[reuse] (dyn.east) -| (rbus |- panelC.south) -- ++(0,-4mm) -| (roll.south);
 \node[font=\tiny, red!60!black, anchor=west] at ($(dyn.east -| rbus)+(0,3mm)$) {dyn.\ reused};
 
-\coordinate (lbus) at ($(panelA.west)+(-7mm,0)$);
+\coordinate (lbus) at ($(panelA.west)+(-5mm,0)$);
 \draw[feed] (z.west) -- (z.west -| lbus)
             -- (heur.west -| lbus) -- (heur.west);
 \draw[feed] (z.west -| lbus) -- (pscore.west -| lbus) -- (pscore.west);
 \node[font=\tiny, blue!55!black, anchor=east, rotate=90] at ($(lbus)+(0,-18mm)$) {$z,\{h_i\}$ feed};
 
-\coordinate (lbus2) at ($(panelA.west)+(-14mm,0)$);
+\coordinate (lbus2) at ($(panelA.west)+(-10mm,0)$);
 \coordinate (commitN) at ($(commit.north)+(0,6mm)$);
 \draw[loop] (commit.north) -- (commitN) -- (commitN -| lbus2)
             -- (enc.south -| lbus2) -- (enc.south);
 \node[font=\tiny, black!55, anchor=east, rotate=90] at ($(lbus2)+(0,7mm)$) {re-encode};
 
-\coordinate (fbus) at ($(panelA.west)+(-21mm,0)$);
+\coordinate (fbus) at ($(panelA.west)+(-15mm,0)$);
 \coordinate (bbus) at ($(panelC.south)+(0,-6mm)$);
 \draw[loop] (argmax.south) -- (argmax.south |- bbus)
             -- (fbus |- bbus) -- (fbus |- inp.west) -- (inp.west);
