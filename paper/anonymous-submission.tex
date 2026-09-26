@@ -93,26 +93,15 @@ methods are effective, but they share a structural limitation: each scores a
 candidate \emph{from the current node alone}, discarding the lookahead
 signal.
 
-CutWorld closes this gap with a learned latent dynamics model that simulates the
-immediate consequences of candidate decisions in latent space, without
-executing child LP solves. We encode each search node as a bipartite graph,
-reading out the graph-level state with a learned attention pool
-\citep{lee2019set} over variable embeddings that emphasizes structurally
-important variables rather than averaging uniformly, and train a causal
-Transformer to predict how this state, alongside its
-constituent per-variable embeddings, evolves under a candidate branching
-action. Because the model predicts fine-grained, per-variable representations
-rather than a static graph summary, the branching policy can be re-applied to
-the imagined child state for a k-step latent lookahead. Candidates are scored
-by combining the predicted child node's dual-bound value with a learned
-subtree-size penalty that directly targets the solver's true cost in explored nodes. For cut selection, candidate Gomory cuts are scored via cross-attention against
-the encoder's existing variable and constraint representations, so branching
-and cut selection share a single latent without any additional learned
-parameters or separate inference passes. A single unified model
-concurrently drives the solver's core discrete choices: variable branching,
-cut selection, and node ordering, influencing only which decisions the solver
-makes and in what order, never the bounds or feasibility tests, so exactness is
-preserved.
+CutWorld closes this gap with a learned latent dynamics model. We encode each
+search node as a bipartite graph with a GATv2 network and attention readout,
+and train a causal Transformer to predict how the latent and per-variable
+embeddings evolve under a candidate action, so the branching policy can be
+re-applied to imagined states for a k-step rollout. Candidates are scored by a
+MuZero-style return combining predicted rewards, a value estimate, and a
+cost-to-go penalty; Gomory cuts are selected via cross-attention over the same
+encoder representations. A single unified model drives variable branching, cut
+selection, and node ordering while preserving the solver's exactness guarantee.
 
 \paragraph{Summary of Contributions.}
 \begin{itemize}
@@ -161,51 +150,33 @@ directly to Set Cover \citep{shafi2022graphscp}, the benchmark domain we
 evaluate on.
 
 Cut selection has been learned along the same lines. \citet{tang2020reinforcement}
-cast it as a sequential decision problem solved with reinforcement learning, and
-\citet{paulus2022learning} imitate a look-ahead expert that scores each cut by
-the bound improvement it yields, but the look-ahead only produces training
-labels; at inference the policy again predicts from the current node alone.
-\citet{wang2023hierarchical} model cut selection as a sequential ranking
-problem with a hierarchical sequence model; like prior cut methods, selection
-is made from the current node without imagining downstream states. Learned
-large neighborhood search \citep{sonnerat2021learning} targets yet another
-solver decision. Across branching and cutting alike, prior work scores a
-candidate either myopically or through an explicit, expensive look-ahead that
-the learned policy itself cannot invoke.
+cast it as an RL problem, and \citet{paulus2022learning} imitate a look-ahead
+expert, but the look-ahead only produces training labels; at inference the
+policy predicts from the current node alone. \citet{wang2023hierarchical} use
+a hierarchical sequence model; like prior cut methods, selection is myopic.
+Learned large neighbourhood search \citep{sonnerat2021learning} targets yet
+another solver decision. Across branching and cutting, prior work scores
+candidates myopically or through an expensive look-ahead the learned policy
+cannot itself invoke.
 
 A complementary line of work introduces sequence models over the
 \emph{realized} branching history. \citet{zhang2026mambabranchin} encode the
-sequence of states and decisions from the root to the current node with a
-Mamba state-space model, training contrastively to distinguish productive and
-unproductive branching histories. This \emph{retrospective} approach captures
-how the search arrived at its current node, but still cannot see what a given
-candidate decision will cause downstream. CutWorld takes the opposite,
-\emph{prospective} stance: given the current node, it simulates the unrealized
-consequences of a candidate before committing to it, recovering part of strong
-branching's look-ahead signal directly rather than from historical pattern.
-The two axes are complementary rather than competing, a Mamba-style history
-encoder could feed the initial state into CutWorld's dynamics model, and
-differ in scope: \citet{zhang2026mambabranchin} addresses branching-variable
-selection only, whereas CutWorld additionally handles cut selection and node
+root-to-node sequence with a Mamba SSM, training contrastively on productive
+vs.\ unproductive histories. This \emph{retrospective} approach captures how
+the search arrived, but cannot see what a candidate will cause downstream.
+CutWorld takes the opposite, \emph{prospective} stance: it simulates
+consequences before committing, and additionally handles cut selection and node
 ordering from the same latent.
 
 CutWorld draws on model-based reinforcement learning. MuZero
-\citep{schrittwieser2020mastering} plans with a learned dynamics model without
-reconstructing observations, and Dreamer \citep{hafner2020dream} learns
-behaviors by imagination in latent space. Predicting next latents in a learned
-embedding space, rather than reconstructing raw observations, yields efficient
-forward models; our DynamicsTransformer follows this design, and we adopt
-latent overshooting as a training-time stabilizer to keep the learned forward
-model faithful across multiple steps and we adopt
-latent overshooting as a training-time stabilizer to keep the learned forward
-model faithful across multiple steps. We bring this inside Branch-and-Cut, combining the
-bipartite representation of \citet{gasse2019exact} with a learned latent
-forward model: rather than ranking candidates by a static score or paying for
-explicit LP look-ahead, we \emph{imagine} the downstream consequences a decision
-induces and recover part of strong branching's look-ahead signal at the cost
-of a short latent rollout per candidate. A single such model drives
-branching, cut selection, and node ordering, whereas prior methods learn each
-decision in isolation.
+\citep{schrittwieser2020mastering} plans without reconstructing observations,
+and Dreamer \citep{hafner2020dream} learns behaviors in latent space; our
+DynamicsTransformer follows the same design, with latent overshooting as a
+training-time stabilizer. We combine the bipartite representation of
+\citet{gasse2019exact} with a learned latent forward model: rather than paying for
+explicit LP look-ahead, we imagine the downstream consequences of a decision at
+the cost of a short latent rollout per candidate, and drive branching, cut
+selection, and node ordering from a single latent.
 
 % -----------------------------------------------------------------------
 \section{Background and Problem Formulation}
@@ -378,15 +349,10 @@ integrality head and the policy's own confidence provide two cheap early
 exits, and only otherwise-ambiguous nodes pay for a latent rollout that
 unrolls the dynamics, re-applies $\pi$ at each imagined step, and scores
 candidates by a reward-, size-, and cost-to-go-weighted return.
-\textbf{Cross-panel links} make the shared machinery explicit: the blue
-dashed path shows $z,\{h_i\}$ from the encoder feeding both the cut-scoring
-cluster and the branching policy; the red dashed path shows the dynamics
-model being reused by the latent-beam cut mode and by the branch rollout;
-and the two gray dashed loops close the search loop, committing cuts
-re-solves the LP and re-encodes a fresh $z,\{h_i\}$ (top loop), and the
-chosen branch variable's children are pushed back onto the queue as new
-B\&C nodes (bottom loop). No gate or head ever alters an LP bound or a
-feasibility test, so solver exactness is unaffected
+Blue dashes: $z,\{h_i\}$ feed both cut-scoring and branching.
+Red dashes: dynamics model reused by cut latent-beam and branch rollout.
+Gray loops: cut commit re-solves and re-encodes (top); branch children pushed
+to queue (bottom). No gate alters LP bounds or feasibility tests
 (Remark~\ref{prop:exact}).}
 \label{fig:arch}
 \end{figure*}
