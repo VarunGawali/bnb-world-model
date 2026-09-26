@@ -110,9 +110,10 @@ rather than a static graph summary, the branching policy can be re-applied to
 the imagined child state for a one-step latent lookahead. Candidates are scored
 by combining the predicted child node's dual-bound value with a learned
 subtree-size penalty that directly targets the solver's true cost in explored
-nodes. For cut selection, a pointer network scores candidate Gomory cuts against the
-same latent state used for branching, so both decisions share a single
-encoder rather than requiring separate inference passes. A single unified model
+nodes. For cut selection, candidate Gomory cuts are scored via cross-attention against
+the encoder's existing variable and constraint representations, so branching
+and cut selection share a single latent without any additional learned
+parameters or separate inference passes. A single unified model
 concurrently drives the solver's core discrete choices --- variable branching,
 cut selection, and node ordering --- influencing only which decisions the solver
 makes and in what order, never the bounds or feasibility tests, so exactness is
