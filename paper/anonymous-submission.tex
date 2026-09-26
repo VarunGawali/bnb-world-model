@@ -255,20 +255,14 @@ model \emph{select} among them rather than invent inequalities.
 % ---------- Panel (b): cut decision ----------
 \node[small, below=20mm of inp] (pool) {Gomory pool\\{\scriptsize root, valid}};
 \node[small, right=7mm of pool] (viol) {Violated\\cuts};
-\node[small, below=9mm of viol, xshift=-16mm] (heur) {Heuristic\\{\scriptsize max-viol.}};
-\node[small, below=9mm of viol] (attn) {Attention\\{\scriptsize param-free}};
-\node[small, below=9mm of viol, xshift=16mm] (latent) {Latent beam\\{\scriptsize dyn.+$V$}};
-\node[small, right=22mm of viol] (commit) {Commit\\{\scriptsize re-solve, re-encode}};
+\node[small, right=7mm of viol] (attn) {Attention\\{\scriptsize param-free}};
+\node[small, right=7mm of attn] (commit) {Commit\\{\scriptsize re-solve, re-encode}};
 
 \draw[arr] (pool) -- (viol);
-\draw[arr] (viol.south) -- ++(0,-4mm) -| (heur.north);
-\draw[arr] (viol.south) -- (attn.north);
-\draw[arr] (viol.south) -- ++(0,-4mm) -| (latent.north);
-\draw[arr] (heur.south) -- ++(0,-4mm) -| (commit.south);
-\draw[arr] (attn.south) -- ++(0,-4mm) -| (commit.south);
-\draw[arr] (latent.south) -- ++(0,-4mm) -| (commit.south);
+\draw[arr] (viol) -- (attn);
+\draw[arr] (attn) -- (commit);
 
-\node[panel, fit=(pool)(viol)(heur)(attn)(latent)(commit)] (panelB) {};
+\node[panel, fit=(pool)(viol)(attn)(commit)] (panelB) {};
 \node[ptitle] at (panelB.north west) {(b) Cut decision\ {\normalfont\scriptsize(gated by $\iota$, budget, gain)}};
 
 % ---------- Panel (c): branch selection ----------
@@ -291,14 +285,12 @@ model \emph{select} among them rather than invent inequalities.
 
 % ---------- Cross-panel interconnections ----------
 \coordinate (rbus) at ($(panelC.east)+(4mm,0)$);
-\draw[reuse] (dyn.east) -- (dyn.east -| rbus)
-             -- (latent.east -| rbus) -- (latent.east);
 \draw[reuse] (dyn.east) -| (rbus |- panelC.south) -- ++(0,-4mm) -| (roll.south);
 \node[font=\tiny, red!60!black, anchor=west] at ($(dyn.east -| rbus)+(0,3mm)$) {dyn.\ reused};
 
 \coordinate (lbus) at ($(panelA.west)+(-5mm,0)$);
 \draw[feed] (z.west) -- (z.west -| lbus)
-            -- (heur.west -| lbus) -- (heur.west);
+            -- (attn.west -| lbus) -- (attn.west);
 \draw[feed] (z.west -| lbus) -- (pscore.west -| lbus) -- (pscore.west);
 \node[font=\tiny, blue!55!black, anchor=east, rotate=90] at ($(lbus)+(0,-18mm)$) {$z,\{h_i\}$ feed};
 
@@ -321,10 +313,10 @@ Branch-and-Cut node to a graph latent $z$ and per-variable embeddings
 $\{h_i\}$; seven heads read $z$ (four also read $\{h_i\}$), and a causal
 Transformer predicts how $z$ and $\{h_i\}$ evolve under a candidate action,
 without invoking the solver. \textbf{(b)} Cut selection is gated by the
-integrality head $\iota$ together with budget/gain/depth checks (Gate~7);
-Candidate Gomory cuts are scored using a parameter-free attention rule over cut and constraint
-embeddings, before the
-chosen cuts are committed and the LP is re-solved and re-encoded.
+integrality head $\iota$ together with budget/gain/depth checks; violated
+Gomory cuts are scored by a parameter-free attention rule over cut and
+constraint embeddings, and the chosen cuts are committed with an LP
+re-solve and re-encode.
 \textbf{(c)} Branching scores fractional variables with the policy head
 $\pi$; the
 integrality head and the policy's own confidence provide two cheap early
@@ -332,7 +324,7 @@ exits, and only otherwise-ambiguous nodes pay for a latent rollout that
 unrolls the dynamics, re-applies $\pi$ at each imagined step, and scores
 candidates by a reward-, size-, and cost-to-go-weighted return.
 Blue dashes: $z,\{h_i\}$ feed both cut-scoring and branching.
-Red dashes: dynamics model reused by cut latent-beam and branch rollout.
+Red dashes: dynamics model reused by branch rollout.
 Gray loops: cut commit re-solves and re-encodes (top); branch children pushed
 to queue (bottom). No gate alters LP bounds or feasibility tests
 (Remark~\ref{prop:exact}).}
