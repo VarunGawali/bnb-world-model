@@ -140,6 +140,11 @@ class NeuralBnBSolver:
         self.device = device
         self.cfg = config or SolverConfig()
 
+        # Keep the dynamics token history inside the trained position range.
+        dyn = getattr(model, "dynamics", None)
+        if dyn is not None:
+            dyn.history_window = self.cfg.dyn_history_window
+
         try:
             import highspy
             self._highs = highspy
@@ -330,7 +335,7 @@ class NeuralBnBSolver:
                     var_lb=vlb, var_ub=vub,
                     node_id=next_id, parent_id=node.node_id,
                     priority=priority,
-                    past_tokens=child_tokens,
+                    past_tokens=child_tokens[direction],
                     warm_basis=lp.basis,
                 ))
                 next_id += 1
@@ -923,20 +928,17 @@ class NeuralBnBSolver:
     def _select_branch_var(self, h_vars, z, x_lp, frac_idx, node, leaf_prob):
         cfg = self.cfg
 
+        same = {1.0: node.past_tokens, -1.0: node.past_tokens}
         if cfg.branch_mode == "most_fractional":
             fr = np.abs(x_lp - np.round(x_lp))
-            return int(frac_idx[np.argmax(fr[frac_idx])]), node.past_tokens
+            return int(frac_idx[np.argmax(fr[frac_idx])]), same
         if cfg.branch_mode == "random":
-            return int(np.random.choice(frac_idx)), node.past_tokens
+            return int(np.random.choice(frac_idx)), same
 
         if cfg.branch_mode == "dyn_pseudo":
             scores = self._dynamics_pseudo_scores(h_vars, z, x_lp, frac_idx, node)
             v = int(frac_idx[np.argmax(scores)])
-            with torch.no_grad():
-                a = h_vars[v].unsqueeze(0)
-                _z, tok, _ = self.model.dynamics_step_full(
-                    z, a, h_vars.unsqueeze(0), node.past_tokens, 0.0)
-            return v, tok
+            return v, self._child_tokens(z, h_vars, v, node.past_tokens)
 
         scores = self._policy_scores(h_vars, z, x_lp)
         frac_t = torch.as_tensor(frac_idx, dtype=torch.long, device=self.device)
@@ -944,10 +946,7 @@ class NeuralBnBSolver:
         masked[frac_t] = scores[frac_t]
 
         def _advance(var):
-            with torch.no_grad():
-                a = h_vars[var].unsqueeze(0)
-                _z, tok, _ = self.model.dynamics_step(z, a, node.past_tokens, 0.0)
-            return tok
+            return self._child_tokens(z, h_vars, var, node.past_tokens)
 
         if cfg.branch_mode == "policy":
             v = int(masked.argmax())
@@ -1023,6 +1022,20 @@ class NeuralBnBSolver:
             self._diag["ors_choice_changed"] += 1
 
         return best_var, _advance(best_var)
+
+    def _child_tokens(self, z, h_vars, var, past_tokens):
+        """History buffers for the up (+1) and down (-1) child of branching on var.
+
+        Training appends token(z_parent, a, dir_child) with the child's own
+        branch direction (SequenceDataset `dir_seq = bdir[dst]`), so each child
+        gets the token for its direction, both computed in one batched step.
+        """
+        with torch.no_grad():
+            a = h_vars[var].unsqueeze(0).expand(2, -1)
+            pt = past_tokens.expand(2, -1, -1) if past_tokens is not None else None
+            d = torch.tensor([1.0, -1.0], dtype=z.dtype, device=z.device)
+            _z, tok = self.model.dynamics_step(z.expand(2, -1), a, pt, d)
+        return {1.0: tok[0:1], -1.0: tok[1:2]}
 
     def _ors_shallow(self, z, h_vars, cands, node, valid_mask):
         """ORS Phase 2: shallow return and depth-1 value magnitude per candidate."""

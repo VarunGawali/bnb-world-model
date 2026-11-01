@@ -32,7 +32,7 @@ except ImportError:
     SCIPModel = None
 
 # Number of top-k candidates to evaluate with dynamics lookahead
-_LOOKAHEAD_K = 5
+_LOOKAHEAD_K = 3
 # Number of latent steps to unroll per candidate
 _LOOKAHEAD_DEPTH = 3
 # Discount factor per lookahead step

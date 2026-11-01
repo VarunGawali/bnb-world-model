@@ -36,13 +36,19 @@ class SolverConfig:
     # ------------------------------------------------------------------ #
     # Lookahead (rollout)                                                  #
     # ------------------------------------------------------------------ #
-    lookahead_k: int = 5
+    lookahead_k: int = 3            # top-k candidates rolled out (paper Table 3)
     lookahead_depth: int = 3
     lookahead_gamma: float = 0.95
     size_weight: float = 0.0
     ctg_weight: float = 1.0
     branch_factor: int = 2
     use_reward_return: bool = True
+
+    # Dynamics token history kept at inference (sliding window, in tokens).
+    # Must not exceed (training max_path_len - 1): positions past that were
+    # never trained. RawSequenceDataset / the latent cache use 32-node paths
+    # (31 tokens); SequenceDataset uses 64 (63). None = no window (max_seq).
+    dyn_history_window: Optional[int] = 31
 
     # Skip lookahead if the integrality head says leaf_prob >= this.
     leaf_prob_skip: float = 0.8

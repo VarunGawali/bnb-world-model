@@ -316,23 +316,30 @@ class BnBWorldModel(nn.Module):
         use_reward_return: bool = False,
         expand_both_children: bool = True,
     ) -> torch.Tensor:
-        """Batched level-wise version of rollout_candidate.
+        """Batched level-wise version of rollout_candidate (Eq. 17).
 
-        The candidate being evaluated remains fixed across the batch dimension
-        at the root. After the root, all child continuations are represented as
-        a frontier tensor and expanded together at each depth.
+        Scores branching on `cand_idx` by expanding an imagined tree K = `depth`
+        transitions deep. Transition j (1-indexed) produces both children
+        (+1/-1) of every frontier node; from depth 2 on, each node's next
+        action is each of the policy's top-b variables, and the b continuations
+        are AVERAGED (an expectation over the policy), while the two children
+        of one branching are SUMMED (both subtrees must be searched):
 
-        This removes recursive Python calls from the expensive dynamics/policy
-        portion of the rollout while preserving:
-          * both-child (+1/-1) expansion;
-          * shrinking candidate masks;
-          * branch-factor top-k policy selection;
-          * value / reward-return / CTG scoring;
-          * immediate-child subtree-size penalty;
-          * per-frontier Transformer token histories.
+            Q(s, a, j) = sum_dir [ gamma^(j-1) * (r_hat - w_C * C_hat)(s'_dir)
+                                   + cont(s'_dir, j) ]
+            cont(s', j) = mean_{a' in topb(s')} Q(s', a', j + 1)   if j < K
+                        = gamma^j * V_hat(s')                       otherwise
 
-        The return is a scalar tensor. Existing callers expecting a Python float
-        can call `.item()` once at the outermost boundary.
+        so the leaf is bootstrapped with gamma^K (gamma^j for a node that runs
+        out of candidates at depth j). With use_reward_return=False the value
+        replaces the reward at every step and there is no leaf bootstrap.
+
+        Each frontier node carries an expectation weight (the product of 1/b
+        factors along its path); every term is multiplied by it, which makes
+        this numerically identical to the recursive reference implementation
+        while expanding a whole level in one batched dynamics call.
+
+        Returns a scalar tensor.
         """
         if z.dim() != 2 or z.size(0) != 1:
             raise ValueError("z must have shape [1, H].")
@@ -344,288 +351,108 @@ class BnBWorldModel(nn.Module):
             raise ValueError("depth must be >= 1.")
 
         device = z.device
-        V = h_vars.size(0)
+        V, H = h_vars.shape
         b = max(1, int(branch_factor))
         directions = (1.0, -1.0) if expand_both_children else (0.0,)
         n_dirs = len(directions)
+        dir_vec = torch.tensor(directions, dtype=z.dtype, device=device)
 
-        # Candidate mask at the root.
         if valid_mask is None:
-            root_mask = None
+            mask_f = None
         else:
             if valid_mask.dim() != 1 or valid_mask.numel() != V:
                 raise ValueError("valid_mask must have shape [V].")
-            root_mask = valid_mask.to(device=device, dtype=torch.bool).clone()
+            root_mask = valid_mask.to(device=device, dtype=torch.bool)
             if not bool(root_mask[cand_idx]):
                 raise ValueError("cand_idx must be valid under valid_mask.")
-
-        bvec = torch.zeros(V, dtype=torch.long, device=device)
-
-        # Root transition: one tensorized dynamics call for both directions.
-        z_root = z.expand(n_dirs, -1)
-        a_root = h_vars[cand_idx].unsqueeze(0).expand(n_dirs, -1)
-        h_root = h_vars.unsqueeze(0).expand(n_dirs, -1, -1)
-
-        if root_mask is None:
-            child_masks = None
-            fm_root = None
-        else:
             child_mask = root_mask.clone()
             child_mask[cand_idx] = False
-            child_masks = child_mask.unsqueeze(0).expand(n_dirs, -1).clone()
-            fm_root = child_mask if bool(child_mask.any()) else None
+            mask_f = child_mask.unsqueeze(0).expand(n_dirs, -1).clone()
 
-        d_root = torch.tensor(directions, dtype=z.dtype, device=device)
-        # past_tokens from the inference loop is [1,T,H]; expand to [n_dirs,T,H]
-        # so the batch dimension matches z_root [n_dirs,H].
-        pt_root = (past_tokens.expand(n_dirs, -1, -1)
-                   if past_tokens is not None else None)
-        z_front, h_front, tok_front = self.dynamics_step_full_batched(
-            z_root, a_root, h_root, pt_root, d_root
+        # Root transition: both children of the candidate in one call.
+        # past_tokens from the inference loop is [1,T,H]; expand to the batch.
+        z_f, h_f, tok_f = self.dynamics_step_full_batched(
+            z.expand(n_dirs, -1),
+            h_vars[cand_idx].unsqueeze(0).expand(n_dirs, -1),
+            h_vars.unsqueeze(0).expand(n_dirs, -1, -1),
+            past_tokens.expand(n_dirs, -1, -1) if past_tokens is not None else None,
+            dir_vec,
         )
-
-        # Flatten [F,V,H] -> [F*V,H] and build proper per-graph batch index.
-        F_root = z_front.size(0)
-        h_front_flat = h_front.reshape(F_root * V, -1)
-        bvec_root = torch.arange(F_root, device=device).repeat_interleave(V)
-        fm_root_flat = (
-            fm_root.unsqueeze(0).expand(F_root, -1).reshape(-1)
-            if fm_root is not None else None
-        )
-
-        # Accumulate root-child scores. Keep everything tensor-valued until
-        # the final scalar conversion so no .item() calls force GPU sync.
-        g = 1.0
-        score_front = []
-
-        if use_reward_return:
-            score_front.append(
-                g * self.dynamics_reward_pred(z_front)
-            )
-        else:
-            score_front.append(
-                g * self.value_pred(
-                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-                )
-            )
-
-        if ctg_weight != 0.0:
-            score_front[-1] = score_front[-1] - (
-                ctg_weight * g *
-                self.cost_to_go_pred(
-                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-                )
-            )
-
-        total_score = torch.stack(score_front).sum()
+        weight_f = torch.ones(n_dirs, dtype=z.dtype, device=device)
+        total = z.new_zeros(())
 
         if size_weight != 0.0:
-            size_root = self.subtree_size_pred(
-                z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-            )
-            total_score = total_score - size_weight * size_root.sum()
+            h_flat, bvec, fm = self._flatten_frontier(h_f, mask_f)
+            total = total - size_weight * self.subtree_size_pred(
+                z_f, h_flat, bvec, frac_mask=fm).sum()
 
-        # At depth 1, there are no continuations.
-        if depth == 1:
+        for level in range(1, depth + 1):
+            h_flat, bvec, fm = self._flatten_frontier(h_f, mask_f)
+
+            # Per-step score of the nodes produced by transition `level`.
             if use_reward_return:
-                leaf_value = self.value_pred(
-                    z_front, h_front_flat, bvec_root, frac_mask=fm_root_flat
-                )
-                total_score = total_score + g * leaf_value.sum()
-            return total_score
-
-        # Frontier state:
-        # z_front       [F,H]
-        # h_front       [F,V,H]
-        # tok_front     [F,T,H]
-        # child_masks   [F,V] or None
-        #
-        # Each root direction is an independent frontier element.
-        frontier_z = z_front
-        frontier_h = h_front
-        frontier_tok = tok_front
-        frontier_masks = child_masks
-
-        # Continuation contribution is discounted by gamma once per transition.
-        # Initialise to 1.0 so that the multiply at the top of each iteration
-        # gives gamma^level, keeping leaf-bootstrap discount consistent with
-        # the recursive branch() which uses the same g for rewards and the
-        # value bootstrap at the terminal depth.
-        continuation_discount = 1.0
-
-        for level in range(1, depth):
-            continuation_discount *= gamma
-
-            F = frontier_z.size(0)
-
-            # Determine which frontier elements can actually expand.
-            if frontier_masks is None:
-                expandable = torch.ones(F, dtype=torch.bool, device=device)
+                step = self.dynamics_reward_pred(z_f)
             else:
-                expandable = frontier_masks.any(dim=1)
+                step = self.value_pred(z_f, h_flat, bvec, frac_mask=fm)
+            if ctg_weight != 0.0:
+                step = step - ctg_weight * self.cost_to_go_pred(
+                    z_f, h_flat, bvec, frac_mask=fm)
+            total = total + gamma ** (level - 1) * (weight_f * step).sum()
 
-            # Terminal frontiers contribute a reward-return bootstrap only.
+            if level == depth:
+                expandable = torch.zeros(z_f.size(0), dtype=torch.bool,
+                                         device=device)
+            elif mask_f is None:
+                expandable = torch.ones(z_f.size(0), dtype=torch.bool,
+                                        device=device)
+            else:
+                expandable = mask_f.any(dim=1)
+
+            # Leaf bootstrap (reward-return mode): gamma^level * V(s').
             terminal = ~expandable
-
-            if bool(terminal.any()):
-                if use_reward_return:
-                    z_term = frontier_z[terminal]
-                    h_term = frontier_h[terminal]
-                    masks_term = (
-                        frontier_masks[terminal]
-                        if frontier_masks is not None else None
-                    )
-                    N_term = z_term.size(0)
-                    h_term_flat = h_term.reshape(N_term * V, -1)
-                    bvec_term = torch.arange(N_term, device=device).repeat_interleave(V)
-                    fm_term_flat = masks_term.reshape(-1) if masks_term is not None else None
-                    terminal_score = self.value_pred(
-                        z_term, h_term_flat, bvec_term, frac_mask=fm_term_flat,
-                    )
-                    total_score = total_score + (
-                        continuation_discount * terminal_score.sum()
-                    )
+            if use_reward_return and bool(terminal.any()):
+                v = self.value_pred(z_f, h_flat, bvec, frac_mask=fm)
+                total = total + gamma ** level * (
+                    weight_f[terminal] * v[terminal]).sum()
 
             if not bool(expandable.any()):
                 break
 
-            # Filter to expandable frontier before top-k selection.
-            exp_idx = expandable.nonzero(as_tuple=False).squeeze(1)
-            z_exp = frontier_z[exp_idx]
-            h_exp = frontier_h[exp_idx]
-            tok_exp = frontier_tok[exp_idx]
-            masks_exp = (
-                frontier_masks[exp_idx]
-                if frontier_masks is not None else None
-            )
+            idx = expandable.nonzero(as_tuple=False).squeeze(1)
+            z_e, h_e, tok_e, w_e = z_f[idx], h_f[idx], tok_f[idx], weight_f[idx]
+            m_e = mask_f[idx] if mask_f is not None else None
 
-            k = b
-            next_idx = self._policy_topk_batched(
-                h_exp, z_exp, masks_exp, k
-            )  # [E,k_eff]
+            nxt = self._policy_topk_batched(h_e, z_e, m_e, b)        # [E,K]
+            E, K = nxt.shape
+            N = E * K * n_dirs
+            rows = torch.arange(E, device=device).unsqueeze(1)
+            a = h_e[rows, nxt]                                       # [E,K,H]
 
-            E, K = next_idx.shape
+            def rep(x):
+                # [E, ...] -> [E*K*n_dirs, ...], parent repeated per child.
+                return x.view(E, 1, 1, *x.shape[1:]).expand(
+                    E, K, n_dirs, *x.shape[1:]).reshape(N, *x.shape[1:])
 
-            # Gather the selected action embeddings.
-            H = h_exp.size(-1)
-            h_expanded = h_exp.unsqueeze(1).expand(-1, K, -1, -1)
-            gather_idx = next_idx.unsqueeze(-1).unsqueeze(-1).expand(
-                -1, -1, 1, H
-            )
-            a_exp = torch.gather(
-                h_expanded, 2, gather_idx
-            ).squeeze(2)  # [E,K,H]
+            if m_e is not None:
+                m_c = m_e.unsqueeze(1).expand(-1, K, -1).clone()     # [E,K,V]
+                m_c.scatter_(2, nxt.unsqueeze(-1), False)
+                mask_f = m_c.unsqueeze(2).expand(-1, -1, n_dirs, -1).reshape(N, V)
 
-            # Each selected action generates both child directions.
-            z_parent = z_exp.unsqueeze(1).expand(-1, K, -1).reshape(
-                E * K, H
-            )
-            a_flat = a_exp.reshape(E * K, H)
-            h_parent = h_exp.unsqueeze(1).expand(
-                -1, K, -1, -1
-            ).reshape(E * K, V, H)
+            a_in = a.unsqueeze(2).expand(E, K, n_dirs, H).reshape(N, H)
+            d_in = dir_vec.view(1, 1, n_dirs).expand(E, K, n_dirs).reshape(N)
+            weight_f = (w_e / K).view(E, 1, 1).expand(E, K, n_dirs).reshape(N)
+            z_f, h_f, tok_f = self.dynamics_step_full_batched(
+                rep(z_e), a_in, rep(h_e), rep(tok_e), d_in)
 
-            tok_parent = tok_exp.unsqueeze(1).expand(
-                -1, K, -1, -1
-            ).reshape(E * K, tok_exp.size(1), H)
+        return total
 
-            if masks_exp is not None:
-                masks_parent = masks_exp.unsqueeze(1).expand(
-                    -1, K, -1
-                ).reshape(E * K, V).clone()
-                row = torch.arange(E * K, device=device)
-                chosen_flat = next_idx.reshape(-1)
-                masks_parent[row, chosen_flat] = False
-            else:
-                masks_parent = None
-
-            if masks_parent is not None:
-                fm_parent = masks_parent
-            else:
-                fm_parent = None
-
-            # Expand directions without a Python loop over child nodes.
-            z_child_in = z_parent.unsqueeze(1).expand(
-                -1, n_dirs, -1
-            ).reshape(E * K * n_dirs, H)
-            a_child_in = a_flat.unsqueeze(1).expand(
-                -1, n_dirs, -1
-            ).reshape(E * K * n_dirs, H)
-            h_child_in = h_parent.unsqueeze(1).expand(
-                -1, n_dirs, -1, -1
-            ).reshape(E * K * n_dirs, V, H)
-            tok_child_in = tok_parent.unsqueeze(1).expand(
-                -1, n_dirs, -1, -1
-            ).reshape(E * K * n_dirs, tok_parent.size(1), H)
-
-            d = torch.tensor(
-                directions, dtype=z.dtype, device=device
-            ).view(1, n_dirs).expand(E * K, -1).reshape(-1)
-
-            if fm_parent is not None:
-                fm_child = fm_parent.unsqueeze(1).expand(
-                    -1, n_dirs, -1
-                ).reshape(E * K * n_dirs, V)
-            else:
-                fm_child = None
-
-            z_next, h_next, tok_next = self.dynamics_step_full_batched(
-                z_child_in, a_child_in, h_child_in, tok_child_in, d
-            )
-
-            N_step = z_next.size(0)
-            h_next_flat = h_next.reshape(N_step * V, -1)
-            bvec_step = torch.arange(N_step, device=device).repeat_interleave(V)
-            fm_step_flat = fm_child.reshape(-1) if fm_child is not None else None
-
-            if use_reward_return:
-                step_score = self.dynamics_reward_pred(z_next)
-            else:
-                step_score = self.value_pred(
-                    z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
-                )
-
-            if ctg_weight != 0.0:
-                ctg = self.cost_to_go_pred(
-                    z_next, h_next_flat, bvec_step, frac_mask=fm_step_flat,
-                )
-                step_score = step_score - ctg_weight * ctg
-
-            # Each parent selected action averages its K continuations; the
-            # original recursive implementation sums directions and averages
-            # over selected next actions. Reshape exactly that structure.
-            step_score = step_score.view(E, K, n_dirs)
-            continuation = step_score.sum(dim=2).mean(dim=1)
-
-            total_score = total_score + continuation_discount * continuation.sum()
-
-            # The frontier after this level consists of all direction-expanded
-            # children. Terminal children are retained so their reward-return
-            # leaf bootstrap can be added on the next iteration.
-            frontier_z = z_next
-            frontier_h = h_next
-            frontier_tok = tok_next
-            frontier_masks = fm_child
-
-            # Advance discount for subsequent levels only. The leaf bootstrap
-            # (below) is at the same depth as this level's step scores, so it
-            # must use the same continuation_discount — not the next level's.
-            if level < depth - 1:
-                continuation_discount *= gamma
-
-        # For reward-return mode, the final frontier gets a single value
-        # bootstrap, matching sum(rewards) + gamma^k V(leaf).
-        if use_reward_return and frontier_z.size(0) > 0:
-            N_leaf = frontier_z.size(0)
-            h_leaf_flat = frontier_h.reshape(N_leaf * V, -1)
-            bvec_leaf = torch.arange(N_leaf, device=device).repeat_interleave(V)
-            fm_leaf_flat = frontier_masks.reshape(-1) if frontier_masks is not None else None
-            leaf_value = self.value_pred(
-                frontier_z, h_leaf_flat, bvec_leaf, frac_mask=fm_leaf_flat,
-            )
-            total_score = total_score + continuation_discount * leaf_value.sum()
-
-        return total_score
+    @staticmethod
+    def _flatten_frontier(h_f: torch.Tensor, mask_f: torch.Tensor | None):
+        """[F,V,H] frontier -> (h_flat [F*V,H], batch index, frac mask or None)."""
+        F_, V, _ = h_f.shape
+        bvec = torch.arange(F_, device=h_f.device).repeat_interleave(V)
+        fm = mask_f.reshape(-1) if mask_f is not None else None
+        return h_f.reshape(F_ * V, -1), bvec, fm
 
     # ------------------------------------------------------------------
     # Real latent rollout for candidate selection
@@ -650,7 +477,8 @@ class BnBWorldModel(nn.Module):
 
         By default this dispatches to the level-wise batched implementation.
         Set batched=False to retain the original recursive implementation for
-        exact A/B equivalence testing.
+        exact A/B equivalence testing. Both compute Eq. 17 as documented on
+        rollout_candidate_batched (tests/test_rollout.py checks they agree).
         """
         if batched:
             return float(
@@ -721,8 +549,10 @@ class BnBWorldModel(nn.Module):
                 )
 
                 if not can_expand:
+                    # Leaf bootstrap one transition past this step's reward:
+                    # gamma^j * V at depth j (gamma^K at the horizon).
                     if use_reward_return:
-                        child_score += g * self.value(
+                        child_score += g * gamma * self.value(
                             z_n, h_n, bvec, frac_mask=fm
                         ).item()
                 else:

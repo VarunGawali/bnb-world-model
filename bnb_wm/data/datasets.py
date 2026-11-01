@@ -968,8 +968,10 @@ class RawSequenceDataset(Dataset):
     Each item is a dict for one root->leaf path:
         graphs        list[Data]   one PyG graph per path step
         branch_vars   [T] long     chosen branching variable index (local, 0-based)
-        dir_seq       [T] float    branch direction +1/-1/0
-        bound_seq     [T] float    normalised dual bounds
+        dir_seq       [T] float    per-NODE incoming branch direction +1/-1/0
+        bound_seq     [T] float    per-NODE normalised dual bound (P0.11)
+    These are node-aligned; raw_paths_to_transitions() shifts them onto the
+    T-1 parent->child transitions.
         path_len      int          T (number of steps)
         instance_weight float      1.0 (placeholder; future: per-difficulty weight)
     """
@@ -1010,8 +1012,10 @@ class RawSequenceDataset(Dataset):
             ei_all = d["edge_indices"]
             ev_all = d["edge_values"]
             bv_all = np.asarray(d["branching_vars"], dtype=np.int64)
-            ndb_all = np.asarray(d["norm_dual_bounds"], dtype=np.float32) \
-                if "norm_dual_bounds" in d else np.zeros(len(path), np.float32)
+            # Same cross-instance target as the value head and SequenceDataset
+            # (P0.11), not the per-file min-max `norm_dual_bounds`.
+            ndb_all = gap_to_primal_norm(d) if "norm_dual_bounds" in d \
+                else np.zeros(len(path), np.float32)
             bdir_all = np.asarray(d["branch_dirs"], dtype=np.float32) \
                 if "branch_dirs" in d else np.zeros(len(path), np.float32)
 
@@ -1038,6 +1042,97 @@ class RawSequenceDataset(Dataset):
             "path_len":     len(path),
             "instance_weight": 1.0,
         }
+
+
+def raw_paths_to_transitions(h_vars_all, z_all, var_batch, sizes, branch_vars,
+                             node_dir, node_bound, max_vars_recon=64, seed=0):
+    """Turn encoded root->leaf paths into transition-aligned dynamics targets.
+
+    Shared by the online-encoder Phase-3 path (Trainer._online_encode_raw_batch)
+    and the latent cache (scripts/prebuild_latent_cache.py) so both produce
+    exactly what SequenceDataset produces. A path of T nodes has T-1
+    transitions; transition s is parent path[s] -> child path[s+1]:
+
+        z_seq[s]          = z(path[s])
+        a_seq[s]          = h(path[s])[branch_var(path[s])]
+        z_next_seq[s]     = z(path[s+1])
+        dir_seq[s]        = direction of path[s+1] relative to its parent
+        bound_next_seq[s] = bound(path[s+1])
+        reward_seq[s]     = bound(path[s+1]) - bound(path[s])
+        hv_seq / hv_next_seq : a fixed variable subset of h at path[s] / [s+1]
+
+    Args:
+        h_vars_all : [sumV, H] per-variable embeddings for every path node
+        z_all      : [sumT, H] graph latents, one per path node, paths concatenated
+        var_batch  : [sumV] graph index of each row of h_vars_all
+        sizes      : [B] nodes per path
+        branch_vars: [sumT] local branching-variable index per node
+        node_dir   : [B, Tmax] per-NODE incoming branch direction (+1/-1/0)
+        node_bound : [B, Tmax] per-NODE normalised dual bound
+        max_vars_recon : per-variable reconstruction subset size (padded to it)
+
+    Returns a dict of [B, Tmax-1, ...] tensors plus time_mask [B, Tmax-1] and
+    var_mask [B, Tmax-1, max_vars_recon] (bool), on z_all's device.
+    """
+    device = z_all.device
+    sizes = [int(t) for t in torch.as_tensor(sizes).tolist()]
+    B, H = len(sizes), z_all.size(-1)
+    Tm = max(1, max(sizes) - 1)
+    K = int(max_vars_recon)
+
+    n_graphs = sum(sizes)
+    var_batch = var_batch.to(device)
+    nv = torch.bincount(var_batch, minlength=n_graphs).tolist()
+    starts = [0]
+    for c in nv[:-1]:
+        starts.append(starts[-1] + c)
+    bvars = torch.as_tensor(branch_vars).tolist()
+    node_dir = torch.as_tensor(node_dir).to(device=device, dtype=z_all.dtype)
+    node_bound = torch.as_tensor(node_bound).to(device=device, dtype=z_all.dtype)
+
+    out = {
+        "z_seq":          z_all.new_zeros(B, Tm, H),
+        "a_seq":          z_all.new_zeros(B, Tm, H),
+        "z_next_seq":     z_all.new_zeros(B, Tm, H),
+        "dir_seq":        z_all.new_zeros(B, Tm),
+        "bound_next_seq": z_all.new_zeros(B, Tm),
+        "reward_seq":     z_all.new_zeros(B, Tm),
+        "time_mask":      torch.zeros(B, Tm, dtype=torch.bool, device=device),
+        "hv_seq":         z_all.new_zeros(B, Tm, K, H),
+        "hv_next_seq":    z_all.new_zeros(B, Tm, K, H),
+        "var_mask":       torch.zeros(B, Tm, K, dtype=torch.bool, device=device),
+    }
+    gen = torch.Generator().manual_seed(seed)
+
+    g0 = 0
+    for i, T in enumerate(sizes):
+        n_tr = T - 1
+        if n_tr >= 1:
+            h_nodes = [h_vars_all[starts[g]:starts[g] + nv[g]]
+                       for g in range(g0, g0 + T)]
+            z_i = z_all[g0:g0 + T]
+            out["z_seq"][i, :n_tr] = z_i[:-1]
+            out["z_next_seq"][i, :n_tr] = z_i[1:]
+            for s in range(n_tr):
+                bv = bvars[g0 + s]
+                bv = bv if 0 <= bv < h_nodes[s].size(0) else 0
+                out["a_seq"][i, s] = h_nodes[s][bv]
+            out["dir_seq"][i, :n_tr] = node_dir[i, 1:T]
+            out["bound_next_seq"][i, :n_tr] = node_bound[i, 1:T]
+            out["reward_seq"][i, :n_tr] = node_bound[i, 1:T] - node_bound[i, :T - 1]
+            out["time_mask"][i, :n_tr] = True
+
+            # Variables are fixed along a path (cuts add rows, not columns).
+            n_var = min(h.size(0) for h in h_nodes)
+            k_i = min(K, n_var)
+            sub = torch.randperm(n_var, generator=gen)[:k_i].sort().values
+            sub = sub.to(device)
+            hv = torch.stack([h[sub] for h in h_nodes], dim=0)   # [T, k_i, H]
+            out["hv_seq"][i, :n_tr, :k_i] = hv[:-1]
+            out["hv_next_seq"][i, :n_tr, :k_i] = hv[1:]
+            out["var_mask"][i, :n_tr, :k_i] = True
+        g0 += T
+    return out
 
 
 def make_raw_collate():

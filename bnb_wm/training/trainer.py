@@ -29,6 +29,7 @@ from .losses import (
 )
 import json
 from .checkpoint import save_checkpoint, load_weights_only
+from bnb_wm.data.datasets import raw_paths_to_transitions
 
 
 # ---------------------------------------------------------------------------
@@ -487,71 +488,24 @@ class Trainer:
         return out
 
     def _online_encode_raw_batch(self, d: dict) -> dict | None:
-        """Encode a raw-graph batch from RawSequenceDataset into z_seq/a_seq form.
+        """Encode a raw-graph batch from RawSequenceDataset into transitions.
 
         Called when _dynamics_batch_loss receives batch_graphs instead of z_seq.
-        Gradients flow through the encoder so joint GNN+dynamics training works.
-        Returns None on OOM (caller should skip this batch).
+        Gradients flow through the encoder, so with --phase3_train_encoder the
+        GNN and dynamics train jointly. Produces the same transition-aligned
+        targets as SequenceDataset (per-variable recon, reward, shifted
+        direction/bound, last path node masked) via raw_paths_to_transitions.
+        Returns None on OOM (caller skips the batch).
         """
         try:
-            gb    = d["batch_graphs"].to(self.device)
-            sizes = d["batch_sizes"]          # [B] steps per path (flat over B paths)
-            bvars = d["branch_vars"]          # [sum(T)] local var indices, flat
-
-            h_vars_all, z_all = self.model.encode(gb)  # gradients flow through GNN
-            # h_vars_all: [total_vars_across_all_steps, H]
-            # gb.batch gives graph index for each node; we need var nodes only.
-            var_mask  = gb.node_type == 0
-            var_batch = gb.batch[var_mask].cpu()  # graph index per var node
-            # n_vars per graph step (graphs are indexed 0..sum(T)-1)
-            n_graphs  = int(sizes.sum().item())
-            n_vars_per_step = torch.bincount(var_batch, minlength=n_graphs)  # [sum(T)]
-
-            B    = len(sizes)
-            H    = z_all.size(-1)
-            Tmax = int(sizes.max().item())
-
-            z_seq_batch      = torch.zeros(B, Tmax, H, device=self.device)
-            z_next_seq_batch = torch.zeros(B, Tmax, H, device=self.device)
-            a_seq_batch      = torch.zeros(B, Tmax, H, device=self.device)
-
-            # Offsets into flat z_all and h_vars_all per path and per step.
-            step_offset = 0    # index into z_all (one entry per graph/step)
-            var_offset  = 0    # index into h_vars_all (one entry per var node)
-            flat_bvars  = bvars  # [sum(T)] local indices
-
-            for b_i, T_i in enumerate(sizes.tolist()):
-                T_i = int(T_i)
-                z_i = z_all[step_offset:step_offset + T_i]          # [T_i, H]
-                z_seq_batch[b_i, :T_i]          = z_i
-                z_next_seq_batch[b_i, :T_i - 1] = z_i[1:]
-
-                # Build a_seq for this path: look up each step's branching var.
-                for s in range(T_i):
-                    nv = int(n_vars_per_step[step_offset + s].item())
-                    bv = int(flat_bvars[step_offset + s].item())
-                    bv = bv if 0 <= bv < nv else 0
-                    hv = h_vars_all[var_offset:var_offset + nv]  # [nv, H]
-                    a_seq_batch[b_i, s] = hv[bv]
-                    var_offset += nv
-
-                step_offset += T_i
-
-            out = {
-                "z_seq":      z_seq_batch,
-                "z_next_seq": z_next_seq_batch,
-                "a_seq":      a_seq_batch,
-            }
-            # dir_seq must be [B, T, 1] for dynamics._tokens cat; unsqueeze here.
-            if "dir_seq" in d:
-                ds = d["dir_seq"].to(self.device)
-                out["dir_seq"] = ds.unsqueeze(-1) if ds.dim() == 2 else ds
-            if "time_mask" in d:
-                out["time_mask"] = d["time_mask"].to(self.device)
-            if "bound_seq" in d:
-                out["bound_next_seq"] = d["bound_seq"].to(self.device)
-            return out
-
+            gb = d["batch_graphs"].to(self.device)
+            h_vars_all, z_all = self.model.encode(gb)
+            var_mask = gb.node_type == 0
+            return raw_paths_to_transitions(
+                h_vars_all, z_all, gb.batch[var_mask], d["batch_sizes"],
+                d["branch_vars"], d["dir_seq"], d["bound_seq"],
+                max_vars_recon=64,   # SequenceDataset default
+            )
         except Exception as exc:
             if _is_oom(exc):
                 _recover_oom()

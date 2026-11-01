@@ -33,14 +33,17 @@ Workflow
 
 Cache format
 ------------
-  <cache_dir>/<file_stem>_<hash6>.pt
-  Each file is a list of dicts, one per root→leaf path:
-    z_seq          [T, H]   latent at each node
-    z_next_seq     [T, H]   latent at each child node
-    a_seq          [T]      branching variable index
-    dir_seq        [T]      branch direction (+1/-1/0)
-    bound_seq      [T]      normalised dual bound targets
-    instance_weight float
+  <cache_dir>/chunk_NNNNN.pt
+  Each file is a list of dicts, one per root→leaf path of T nodes, holding its
+  T-1 parent→child transitions (bnb_wm.data.datasets.raw_paths_to_transitions,
+  the same targets SequenceDataset builds):
+    z_seq, a_seq, z_next_seq          [T-1, H]     (a_seq = action embedding)
+    dir_seq, bound_next_seq, reward_seq, time_mask   [T-1]
+    hv_seq, hv_next_seq               [T-1, K, H]  per-variable recon subset
+    var_mask                          [T-1, K]     bool
+    instance_weight                   float
+  Caches built before this format (a_seq indices, unshifted bound/dir, no
+  hv/reward) must be rebuilt.
 """
 
 import argparse
@@ -56,7 +59,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bnb_wm.model.world_model import BnBWorldModel
-from bnb_wm.data.datasets import RawSequenceDataset, make_raw_collate
+from bnb_wm.data.datasets import (
+    RawSequenceDataset, make_raw_collate, raw_paths_to_transitions,
+)
 from bnb_wm.training.checkpoint import load_weights_only
 from torch.utils.data import DataLoader
 
@@ -70,7 +75,8 @@ def _cache_path(cache_dir: Path, traj_file: Path) -> Path:
 
 
 @torch.no_grad()
-def encode_file_group(model, file_paths, cache_dir, device, batch_size=1, max_path_len=32):
+def encode_file_group(model, file_paths, cache_dir, device, batch_size=1, max_path_len=32,
+                      max_vars_recon=64):
     """Encode all root→leaf paths from a list of trajectory files, save to cache."""
     ds = RawSequenceDataset(file_paths, max_path_len=max_path_len)
     if len(ds) == 0:
@@ -95,58 +101,24 @@ def encode_file_group(model, file_paths, cache_dir, device, batch_size=1, max_pa
         try:
             gb = batch["batch_graphs"].to(device)
             sizes = batch["batch_sizes"]           # [B] steps per path
-            bvars = batch["branch_vars"].to(device)
-            bound = batch["bound_seq"].to(device) if "bound_seq" in batch else None
-            dseq  = batch["dir_seq"].to(device)   if "dir_seq"   in batch else None
-            tmask = batch["time_mask"].to(device)  if "time_mask" in batch else None
+            bvars = batch["branch_vars"]
+            bound = batch["bound_seq"]             # [B, Tmax] per node
+            dseq  = batch["dir_seq"]               # [B, Tmax] per node
             iw    = batch["instance_weight"]
 
-            h_vars_all, z_all = model.encode(gb)   # [sum_nodes, H], [sum_paths, H]
+            h_vars_all, z_all = model.encode(gb)   # [sum_vars, H], [sum_nodes, H]
+            var_mask = gb.node_type == 0
+            tr = raw_paths_to_transitions(
+                h_vars_all, z_all, gb.batch[var_mask], sizes, bvars,
+                dseq, bound, max_vars_recon=max_vars_recon)
 
-            # Split z_all back into per-path sequences using sizes
-            B = len(sizes)
-            H = z_all.size(-1)
-            Tmax = int(sizes.max().item())
-
-            # Rebuild per-path z_seq / z_next_seq from the flat encode
-            # (same logic as _online_encode_raw_batch in trainer.py)
-            z_seq_batch      = torch.zeros(B, Tmax, H, device=device)
-            z_next_seq_batch = torch.zeros(B, Tmax, H, device=device)
-            a_seq_batch      = torch.zeros(B, Tmax, dtype=torch.long, device=device)
-
-            offset = 0
+            # Store each path's valid transitions (drop paths with none).
             for b_i, T_i in enumerate(sizes.tolist()):
-                T_i = int(T_i)
-                z_i = z_all[offset:offset + T_i]      # [T_i, H]
-                z_seq_batch[b_i, :T_i]      = z_i
-                z_next_seq_batch[b_i, :T_i - 1] = z_i[1:]  # child = next in path
-                offset += T_i
-
-                # branching vars for this path
-                bv_start = int(sizes[:b_i].sum()) if b_i > 0 else 0
-                a_seq_batch[b_i, :T_i] = bvars[bv_start:bv_start + T_i]
-
-            # Store each sequence dict
-            for b_i, T_i in enumerate(sizes.tolist()):
-                T_i = int(T_i)
-                seq = {
-                    "z_seq":          z_seq_batch[b_i, :T_i].cpu(),
-                    "z_next_seq":     z_next_seq_batch[b_i, :T_i].cpu(),
-                    "a_seq":          a_seq_batch[b_i, :T_i].cpu(),
-                    "instance_weight": float(iw[b_i]),
-                }
-                if dseq is not None:
-                    seq["dir_seq"] = dseq[b_i, :T_i].cpu()
-                if bound is not None:
-                    seq["bound_seq"] = bound[b_i, :T_i].cpu()
-                if tmask is not None:
-                    seq["time_mask"] = tmask[b_i, :T_i].cpu()
-
-                # ds.index[b_i] gives (file_idx, path_indices, weight)
-                # We store all sequences for a file together
-                # Since batch may mix files, group by file_idx isn't trivial here.
-                # Use a flat list per batch instead; save per batch.
-                fi = 0  # placeholder — we save all per batch below
+                n_tr = int(T_i) - 1
+                if n_tr < 1:
+                    continue
+                seq = {k: v[b_i, :n_tr].cpu() for k, v in tr.items()}
+                seq["instance_weight"] = float(iw[b_i])
                 file_sequences.setdefault(-1, []).append(seq)
 
         except torch.cuda.OutOfMemoryError:
@@ -167,6 +139,8 @@ def main():
                         help="Output directory for cached latent .pt files")
     parser.add_argument("--config",     default=str(ROOT / "configs" / "default.yaml"))
     parser.add_argument("--max_path_len", type=int, default=32)
+    parser.add_argument("--max_vars_recon", type=int, default=64,
+                        help="Per-variable reconstruction subset size")
     parser.add_argument("--batch_size",   type=int, default=1,
                         help="Paths per encoding batch (reduce if OOM)")
     parser.add_argument("--device",     default=None)
@@ -222,6 +196,7 @@ def main():
             model, chunk, cache_dir, device,
             batch_size=args.batch_size,
             max_path_len=args.max_path_len,
+            max_vars_recon=args.max_vars_recon,
         )
         if seqs:
             torch.save(seqs, cache_key)

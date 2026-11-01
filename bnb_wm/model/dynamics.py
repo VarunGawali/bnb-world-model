@@ -181,6 +181,15 @@ class DynamicsTransformer(nn.Module):
         self.residual = residual
         self.heteroscedastic = heteroscedastic
 
+        # Inference-time sliding window over the token history (None = max_seq).
+        # Training sequences are root->leaf paths capped at `max_path_len`
+        # nodes, so positions beyond max_path_len - 1 tokens never receive a
+        # gradient. The solver sets this to that limit; the window keeps the
+        # most recent ancestors and re-indexes them from position 0, exactly as
+        # the training-time path truncation does. Not a parameter or buffer, so
+        # checkpoints are unaffected.
+        self.history_window: int | None = None
+
         # Project [z_t || a_t || dir_t] -> d_model.
         self.input_proj = nn.Linear(2 * hidden_dim + 1, hidden_dim)
 
@@ -346,8 +355,10 @@ class DynamicsTransformer(nn.Module):
         else:
             tokens = torch.cat([past_tokens, token], dim=-2)
 
-        if tokens.size(-2) > self.max_seq:
-            tokens = tokens[..., -self.max_seq:, :]
+        limit = self.max_seq if self.history_window is None else min(
+            self.max_seq, int(self.history_window))
+        if tokens.size(-2) > limit:
+            tokens = tokens[..., -limit:, :]
 
         T = tokens.size(-2)
         pos = self.pos_emb(

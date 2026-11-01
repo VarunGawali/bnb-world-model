@@ -319,7 +319,10 @@ def _cached_latent_collate(batch: list[dict]) -> dict:
             except RuntimeError:
                 # Variable-length sequences — pad to longest
                 max_len = max(v.shape[0] for v in vals)
-                padded = torch.zeros(len(vals), max_len, *vals[0].shape[1:])
+                # Keep dtype: time_mask / var_mask must stay bool (used as
+                # boolean indices); padded steps are False -> masked out.
+                padded = torch.zeros(len(vals), max_len, *vals[0].shape[1:],
+                                     dtype=vals[0].dtype)
                 for i, v in enumerate(vals):
                     padded[i, :v.shape[0]] = v
                 out[k] = padded
