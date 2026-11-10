@@ -28,7 +28,7 @@ rows:
   sb8:         {solver: classical, sb_init: 8, eta: 4}
 
   # ---- SCIP (single thread) ----
-  scip_default:    {solver: scip, variant: default}
+  scip_default:    {solver: scip, variant: default, save_solution: true}
   # branching isolated: presolve and separation off
   scip_pscost:     {solver: scip, variant: pseudocost}
   scip_fullstrong: {solver: scip, variant: fullstrong}
@@ -63,10 +63,12 @@ rows:
   cuts_attention: {solver: neural, branch_mode: policy, cut_mode: attention, size_weight: 0.0, ctg_weight: 0.0, lookahead_k: 5}
 
 groups:
-  reference: [scip_ref]
-  main:      [mf, sb4, scip_pscost, paper_policy, paper_mf_blend, paper_rollout, paper_neural_best]
-  full:      [mf, sb1, sb4, sb8, scip_default, scip_pscost, scip_fullstrong,
+  # run first: its solutions are the reference for cut-validity checks
+  reference: [scip_default]
+  # the rows of the submitted Tables 1-2 (minus Neural-Best-D3), plus SCIP
+  # with presolve and separation off to isolate branching (Z9wQ Q3)
+  tables:    [mf, sb1, sb4, sb8, scip_pscost,
               paper_policy, paper_mf_blend, paper_policy_cuts, paper_rollout,
-              paper_rollout_size, paper_neural_best, paper_neural_best_d3]
+              paper_rollout_size, paper_neural_best]
   depth:     [paper_policy, rollout_k1, rollout_k2, rollout_k3]
   cuts:      [paper_policy, cuts_random, cuts_violation, cuts_attention]
