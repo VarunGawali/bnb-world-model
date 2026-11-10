@@ -63,6 +63,52 @@ class LPResult:
     x: Optional[np.ndarray] = None
     sol: Optional[dict] = None
     basis: Optional[tuple] = None
+    # "optimal" | "infeasible" (certified, safe to prune) | "time_limit" | "error"
+    status: str = "optimal"
+
+
+# ---------------------------------------------------------------------------
+# Search status helpers (shared by both solvers)
+# ---------------------------------------------------------------------------
+
+def open_lb(heap, unresolved, global_ub) -> float:
+    lbs = [nd.lb for nd in heap] + [nd.lb for nd in unresolved]
+    return min(lbs) if lbs else global_ub
+
+
+def final_status(heap, unresolved, best_sol, global_ub, diag, gap_tol):
+    """Status and relative gap. "optimal" only when every open node was
+    certified closed, or the remaining bound gap is within tolerance."""
+    if best_sol is None:
+        if diag.get("timeout"):
+            return "timeout", np.inf
+        if diag.get("node_limit_hit"):
+            return "node_limit", np.inf
+        return ("incomplete" if (heap or unresolved) else "infeasible"), np.inf
+    global_lb = open_lb(heap, unresolved, global_ub)
+    gap = max(0.0, (global_ub - global_lb) / (abs(global_ub) + 1e-10))
+    if not heap and not unresolved:
+        return "optimal", 0.0
+    if gap < gap_tol:
+        return "optimal", gap
+    if diag.get("timeout"):
+        return "timeout", gap
+    if diag.get("node_limit_hit"):
+        return "node_limit", gap
+    return "incomplete", gap
+
+
+def incumbent_check(A: np.ndarray, b: np.ndarray, sol) -> dict:
+    """Independent feasibility check of a returned solution against Ax >= b, x binary."""
+    if sol is None:
+        return {"incumbent_checked": False}
+    x = np.asarray(sol, dtype=np.float64)
+    viol = float(np.max(np.maximum(b - A @ x, 0.0))) if len(b) else 0.0
+    nonbin = float(np.max(np.abs(x - np.round(x)))) if len(x) else 0.0
+    return {"incumbent_checked": True,
+            "incumbent_max_row_violation": viol,
+            "incumbent_max_nonbinary": nonbin,
+            "incumbent_feasible": bool(viol <= 1e-6 and nonbin <= 1e-6)}
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +150,8 @@ class LPBackend:
 
         self.lp_count: int = 0
         self.lp_time: float = 0.0
+        self.status_counts: dict[str, int] = {}
+        self.cold_retries: int = 0
 
         self._cur_lb: np.ndarray = np.zeros(self._n, dtype=np.float64)
         self._cur_ub: np.ndarray = np.ones(self._n, dtype=np.float64)
@@ -221,19 +269,17 @@ class LPBackend:
             except Exception:
                 pass
 
-        h.setOptionValue("time_limit", float(time_limit))
-        h.run()
-        self.lp_count += 1
-
-        try:
-            optimal = h.getModelStatus() == hs.HighsModelStatus.kOptimal
-        except Exception:
-            optimal = False
-
+        status = self._run(time_limit)
+        if status == "error":
+            # Warm start or numerics failed; one cold re-solve before giving up.
+            self.cold_retries += 1
+            h.clearSolver()
+            status = self._run(time_limit)
+        self.status_counts[status] = self.status_counts.get(status, 0) + 1
         self.lp_time += time.perf_counter() - t0
 
-        if not optimal:
-            return LPResult(feasible=False)
+        if status != "optimal":
+            return LPResult(feasible=False, status=status)
 
         sol = sol_from_highs(hs, h, self._n, self._n_rows)
         return LPResult(
@@ -243,6 +289,32 @@ class LPBackend:
             sol=sol,
             basis=(sol["col_status"], sol["row_status"]),
         )
+
+    def _run(self, time_limit: float) -> str:
+        hs = self._hs
+        h = self._model
+        # HiGHS measures time_limit against its run clock, which accumulates
+        # over every run() on this object, so the per-solve budget must be
+        # offset by the time already spent.
+        if np.isfinite(time_limit) and time_limit < 1e29:
+            h.setOptionValue("time_limit", float(h.getRunTime() + time_limit))
+        else:
+            h.setOptionValue("time_limit", 1e30)
+        h.run()
+        self.lp_count += 1
+        try:
+            ms = h.getModelStatus()
+        except Exception:
+            return "error"
+        M = hs.HighsModelStatus
+        if ms == M.kOptimal:
+            return "optimal"
+        # Variables are bounded in [0, 1], so "unbounded or infeasible" is infeasible.
+        if ms in (M.kInfeasible, M.kUnboundedOrInfeasible):
+            return "infeasible"
+        if ms == M.kTimeLimit:
+            return "time_limit"
+        return "error"
 
     # ------------------------------------------------------------------
     # Cuts

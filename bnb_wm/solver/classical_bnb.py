@@ -49,7 +49,9 @@ from typing import Optional
 
 import numpy as np
 
-from bnb_wm.solver.lp_backend import LPBackend, CutRecord, LPResult
+from bnb_wm.solver.lp_backend import (
+    LPBackend, CutRecord, LPResult, final_status, incumbent_check, open_lb,
+)
 from bnb_wm.solver.config import SolverConfig
 
 
@@ -219,6 +221,7 @@ class ClassicalBnBSolver:
             "primal_heur_hits": 0, "g1_bound_prune": 0,
             "g3_infeasible": 0, "g3_dominated": 0, "g4_integral": 0,
             "timeout": False, "node_limit_hit": False,
+            "lp_unresolved": 0, "cut_resolve_fallbacks": 0,
         }
 
         # Root LP
@@ -226,7 +229,8 @@ class ClassicalBnBSolver:
         root_ub = np.ones(n)
         lp = self._lp.solve(root_lb, root_ub, warm_basis=None)
         if not lp.feasible:
-            return self._result("infeasible", np.inf, None, 0, t0, np.inf)
+            status = "infeasible" if lp.status == "infeasible" else "lp_error"
+            return self._result(status, np.inf, None, 0, t0, np.inf)
 
         global_ub, best_sol = np.inf, None
         status = "infeasible"
@@ -250,10 +254,10 @@ class ClassicalBnBSolver:
 
         n_nodes = 0
         next_id = 1
+        unresolved: list[Node] = []
 
         while heap:
             if time.perf_counter() - t0 > cfg.time_limit:
-                status = status if best_sol is not None else "timeout"
                 self._diag["timeout"] = True
                 break
             if n_nodes >= cfg.node_limit:
@@ -275,7 +279,12 @@ class ClassicalBnBSolver:
                 lp = self._lp.solve(node.var_lb, node.var_ub, node.warm_basis)
             n_nodes += 1
 
-            # Gate 3: infeasible / dominated
+            # Gate 3: infeasible / dominated. Only a certified-infeasible LP
+            # prunes; a solver failure keeps the node as unresolved.
+            if not lp.feasible and lp.status != "infeasible":
+                unresolved.append(node)
+                self._diag["lp_unresolved"] += 1
+                continue
             if not lp.feasible:
                 # Update pseudocost: infeasible child = large gain
                 if node.branch_var is not None and node.parent_lb is not None:
@@ -366,16 +375,9 @@ class ClassicalBnBSolver:
                 ))
                 next_id += 1
 
-        global_lb = min((nd.lb for nd in heap), default=global_ub)
-        if best_sol is not None:
-            gap = max(0.0, (global_ub - global_lb) / (abs(global_ub) + 1e-10))
-        else:
-            gap = np.inf
-
-        if best_sol is not None and gap < cfg.gap_tolerance:
-            status = "optimal"
-        elif best_sol is not None and not heap and status != "timeout":
-            status, gap = "optimal", 0.0
+        status, gap = final_status(
+            heap, unresolved, best_sol, global_ub, self._diag, cfg.gap_tolerance)
+        self._diag["global_lb"] = open_lb(heap, unresolved, global_ub)
 
         return self._result(status, global_ub if best_sol is not None else np.inf,
                             best_sol, n_nodes, t0, gap)
@@ -457,10 +459,12 @@ class ClassicalBnBSolver:
             child_lp = self._lp.solve(vlb, vub, lp.basis)
             self._decision_lps += 1
 
-            if not child_lp.feasible:
+            if child_lp.feasible:
+                gain = max(child_lp.obj - lp.obj, 0.0)
+            elif child_lp.status == "infeasible":
                 gain = abs(self._c[j]) * 10.0
             else:
-                gain = max(child_lp.obj - lp.obj, 0.0)
+                gain = 0.0  # unresolved probe: no information
 
             f = (1.0 - frac) if direction > 0 else frac
             self._pc.update(j, direction, gain, max(f, 1e-9))
@@ -519,7 +523,11 @@ class ClassicalBnBSolver:
 
         lp2 = self._lp.solve(node.var_lb, node.var_ub, lp.basis)
         if not lp2.feasible:
-            return None
+            if lp2.status == "infeasible":
+                return None
+            # Globally valid cuts: the pre-cut LP remains a valid relaxation.
+            self._diag["cut_resolve_fallbacks"] += 1
+            return lp
         return lp2
 
     # ------------------------------------------------------------------
@@ -563,6 +571,9 @@ class ClassicalBnBSolver:
                 **self._diag,
                 "sb_init": self.sb_init,
                 "eta": self.eta,
+                "lp_status_counts": dict(self._lp.status_counts),
+                "lp_cold_retries": self._lp.cold_retries,
+                **incumbent_check(self._A, self._b, sol),
             },
         )
 

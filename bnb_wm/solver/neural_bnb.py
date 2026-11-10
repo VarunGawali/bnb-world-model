@@ -56,7 +56,9 @@ import torch
 
 from bnb_wm.features import edge_arrays
 from bnb_wm.solver.config import SolverConfig
-from bnb_wm.solver.lp_backend import LPBackend, CutRecord
+from bnb_wm.solver.lp_backend import (
+    LPBackend, CutRecord, final_status, incumbent_check, open_lb,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -100,14 +102,16 @@ class SolveResult:
 
 
 class _LP:
-    __slots__ = ("feasible", "obj", "x", "sol", "basis")
+    __slots__ = ("feasible", "obj", "x", "sol", "basis", "status")
 
-    def __init__(self, feasible, obj=None, x=None, sol=None, basis=None):
+    def __init__(self, feasible, obj=None, x=None, sol=None, basis=None,
+                 status="optimal"):
         self.feasible = feasible
         self.obj = obj
         self.x = x
         self.sol = sol
         self.basis = basis
+        self.status = status
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +185,8 @@ class NeuralBnBSolver:
 
         lp = self._lp_solve(root_lb, root_ub, warm_basis=None)
         if not lp.feasible:
-            return self._result("infeasible", np.inf, None, 0, t0, np.inf)
+            status = "infeasible" if lp.status == "infeasible" else "lp_error"
+            return self._result(status, np.inf, None, 0, t0, np.inf)
 
         global_ub, best_sol = np.inf, None
         status = "infeasible"
@@ -205,10 +210,10 @@ class NeuralBnBSolver:
 
         n_nodes = 0
         next_id = 1
+        unresolved: list[Node] = []
 
         while heap:
             if time.perf_counter() - t0 > cfg.time_limit:
-                status = "timeout" if best_sol is None else status
                 self._diag["timeout"] = True
                 break
             if n_nodes >= cfg.node_limit:
@@ -238,9 +243,18 @@ class NeuralBnBSolver:
                                     time_limit=max(remaining, 1.0))
             n_nodes += 1
 
-            # Gate 3: infeasible / dominated
+            # Gate 3: infeasible / dominated. Only a certified-infeasible LP
+            # prunes; a time limit or solver failure must not drop the node.
             if not lp.feasible:
-                self._diag["g3_infeasible"] += 1
+                if lp.status == "infeasible":
+                    self._diag["g3_infeasible"] += 1
+                    continue
+                if lp.status == "time_limit":
+                    heapq.heappush(heap, node)
+                    self._diag["timeout"] = True
+                    break
+                unresolved.append(node)
+                self._diag["lp_unresolved"] += 1
                 continue
             if lp.obj >= global_ub - 1e-6:
                 self._diag["g3_dominated"] += 1
@@ -340,16 +354,9 @@ class NeuralBnBSolver:
                 ))
                 next_id += 1
 
-        global_lb = min((nd.lb for nd in heap), default=global_ub)
-        if best_sol is not None:
-            gap = max(0.0, (global_ub - global_lb) / (abs(global_ub) + 1e-10))
-        else:
-            gap = np.inf
-
-        if best_sol is not None and gap < cfg.gap_tolerance:
-            status = "optimal"
-        elif best_sol is not None and not heap and status != "timeout":
-            status, gap = "optimal", 0.0
+        status, gap = final_status(
+            heap, unresolved, best_sol, global_ub, self._diag, cfg.gap_tolerance)
+        self._diag["global_lb"] = open_lb(heap, unresolved, global_ub)
 
         return self._result(
             status,
@@ -379,6 +386,7 @@ class NeuralBnBSolver:
             "primal_heur_hits": 0, "cuts_committed": 0, "cut_rounds_run": 0,
             "cut_gate_reason": {}, "leaf_gate_skips": 0,
             "confident_skips": 0, "timeout": False, "node_limit_hit": False,
+            "lp_unresolved": 0, "cut_resolve_fallbacks": 0,
             "cut_head_untrained": self._cut_head_untrained,
             "ors_nodes": 0, "ors_cands_seen": 0, "ors_cands_survived": 0,
             "ors_single_survivor": 0, "ors_choice_changed": 0,
@@ -395,7 +403,10 @@ class NeuralBnBSolver:
             cuts_added=len(lp.committed_cuts) if lp else 0,
             is_exact=self.cfg.is_exact,
             diagnostics={**self._diag, "timing": dict(self._timing),
-                         "config": self.cfg.to_dict()},
+                         "config": self.cfg.to_dict(),
+                         "lp_status_counts": dict(lp.status_counts) if lp else {},
+                         "lp_cold_retries": lp.cold_retries if lp else 0,
+                         **incumbent_check(self._A, self._b, sol)},
         )
 
     # ==================================================================
@@ -409,7 +420,7 @@ class NeuralBnBSolver:
         res = self._lp.solve(vlb, vub, warm_basis, time_limit=time_limit)
         self._timing["lp"] = self._lp.lp_time
         if not res.feasible:
-            return _LP(False)
+            return _LP(False, status=res.status)
         return _LP(True, obj=res.obj, x=res.x, sol=res.sol, basis=res.basis)
 
     def _lp_commit_cuts(self, cuts: list[CutData]):
@@ -816,7 +827,12 @@ class NeuralBnBSolver:
             return lp, h_vars, z, frac_idx, False
         lp2 = self._lp_solve(node.var_lb, node.var_ub, lp.basis, time_limit=remaining)
         if not lp2.feasible:
-            return None, None, None, None, True
+            if lp2.status == "infeasible":
+                return None, None, None, None, True
+            # Cuts are globally valid, so the pre-cut LP is still a valid
+            # (weaker) relaxation of this node; keep it rather than drop the node.
+            self._diag["cut_resolve_fallbacks"] += 1
+            return lp, h_vars, z, frac_idx, False
 
         self._last_cut_gain = float(lp2.obj - obj_before)
         t_enc = time.perf_counter()
