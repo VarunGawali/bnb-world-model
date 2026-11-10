@@ -98,6 +98,34 @@ def final_status(heap, unresolved, best_sol, global_ub, diag, gap_tol):
     return "incomplete", gap
 
 
+class SearchTrace:
+    """Anytime log of [t, nodes, incumbent, proven bound, open nodes]."""
+
+    def __init__(self, t0: float, every: float):
+        self.t0 = t0
+        self.every = every
+        self.points: list[list] = []
+        self._next = 0.0
+        self._last_ub = np.inf
+
+    def maybe(self, n_nodes, global_ub, heap, unresolved, force=False):
+        if self.every <= 0:
+            return
+        t = time.perf_counter() - self.t0
+        improved = global_ub < self._last_ub
+        if not (force or improved or t >= self._next):
+            return
+        self._last_ub = global_ub
+        self._next = t + self.every
+        self.points.append([
+            round(t, 3), int(n_nodes),
+            float(global_ub) if np.isfinite(global_ub) else None,
+            float(open_lb(heap, unresolved, global_ub))
+            if (heap or unresolved) else (float(global_ub) if np.isfinite(global_ub) else None),
+            len(heap) + len(unresolved),
+        ])
+
+
 def incumbent_check(A: np.ndarray, b: np.ndarray, sol) -> dict:
     """Independent feasibility check of a returned solution against Ax >= b, x binary."""
     if sol is None:

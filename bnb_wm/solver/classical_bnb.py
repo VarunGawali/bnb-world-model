@@ -51,6 +51,7 @@ import numpy as np
 
 from bnb_wm.solver.lp_backend import (
     LPBackend, CutRecord, LPResult, final_status, incumbent_check, open_lb,
+    SearchTrace,
 )
 from bnb_wm.solver.config import SolverConfig
 
@@ -255,6 +256,7 @@ class ClassicalBnBSolver:
         n_nodes = 0
         next_id = 1
         unresolved: list[Node] = []
+        trace = SearchTrace(t0, cfg.trace_every)
 
         while heap:
             if time.perf_counter() - t0 > cfg.time_limit:
@@ -263,6 +265,7 @@ class ClassicalBnBSolver:
             if n_nodes >= cfg.node_limit:
                 self._diag["node_limit_hit"] = True
                 break
+            trace.maybe(n_nodes, global_ub, heap, unresolved)
 
             node = heapq.heappop(heap)
 
@@ -375,6 +378,8 @@ class ClassicalBnBSolver:
                 ))
                 next_id += 1
 
+        trace.maybe(n_nodes, global_ub, heap, unresolved, force=True)
+        self._diag["trace"] = trace.points
         status, gap = final_status(
             heap, unresolved, best_sol, global_ub, self._diag, cfg.gap_tolerance)
         self._diag["global_lb"] = open_lb(heap, unresolved, global_ub)

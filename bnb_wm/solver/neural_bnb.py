@@ -58,6 +58,7 @@ from bnb_wm.features import edge_arrays
 from bnb_wm.solver.config import SolverConfig
 from bnb_wm.solver.lp_backend import (
     LPBackend, CutRecord, final_status, incumbent_check, open_lb,
+    SearchTrace,
 )
 
 
@@ -211,6 +212,7 @@ class NeuralBnBSolver:
         n_nodes = 0
         next_id = 1
         unresolved: list[Node] = []
+        trace = SearchTrace(t0, cfg.trace_every)
 
         while heap:
             if time.perf_counter() - t0 > cfg.time_limit:
@@ -219,6 +221,7 @@ class NeuralBnBSolver:
             if n_nodes >= cfg.node_limit:
                 self._diag["node_limit_hit"] = True
                 break
+            trace.maybe(n_nodes, global_ub, heap, unresolved)
 
             node = heapq.heappop(heap)
 
@@ -354,6 +357,8 @@ class NeuralBnBSolver:
                 ))
                 next_id += 1
 
+        trace.maybe(n_nodes, global_ub, heap, unresolved, force=True)
+        self._diag["trace"] = trace.points
         status, gap = final_status(
             heap, unresolved, best_sol, global_ub, self._diag, cfg.gap_tolerance)
         self._diag["global_lb"] = open_lb(heap, unresolved, global_ub)
@@ -369,6 +374,7 @@ class NeuralBnBSolver:
     # ==================================================================
 
     def _reset_instance_state(self):
+        self._cut_rng = np.random.default_rng(self.cfg.cut_random_seed)
         self._lp: Optional[LPBackend] = None
         self._gomory_pool: Optional[list[CutData]] = None
         self._struct_cache = None
@@ -387,6 +393,10 @@ class NeuralBnBSolver:
             "cut_gate_reason": {}, "leaf_gate_skips": 0,
             "confident_skips": 0, "timeout": False, "node_limit_hit": False,
             "lp_unresolved": 0, "cut_resolve_fallbacks": 0,
+            "cut_stats": {"rounds": 0, "pool_size": 0, "violated_seen": 0,
+                          "committed": 0, "violation_sum": 0.0,
+                          "efficacy_sum": 0.0, "bound_gain_sum": 0.0,
+                          "resolve_time": 0.0, "resolve_lps": 0},
             "cut_head_untrained": self._cut_head_untrained,
             "ors_nodes": 0, "ors_cands_seen": 0, "ors_cands_survived": 0,
             "ors_single_survivor": 0, "ors_choice_changed": 0,
@@ -794,11 +804,18 @@ class NeuralBnBSolver:
         if time.perf_counter() - self._t0 > cfg.time_limit:
             return lp, h_vars, z, frac_idx, False
         cands = self._violated_cuts(lp.x)
+        cs = self._diag["cut_stats"]
+        cs["rounds"] += 1
+        cs["pool_size"] = len(self._cut_pool())
+        cs["violated_seen"] += len(cands)
         if not cands:
             self._last_cut_gain = 0.0
             return lp, h_vars, z, frac_idx, False
 
-        if cfg.cut_mode == "heuristic":
+        if cfg.cut_mode == "random":
+            idx = self._cut_rng.permutation(len(cands))[:cfg.max_cuts_per_node]
+            chosen = [cands[i] for i in idx]
+        elif cfg.cut_mode == "heuristic":
             viol = np.array([cut.rhs - float(cut.lhs @ lp.x) for cut in cands])
             chosen = [cands[i] for i in np.argsort(-viol)[:cfg.max_cuts_per_node]]
         elif cfg.cut_mode == "attention":
@@ -821,11 +838,21 @@ class NeuralBnBSolver:
             return lp, h_vars, z, frac_idx, False
 
         obj_before = lp.obj
+        for cut in chosen:
+            nrm = float(np.linalg.norm(cut.lhs))
+            cs["committed"] += 1
+            cs["violation_sum"] += cut.rhs - float(cut.lhs @ lp.x)
+            cs["efficacy_sum"] += (cut.rhs - float(cut.lhs @ lp.x)) / max(nrm, 1e-12)
         self._lp_commit_cuts(chosen)
         remaining = cfg.time_limit - (time.perf_counter() - self._t0)
         if remaining <= 0:
             return lp, h_vars, z, frac_idx, False
+        t_rs, lp_count0 = time.perf_counter(), self._lp.lp_count
         lp2 = self._lp_solve(node.var_lb, node.var_ub, lp.basis, time_limit=remaining)
+        cs["resolve_time"] += time.perf_counter() - t_rs
+        cs["resolve_lps"] += self._lp.lp_count - lp_count0
+        if lp2.feasible:
+            cs["bound_gain_sum"] += float(lp2.obj - obj_before)
         if not lp2.feasible:
             if lp2.status == "infeasible":
                 return None, None, None, None, True

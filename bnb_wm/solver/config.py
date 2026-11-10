@@ -26,6 +26,9 @@ class SolverConfig:
     gap_tolerance: float = 1e-4
     time_limit: float = 300.0
     node_limit: int = 500_000
+    # Anytime trace: sample (time, nodes, incumbent, bound, open nodes) at
+    # this interval in seconds and on every incumbent improvement. 0 = off.
+    trace_every: float = 5.0
 
     # ------------------------------------------------------------------ #
     # Branching mode                                                       #
@@ -94,8 +97,9 @@ class SolverConfig:
     # ------------------------------------------------------------------ #
     # Cuts                                                                 #
     # ------------------------------------------------------------------ #
-    # "none" | "heuristic" | "latent" | "attention"
+    # "none" | "random" | "heuristic" (max violation) | "latent" | "attention"
     cut_mode: str = "none"
+    cut_random_seed: int = 0
     force_root_cuts: bool = False
     cut_budget_cap: int = 200
     cut_pool_max: int = 200

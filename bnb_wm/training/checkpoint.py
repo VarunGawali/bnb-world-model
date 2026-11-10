@@ -80,8 +80,10 @@ def load_weights_only(model, path, device=None):
     state = ckpt["model"] if "model" in ckpt else ckpt
     state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
 
-    # Migrate legacy _VarDynamics checkpoint (net.0/net.3) to decomposed form.
-    if any("var_dynamics.net." in k for k in state):
+    # Migrate legacy _VarDynamics checkpoint (net.0/net.3) to decomposed form,
+    # only when the model itself no longer uses the net.* layout.
+    model_has_net = any("var_dynamics.net." in k for k in model.state_dict())
+    if any("var_dynamics.net." in k for k in state) and not model_has_net:
         _, state = _VarDynamics.from_legacy_state(
             state, hidden_dim=model.dynamics.hidden_dim
         )
