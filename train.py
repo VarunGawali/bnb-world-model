@@ -180,7 +180,7 @@ def main():
     tr_files, va_files, _ = split_files(
         files,
         cfg["data"]["train_split"], cfg["data"]["val_split"],
-        cfg["data"]["test_split"],
+        cfg["data"]["test_split"], seed=args.seed,
     )
     print(f"Trajectories: {len(files)} total | {len(tr_files)} train | "
           f"{len(va_files)} val")

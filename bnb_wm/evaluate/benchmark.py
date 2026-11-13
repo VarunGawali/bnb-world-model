@@ -32,7 +32,7 @@ except ImportError:
     SCIPModel = None
 
 # Number of top-k candidates to evaluate with dynamics lookahead
-_LOOKAHEAD_K = 5
+_LOOKAHEAD_K = 3
 # Number of latent steps to unroll per candidate
 _LOOKAHEAD_DEPTH = 3
 # Discount factor per lookahead step
@@ -76,38 +76,91 @@ def apply_config(cfg: dict | None):
 
 
 def _format_obs(obs, device):
-    """Convert an Ecole NodeBipartite observation to a PyG Batch with edge_attr."""
-    vf_raw = (obs.variable_features if hasattr(obs, "variable_features")
-              else obs.column_features)
-    cf_raw = (obs.constraint_features if hasattr(obs, "constraint_features")
-              else obs.row_features)
+    """Convert an Ecole NodeBipartite observation to a PyG Batch with edge_attr.
 
-    # Clip to FEATURE_CLIP (±1e4), matching build_pyg_data so the encoder's
-    # fixed input standardisation sees the same range at train and deploy.
+    Remaps Ecole's raw NodeBipartite variable features to the 19-dim layout
+    used by collect_highs.py._var_features() so eval features match training:
+
+        Training layout (collect_highs.py):
+         0  obj_coef_norm     c / max|c|
+         1  has_lb            CONSTANT 1
+         2  has_ub            CONSTANT 1
+         3  sol_is_at_lb      LP value <= lb + eps  (lb=0 for binary)
+         4  sol_is_at_ub      LP value >= ub - eps  (rare but nonzero at depth)
+         5  basis_status      0=lower 1=basic 2=upper
+         6  reduced_cost_norm rc / max|rc|
+         7  (zero)            CONSTANT 0
+         8  n_rows_norm       degree_j / n_cons  (computed from edge_index)
+         9-12 (zeros)         CONSTANT 0
+        13  sol_val           LP solution value
+        14  sol_frac          |sol_val - round(sol_val)|  <- CRITICAL
+        15  lp_obj_norm       CONSTANT 1 (for set-cover minimisation)
+        16  n_rows_tight_norm #tight_constraints_for_j / n_cons
+        17  lb                CONSTANT 0
+        18  ub                CONSTANT 1
+
+        Ecole NodeBipartite confirmed column layout (check_feature_layout.py,
+        action_set=112, 888+112=1000 variables):
+         0  obj_coef          normalised by Ecole ‖c‖ (different scale from training)
+         1  type_binary       CONSTANT 1
+         2  type_integer      CONSTANT 0
+         3  type_implicit     CONSTANT 0
+         4  type_continuous   CONSTANT 0
+         5  has_lb            CONSTANT 1
+         6  has_ub            CONSTANT 1
+         7  normed_reduced_cost signed, Ecole-normalised
+         8  solution_value    LP solution value  [0, 1]
+         9  solution_frac     x − floor(x)  [0, 1)  (Ecole's def, NOT |x−round(x)|)
+        10  is_at_lower_bound binary mean=0.888  <- sol_is_at_lb
+        11  (other binary)    mean=0.686
+        12  scaled_age        5 unique values, [0, 0.157]
+        13  incumbent_value   binary, mean=0.047
+        14  avg_incumbent_value continuous mean=0.070  (NOT sol_frac)
+        15  is_basis_lower    sum(15,16)=1.0  mean=0.888
+        16  is_basis_basic    mean=0.112  (= #fractional / n_vars)
+        17  is_basis_upper    CONSTANT 0 for binary vars
+        18  is_basis_zero     CONSTANT 0
+
+        NOTE: Ecole col 9 is x−floor(x); training col 14 needs |x−round(x)|.
+        For x=0.94: Ecole gives 0.94, training needs 0.06.  Must recompute.
+    """
+    from bnb_wm.features import ecole_to_train_layout
     from bnb_wm.data.datasets import FEATURE_CLIP as _FC
-    vf = np.clip(np.nan_to_num(
-        np.array(vf_raw, dtype=np.float32), nan=0.0, posinf=_FC, neginf=-_FC
-    ), -_FC, _FC)
-    cf = np.clip(np.nan_to_num(
-        np.array(cf_raw, dtype=np.float32), nan=0.0, posinf=_FC, neginf=-_FC
-    ), -_FC, _FC)
+
+    vf_raw = np.array(
+        obs.variable_features if hasattr(obs, "variable_features")
+        else obs.column_features, dtype=np.float32)
+    cf_ecole = np.array(
+        obs.constraint_features if hasattr(obs, "constraint_features")
+        else obs.row_features, dtype=np.float32)
     ei = np.array(obs.edge_features.indices, dtype=np.int64)   # [2, E]
+    ev_ecole = np.array(obs.edge_features.values, dtype=np.float32)
+    if ev_ecole.ndim == 2:
+        ev_ecole = ev_ecole[:, 0]
+    ev_ecole = np.nan_to_num(ev_ecole.flatten(), nan=0.0, posinf=1e6, neginf=-1e6)
 
-    # Edge values: constraint coefficients from Ecole
-    ev_raw = np.array(obs.edge_features.values, dtype=np.float32)
-    if ev_raw.ndim == 2:
-        ev_raw = ev_raw[:, 0]
-    ev_raw = np.nan_to_num(ev_raw.flatten(), nan=0.0, posinf=1e6, neginf=-1e6)
+    # Ecole row-normalises A and flips sign for >= constraints (stored as -Ax <= -b),
+    # so edge values come out as small negatives (~-0.17).  Training used raw A entries,
+    # which are exactly 1.0 for set cover (A ∈ {0,1}, Ecole only emits nonzero edges),
+    # giving edge_attr = [1, 1, 1] on every edge.  Reconstruct that.
+    ev_raw = np.ones(ev_ecole.shape[0], dtype=np.float32)
 
-    # 3-dim edge features: [coeff, norm_coeff, sign]
-    # Ecole constraint feature layout (5-dim):
-    #   [0] obj_cosine_similarity  [1] bias/RHS  [2] is_tight
-    #   [3] dual_value             [4] age
-    # Normalise coefficient by constraint RHS (index 1 = bias).
-    con_src = ei[0]  # constraint indices (before node offset)
-    rhs_src = cf[con_src, 1] if cf.shape[1] > 1 else np.ones(len(con_src))
-    norm_ev  = ev_raw / (np.abs(rhs_src) + 1e-8)
-    sign_ev  = np.sign(ev_raw)
+    vf_raw = np.nan_to_num(vf_raw, nan=0.0, posinf=1e4, neginf=-1e4)
+    cf_ecole = np.nan_to_num(cf_ecole, nan=0.0, posinf=1e4, neginf=-1e4)
+
+    vf, cf = ecole_to_train_layout(vf_raw, cf_ecole, ei)
+    vf = np.clip(vf, -_FC, _FC)
+    cf = np.clip(cf, -_FC, _FC)
+
+    n_vars = vf.shape[0]
+    n_cons = cf.shape[0]
+
+    # --- Edge features: [coeff, coeff/|RHS|, sign(coeff)] ---
+    # cf[:,1] = 1.0 (set-cover RHS), so norm_ev = ev_raw (matches training).
+    con_src = ei[0]
+    rhs_src = cf[con_src, 1]
+    norm_ev = ev_raw / (np.abs(rhs_src) + 1e-8)
+    sign_ev = np.sign(ev_raw)
     edge_attr_np = np.stack([ev_raw, norm_ev, sign_ev], axis=1).astype(np.float32)
 
     vf_t  = torch.tensor(vf, dtype=torch.float32, device=device)

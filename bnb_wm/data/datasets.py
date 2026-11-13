@@ -907,3 +907,271 @@ def make_sequence_collate(include_vars=True):
         return out
 
     return _collate
+
+
+# Alias: EncodedSequenceDataset is the historical name for SequenceDataset.
+EncodedSequenceDataset = SequenceDataset
+
+
+# ---------------------------------------------------------------------------
+# CutTransitionDataset — cut-selection transitions (*_cut.npz files)
+# ---------------------------------------------------------------------------
+
+class CutTransitionDataset(Dataset):
+    """Minimal stub for cut-selection transitions. Skipped when no cut files exist."""
+
+    def __init__(self, files):
+        self.files = list(files)
+        self.index = []
+        for fi, f in enumerate(self.files):
+            try:
+                with np.load(f, allow_pickle=True) as d:
+                    T = int(d["n_steps"])
+                    self.index.extend([(fi, t) for t in range(T)])
+            except Exception:
+                continue
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        fi, t = self.index[idx]
+        f = self.files[fi]
+        with np.load(f, allow_pickle=True) as d:
+            vf = d["var_features"][t]
+            cf = d["con_features"][t]
+            ei = d["edge_indices"][t]
+            ev = d["edge_values"][t]
+            cut_feats = d["cut_features"][t] if "cut_features" in d else np.zeros((0, 6), np.float32)
+            cut_labels = d["cut_labels"][t] if "cut_labels" in d else np.zeros(0, np.float32)
+        graph = build_pyg_data(vf, cf, ei, ev)
+        return graph, {
+            "cut_feats":  torch.from_numpy(np.asarray(cut_feats,  dtype=np.float32)),
+            "cut_labels": torch.from_numpy(np.asarray(cut_labels, dtype=np.float32)),
+        }
+
+    @staticmethod
+    def collate(batch):
+        graphs, metas = zip(*batch)
+        return Batch.from_data_list(graphs), list(metas)
+
+
+# ---------------------------------------------------------------------------
+# RawSequenceDataset — raw PyG graphs for joint encoder+dynamics training
+# ---------------------------------------------------------------------------
+
+class RawSequenceDataset(Dataset):
+    """
+    Like SequenceDataset but returns raw (unencoded) PyG graphs so the GNN
+    encoder runs during training with gradients (joint encoder+dynamics).
+
+    Each item is a dict for one root->leaf path:
+        graphs        list[Data]   one PyG graph per path step
+        branch_vars   [T] long     chosen branching variable index (local, 0-based)
+        dir_seq       [T] float    per-NODE incoming branch direction +1/-1/0
+        bound_seq     [T] float    per-NODE normalised dual bound (P0.11)
+    These are node-aligned; raw_paths_to_transitions() shifts them onto the
+    T-1 parent->child transitions.
+        path_len      int          T (number of steps)
+        instance_weight float      1.0 (placeholder; future: per-difficulty weight)
+    """
+
+    def __init__(self, files, max_path_len=32, allow_visitation_fallback=False):
+        self.files = list(files)
+        self.max_path_len = max_path_len
+        self.allow_visitation_fallback = allow_visitation_fallback
+
+        self.index = []   # (file_idx, path)
+        for fi, f in enumerate(self.files):
+            try:
+                with np.load(f, allow_pickle=True) as d:
+                    T = int(d["n_steps"])
+                    if "node_ids" in d and "parent_ids" in d:
+                        paths = _root_to_leaf_paths(
+                            np.asarray(d["node_ids"]),
+                            np.asarray(d["parent_ids"]),
+                            self.max_path_len)
+                    elif self.allow_visitation_fallback:
+                        paths = [list(range(T))] if T >= 2 else []
+                    else:
+                        continue  # skip files without path info
+                    for p in paths:
+                        self.index.append((fi, p))
+            except Exception:
+                continue
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        fi, path = self.index[idx]
+        f = self.files[fi]
+        with np.load(f, allow_pickle=True) as d:
+            vf_all = d["var_features"]
+            cf_all = d["con_features"]
+            ei_all = d["edge_indices"]
+            ev_all = d["edge_values"]
+            bv_all = np.asarray(d["branching_vars"], dtype=np.int64)
+            # Same cross-instance target as the value head and SequenceDataset
+            # (P0.11), not the per-file min-max `norm_dual_bounds`.
+            ndb_all = gap_to_primal_norm(d) if "norm_dual_bounds" in d \
+                else np.zeros(len(path), np.float32)
+            bdir_all = np.asarray(d["branch_dirs"], dtype=np.float32) \
+                if "branch_dirs" in d else np.zeros(len(path), np.float32)
+
+        graphs = []
+        branch_vars = []
+        bound_seq = []
+        dir_seq = []
+
+        for t in path:
+            g = build_pyg_data(vf_all[t], cf_all[t], ei_all[t], ev_all[t])
+            graphs.append(g)
+            n_vars = int(vf_all[t].shape[0])
+            bv = int(bv_all[t])
+            bv = bv if 0 <= bv < n_vars else 0
+            branch_vars.append(bv)
+            bound_seq.append(float(ndb_all[t]) if t < len(ndb_all) else 0.0)
+            dir_seq.append(float(bdir_all[t]) if t < len(bdir_all) else 0.0)
+
+        return {
+            "graphs":       graphs,
+            "branch_vars":  torch.tensor(branch_vars, dtype=torch.long),
+            "bound_seq":    torch.tensor(bound_seq,   dtype=torch.float32),
+            "dir_seq":      torch.tensor(dir_seq,     dtype=torch.float32),
+            "path_len":     len(path),
+            "instance_weight": 1.0,
+        }
+
+
+def raw_paths_to_transitions(h_vars_all, z_all, var_batch, sizes, branch_vars,
+                             node_dir, node_bound, max_vars_recon=64, seed=0):
+    """Turn encoded root->leaf paths into transition-aligned dynamics targets.
+
+    Shared by the online-encoder Phase-3 path (Trainer._online_encode_raw_batch)
+    and the latent cache (scripts/prebuild_latent_cache.py) so both produce
+    exactly what SequenceDataset produces. A path of T nodes has T-1
+    transitions; transition s is parent path[s] -> child path[s+1]:
+
+        z_seq[s]          = z(path[s])
+        a_seq[s]          = h(path[s])[branch_var(path[s])]
+        z_next_seq[s]     = z(path[s+1])
+        dir_seq[s]        = direction of path[s+1] relative to its parent
+        bound_next_seq[s] = bound(path[s+1])
+        reward_seq[s]     = bound(path[s+1]) - bound(path[s])
+        hv_seq / hv_next_seq : a fixed variable subset of h at path[s] / [s+1]
+
+    Args:
+        h_vars_all : [sumV, H] per-variable embeddings for every path node
+        z_all      : [sumT, H] graph latents, one per path node, paths concatenated
+        var_batch  : [sumV] graph index of each row of h_vars_all
+        sizes      : [B] nodes per path
+        branch_vars: [sumT] local branching-variable index per node
+        node_dir   : [B, Tmax] per-NODE incoming branch direction (+1/-1/0)
+        node_bound : [B, Tmax] per-NODE normalised dual bound
+        max_vars_recon : per-variable reconstruction subset size (padded to it)
+
+    Returns a dict of [B, Tmax-1, ...] tensors plus time_mask [B, Tmax-1] and
+    var_mask [B, Tmax-1, max_vars_recon] (bool), on z_all's device.
+    """
+    device = z_all.device
+    sizes = [int(t) for t in torch.as_tensor(sizes).tolist()]
+    B, H = len(sizes), z_all.size(-1)
+    Tm = max(1, max(sizes) - 1)
+    K = int(max_vars_recon)
+
+    n_graphs = sum(sizes)
+    var_batch = var_batch.to(device)
+    nv = torch.bincount(var_batch, minlength=n_graphs).tolist()
+    starts = [0]
+    for c in nv[:-1]:
+        starts.append(starts[-1] + c)
+    bvars = torch.as_tensor(branch_vars).tolist()
+    node_dir = torch.as_tensor(node_dir).to(device=device, dtype=z_all.dtype)
+    node_bound = torch.as_tensor(node_bound).to(device=device, dtype=z_all.dtype)
+
+    out = {
+        "z_seq":          z_all.new_zeros(B, Tm, H),
+        "a_seq":          z_all.new_zeros(B, Tm, H),
+        "z_next_seq":     z_all.new_zeros(B, Tm, H),
+        "dir_seq":        z_all.new_zeros(B, Tm),
+        "bound_next_seq": z_all.new_zeros(B, Tm),
+        "reward_seq":     z_all.new_zeros(B, Tm),
+        "time_mask":      torch.zeros(B, Tm, dtype=torch.bool, device=device),
+        "hv_seq":         z_all.new_zeros(B, Tm, K, H),
+        "hv_next_seq":    z_all.new_zeros(B, Tm, K, H),
+        "var_mask":       torch.zeros(B, Tm, K, dtype=torch.bool, device=device),
+    }
+    gen = torch.Generator().manual_seed(seed)
+
+    g0 = 0
+    for i, T in enumerate(sizes):
+        n_tr = T - 1
+        if n_tr >= 1:
+            h_nodes = [h_vars_all[starts[g]:starts[g] + nv[g]]
+                       for g in range(g0, g0 + T)]
+            z_i = z_all[g0:g0 + T]
+            out["z_seq"][i, :n_tr] = z_i[:-1]
+            out["z_next_seq"][i, :n_tr] = z_i[1:]
+            for s in range(n_tr):
+                bv = bvars[g0 + s]
+                bv = bv if 0 <= bv < h_nodes[s].size(0) else 0
+                out["a_seq"][i, s] = h_nodes[s][bv]
+            out["dir_seq"][i, :n_tr] = node_dir[i, 1:T]
+            out["bound_next_seq"][i, :n_tr] = node_bound[i, 1:T]
+            out["reward_seq"][i, :n_tr] = node_bound[i, 1:T] - node_bound[i, :T - 1]
+            out["time_mask"][i, :n_tr] = True
+
+            # Variables are fixed along a path (cuts add rows, not columns).
+            n_var = min(h.size(0) for h in h_nodes)
+            k_i = min(K, n_var)
+            sub = torch.randperm(n_var, generator=gen)[:k_i].sort().values
+            sub = sub.to(device)
+            hv = torch.stack([h[sub] for h in h_nodes], dim=0)   # [T, k_i, H]
+            out["hv_seq"][i, :n_tr, :k_i] = hv[:-1]
+            out["hv_next_seq"][i, :n_tr, :k_i] = hv[1:]
+            out["var_mask"][i, :n_tr, :k_i] = True
+        g0 += T
+    return out
+
+
+def make_raw_collate():
+    """
+    Collate for RawSequenceDataset. Batches all graphs from all paths into one
+    big PyG Batch, records per-path step counts (batch_sizes) so the trainer
+    can split h_vars / z back into per-path sequences after encoding.
+    """
+    def _collate(batch):
+        all_graphs = []
+        batch_sizes = []   # number of steps (graphs) per path in this batch
+        branch_vars = []   # flat list of per-step branching var indices
+        dir_seqs    = []   # [B, Tmax] — padded below
+        bound_seqs  = []
+        iw          = []
+        Tmax = max(b["path_len"] for b in batch)
+
+        dir_pad   = torch.zeros(len(batch), Tmax)
+        bound_pad = torch.zeros(len(batch), Tmax)
+        tmask     = torch.zeros(len(batch), Tmax, dtype=torch.bool)
+
+        for i, b in enumerate(batch):
+            T = b["path_len"]
+            all_graphs.extend(b["graphs"])
+            batch_sizes.append(T)
+            branch_vars.append(b["branch_vars"])
+            dir_pad[i,   :T] = b["dir_seq"]
+            bound_pad[i, :T] = b["bound_seq"]
+            tmask[i,     :T] = True
+            iw.append(b["instance_weight"])
+
+        return {
+            "batch_graphs": Batch.from_data_list(all_graphs),
+            "batch_sizes":  torch.tensor(batch_sizes, dtype=torch.long),
+            "branch_vars":  torch.cat(branch_vars, dim=0),   # flat [sum(T)]
+            "dir_seq":      dir_pad,
+            "bound_seq":    bound_pad,
+            "time_mask":    tmask,
+            "instance_weight": torch.tensor(iw, dtype=torch.float32),
+        }
+
+    return _collate

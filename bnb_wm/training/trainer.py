@@ -29,6 +29,7 @@ from .losses import (
 )
 import json
 from .checkpoint import save_checkpoint, load_weights_only
+from bnb_wm.data.datasets import raw_paths_to_transitions
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +436,10 @@ class Trainer:
         for batch in loader:
             d = batch if isinstance(batch, dict) else dict(zip(
                 ("z_seq", "a_seq", "z_next_seq"), batch))
+            if "batch_graphs" in d and "z_seq" not in d:
+                d = self._online_encode_raw_batch(d)
+                if d is None:
+                    continue
             z_seq      = d["z_seq"].to(self.device)
             a_seq      = d["a_seq"].to(self.device)
             z_next_seq = d["z_next_seq"].to(self.device)
@@ -482,6 +487,31 @@ class Trainer:
             print(f"  saved -> {save_path}")
         return out
 
+    def _online_encode_raw_batch(self, d: dict) -> dict | None:
+        """Encode a raw-graph batch from RawSequenceDataset into transitions.
+
+        Called when _dynamics_batch_loss receives batch_graphs instead of z_seq.
+        Gradients flow through the encoder, so with --phase3_train_encoder the
+        GNN and dynamics train jointly. Produces the same transition-aligned
+        targets as SequenceDataset (per-variable recon, reward, shifted
+        direction/bound, last path node masked) via raw_paths_to_transitions.
+        Returns None on OOM (caller skips the batch).
+        """
+        try:
+            gb = d["batch_graphs"].to(self.device)
+            h_vars_all, z_all = self.model.encode(gb)
+            var_mask = gb.node_type == 0
+            return raw_paths_to_transitions(
+                h_vars_all, z_all, gb.batch[var_mask], d["batch_sizes"],
+                d["branch_vars"], d["dir_seq"], d["bound_seq"],
+                max_vars_recon=64,   # SequenceDataset default
+            )
+        except Exception as exc:
+            if _is_oom(exc):
+                _recover_oom()
+                return None
+            raise
+
     def _dynamics_batch_loss(self, batch):
         """
         Compute the Phase-3 dynamics loss for one batch.
@@ -515,6 +545,14 @@ class Trainer:
                  "var_mask"),
                 batch,
             ))
+
+        # Online encoding path: batch_graphs present means the loader yielded raw
+        # PyG graphs (RawSequenceDataset / --phase3_train_encoder). Encode the
+        # full path graph with the live encoder (gradients flow through GNN).
+        if "batch_graphs" in d and "z_seq" not in d:
+            d = self._online_encode_raw_batch(d)
+            if d is None:
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         z_seq      = d["z_seq"].to(self.device)
         a_seq      = d["a_seq"].to(self.device)
@@ -661,25 +699,37 @@ class Trainer:
                 leave=False,
             ):
                 optimizer.zero_grad(set_to_none=True)
-                with autocast("cuda", enabled=self.amp):
-                    loss = self._dynamics_batch_loss(batch)
+                try:
+                    with autocast("cuda", enabled=self.amp):
+                        loss = self._dynamics_batch_loss(batch)
 
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
 
-                total_loss += loss.item()
-                n += 1
+                    total_loss += loss.item()
+                    n += 1
+                except Exception as exc:
+                    if _is_oom(exc):
+                        _recover_oom(optimizer)
+                        continue
+                    raise
 
             # Validation
             self.model.eval()
             val_loss_sum = val_n = 0
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc="Dyn Val", leave=False):
-                    val_loss_sum += self._dynamics_batch_loss(batch).item()
-                    val_n += 1
+                    try:
+                        val_loss_sum += self._dynamics_batch_loss(batch).item()
+                        val_n += 1
+                    except Exception as exc:
+                        if _is_oom(exc):
+                            _recover_oom()
+                            continue
+                        raise
 
             train_loss = total_loss / n if n else float("inf")
             val_loss   = val_loss_sum / val_n if val_n > 0 else float("inf")
@@ -805,7 +855,7 @@ class Trainer:
                     # on its own distribution, removing the OOD gap it would
                     # otherwise face during the latent rollout at inference.
                     a_chosen = h_vars[torch.tensor(chosen_idx, device=self.device)]
-                    z_pred1, _ = self.model.dynamics_step(z, a_chosen)
+                    z_pred1 = self.model.dynamics_step(z, a_chosen)[0]
                     bvec_g   = torch.zeros(z.size(0), dtype=torch.long, device=self.device)
                     v_on_pred = self.model.value_pred(z_pred1, z_pred1, bvec_g, None)
                     v_consist = F.mse_loss(v_on_pred, v_pred_real.detach())

@@ -1,0 +1,79 @@
+# Benchmark rows for tools/run_benchmark.py.
+#
+# Every row is fully specified here; anything not listed takes the
+# SolverConfig default, and the runner writes each row's fully resolved
+# config into every result record.
+#
+# `paper_*` rows reproduce the settings that produced the submitted tables
+# (tools/benchmark_solvers.py at the time), including settings the paper
+# text did not report: lookahead_k was then 5 by default, Neural-Best used
+# rollout depth 1 with the MF blend and the size penalty, and no row used
+# cost-to-go node ordering (node_selection: bound throughout).
+# They reproduce the submitted settings, not the submitted code: they run on
+# the current solver, which fixes wrongly pruned nodes and, since dd33a44,
+# gives each child a direction-specific history token, windows the token
+# history and scores rollouts per Eq. 17. Results will differ from the paper
+# for those reasons too.
+
+common:
+  exact: true
+  node_selection: bound
+  primal_heuristic: true
+  primal_heuristic_every: 50
+  ors_cascade: false
+  katz_weight: 0.0
+  cut_pool_max: 200
+  cut_budget_cap: 200
+
+rows:
+  # ---- classical, same Python/HiGHS harness ----
+  mf:          {solver: classical, sb_init: 0, eta: 99}
+  sb1:         {solver: classical, sb_init: 1, eta: 1}
+  sb4:         {solver: classical, sb_init: 4, eta: 4}
+  sb8:         {solver: classical, sb_init: 8, eta: 4}
+
+  # ---- SCIP (single thread) ----
+  scip_default:    {solver: scip, variant: default, save_solution: true}
+  # branching isolated: presolve and separation off
+  scip_pscost:     {solver: scip, variant: pseudocost}
+  scip_fullstrong: {solver: scip, variant: fullstrong}
+  # long run used as the reference incumbent / bound; saves its solution
+  scip_ref:        {solver: scip, variant: default, time_limit: 3600, save_solution: true}
+
+  # ---- neural, as submitted ----
+  paper_policy:
+    {solver: neural, branch_mode: policy, cut_mode: none, size_weight: 0.0, ctg_weight: 0.0, lookahead_k: 5}
+  paper_mf_blend:
+    {solver: neural, branch_mode: policy, cut_mode: none, mf_blend_alpha: 0.2, lookahead_k: 5}
+  paper_policy_cuts:
+    {solver: neural, branch_mode: policy, cut_mode: attention, size_weight: 0.0, ctg_weight: 0.0, lookahead_k: 5}
+  paper_rollout:          # labelled "Rollout" / "Rollout-D1"; ran at the default depth 3
+    {solver: neural, branch_mode: rollout, cut_mode: none, lookahead_depth: 3, size_weight: 0.0, ctg_weight: 0.0, lookahead_k: 5}
+  paper_rollout_size:
+    {solver: neural, branch_mode: rollout, cut_mode: none, lookahead_depth: 1, size_weight: 1.0, ctg_weight: 0.0, lookahead_k: 5}
+  paper_neural_best:      # headline row: depth 1 + MF blend + size penalty + attention cuts
+    {solver: neural, branch_mode: rollout, cut_mode: attention, mf_blend_alpha: 0.2, lookahead_depth: 1, size_weight: 1.0, ctg_weight: 0.0, lookahead_k: 5}
+  paper_neural_best_d3:
+    {solver: neural, branch_mode: rollout, cut_mode: attention, mf_blend_alpha: 0.2, lookahead_depth: 3, size_weight: 1.0, ctg_weight: 0.0, lookahead_k: 5}
+
+  # ---- rollout-depth ablation: everything fixed except lookahead_depth ----
+  rollout_k1: {solver: neural, branch_mode: rollout, cut_mode: none, lookahead_depth: 1, lookahead_k: 3, size_weight: 0.0, ctg_weight: 0.0}
+  rollout_k2: {solver: neural, branch_mode: rollout, cut_mode: none, lookahead_depth: 2, lookahead_k: 3, size_weight: 0.0, ctg_weight: 0.0}
+  rollout_k3: {solver: neural, branch_mode: rollout, cut_mode: none, lookahead_depth: 3, lookahead_k: 3, size_weight: 0.0, ctg_weight: 0.0}
+
+  # ---- cut-selection ablation: identical to paper_policy_cuts (same certified
+  #      root Gomory pool, same cut gates and budget) except the selection rule ----
+  cuts_random:    {solver: neural, branch_mode: policy, cut_mode: random, size_weight: 0.0, ctg_weight: 0.0, lookahead_k: 5}
+  cuts_violation: {solver: neural, branch_mode: policy, cut_mode: heuristic, size_weight: 0.0, ctg_weight: 0.0, lookahead_k: 5}
+  cuts_attention: {solver: neural, branch_mode: policy, cut_mode: attention, size_weight: 0.0, ctg_weight: 0.0, lookahead_k: 5}
+
+groups:
+  # run first: its solutions are the reference for cut-validity checks
+  reference: [scip_default]
+  # the rows of the submitted Tables 1-2 (minus Neural-Best-D3), plus SCIP
+  # with presolve and separation off to isolate branching (Z9wQ Q3)
+  tables:    [mf, sb1, sb4, sb8, scip_pscost,
+              paper_policy, paper_mf_blend, paper_policy_cuts, paper_rollout,
+              paper_rollout_size, paper_neural_best]
+  depth:     [paper_policy, rollout_k1, rollout_k2, rollout_k3]
+  cuts:      [paper_policy, cuts_random, cuts_violation, cuts_attention]
