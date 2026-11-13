@@ -9,6 +9,11 @@
 # text did not report: lookahead_k was then 5 by default, Neural-Best used
 # rollout depth 1 with the MF blend and the size penalty, and no row used
 # cost-to-go node ordering (node_selection: bound throughout).
+# They reproduce the submitted settings, not the submitted code: they run on
+# the current solver, which fixes wrongly pruned nodes and, since dd33a44,
+# gives each child a direction-specific history token, windows the token
+# history and scores rollouts per Eq. 17. Results will differ from the paper
+# for those reasons too.
 
 common:
   exact: true
