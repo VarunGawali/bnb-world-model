@@ -31,6 +31,12 @@ run() {  # tier, seeds, n, out-name, extra args...
 #    the fixed solver. Before the fix these "completed" with positive gaps.
 run medium 1 10 medium_seed1_check --rows_include paper_policy paper_neural_best scip_default
 
+# 1b. Does the checkpoint's dynamics predict real transitions? (~30 min)
+#     One-step / multi-step error, change direction, and agreement of policy
+#     and rollout with real strong branching on generated instances.
+python tools/dynamics_check.py --checkpoint "$CKPT" --tier medium --seeds 0 \
+    --n_instances 10 --device "$DEVICE" --out "$OUT/dynamics_check.json"
+
 # 2. Reference solutions (SCIP default at the tier budget), needed by step 3's
 #    cut-validity check.
 run hard   "0 2 3" 5  hard_ref   --group reference
