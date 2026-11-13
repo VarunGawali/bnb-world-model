@@ -46,12 +46,18 @@ run medium "0 2 3" 10 medium_ref --group reference
 run hard   "0 2 3" 5  hard   --group tables --reference "$OUT/hard_ref.jsonl"
 run medium "0 2 3" 10 medium --group tables --reference "$OUT/medium_ref.jsonl"
 
+# 3b. Extended set: 30 easy instances (200x400), the tier where searches can
+#     finish (SCIP closes them in 5-11 s), for completed-tree node counts.
+#     Worst case ~7 h on 4 workers if nothing closes; expected far less.
+run easy "0 2 3" 10 easy_ref --group reference
+run easy "0 2 3" 10 easy --group tables --reference "$OUT/easy_ref.jsonl"
+
 # 4. Ablations on 10 medium instances (seed 0): rollout depth and cut selection.
 run medium 0 10 medium_ablations --rows_include rollout_k1 rollout_k2 rollout_k3 \
     cuts_random cuts_violation cuts_attention --reference "$OUT/medium_ref.jsonl"
 
 # 5. Analysis.
-for t in medium hard; do
+for t in easy medium hard; do
   python tools/analyze_benchmark.py "$OUT/${t}_ref.jsonl" "$OUT/$t.jsonl" \
       --baseline paper_policy --md "$OUT/$t.md" --csv "$OUT/${t}_instances.csv"
 done
