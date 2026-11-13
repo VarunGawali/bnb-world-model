@@ -111,6 +111,7 @@ def _model():
         load_weights_only(model, a["checkpoint"], device=dev)
         model.eval()
         _W["model"], _W["device"] = model, dev
+        _W["load_report"] = getattr(model, "_load_report", {})
     return _W["model"], _W["device"]
 
 
@@ -254,7 +255,7 @@ def run_job(job):
             "instance_sha": instance_hash(A, b, c), "shape": list(A.shape),
             "time_limit": cfg.get("time_limit", a["time_limit"]),
             "node_limit": a["node_limit"], "started": t_start, "error": err,
-            "host": a["host"], **rec}
+            "host": a["host"], "checkpoint_load": _W.get("load_report"), **rec}
 
 
 # --------------------------------------------------------------------------

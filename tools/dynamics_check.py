@@ -311,7 +311,8 @@ def main():
     load_weights_only(model, args.checkpoint, device=device)
     model.eval()
 
-    out = {"args": vars(args), "one_step": [], "multi_step": [], "ranking": []}
+    out = {"args": vars(args), "checkpoint_load": getattr(model, "_load_report", {}),
+           "one_step": [], "multi_step": [], "ranking": []}
     rng = np.random.default_rng(12345)
     t0 = time.time()
     for s in args.seeds:
