@@ -36,17 +36,47 @@
 \large M.Tech Project Report}
 
 % Fill in your details below.
-\author{[Student Name] \\ [Roll Number] \\[1em]
-Supervisor: [Supervisor Name] \\[1em]
-[Department] \\ [Institute]}
+\author{Varun Gawali \\ 2022CH71505 \\[1em]
+Supervisor: Prof. Hariprasad Kodamana \\[1em]
+Department of Chemical Engineering \\ IIT Delhi}
 
 \date{\today}
 % -----------------------------------------------------------------------
 
 \begin{document}
 
-\maketitle
-\thispagestyle{empty}
+\begin{titlepage}
+\centering
+\vspace*{1cm}
+{\large\bfseries M.Tech. Project Entitled\par}
+\vspace{1.2cm}
+{\LARGE\bfseries CutWorld: A Latent Dynamics Model for\\[0.3em] Unified Branch-and-Cut Control\par}
+\vspace{2cm}
+{\normalsize Submitted by\par}
+\vspace{0.3cm}
+{\Large\bfseries Varun Gawali\par}
+\vspace{0.2cm}
+{\normalsize (2022CH71505)\par}
+\vspace{1.2cm}
+% IIT Delhi logo: put the image file (e.g. iitd_logo.png) next to this .tex file.
+\IfFileExists{iitd_logo.png}{\includegraphics[width=3.2cm]{iitd_logo}}{\fbox{\parbox[c][3.2cm][c]{3.2cm}{\centering IIT Delhi logo}}}\par
+\vspace{1.5cm}
+{\bfseries Department of Chemical Engineering\\[0.3em]
+Indian Institute of Technology Delhi\\[0.3em]
+New Delhi - 110016\\[0.3em]
+November 2026\par}
+\vfill
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{|p{0.55\textwidth}|p{0.3\textwidth}|}
+\hline
+\centering\textbf{Supervisor's signature} & \centering\textbf{Date}\tabularnewline
+\hline
+\rule{0pt}{1.8cm} & \\
+\centering(Prof. Hariprasad Kodamana) & \tabularnewline
+\hline
+\end{tabular}
+\vspace*{1cm}
+\end{titlepage}
 
 \begin{abstract}
 Branch-and-Cut solvers repeatedly choose a branching variable, a cutting plane, and an open search node. These choices reshape an exponentially large search tree, but standard learned branching rules score candidates only from the current relaxation. We present \CutWorld{}, a latent decision-dynamics model that plans over candidate branching actions without solving their child linear programs. A bipartite GATv2 encoder maps the current relaxation to a global latent and per-variable embeddings. A causal Transformer then predicts the latent successor and its variable embeddings conditioned on a candidate and branch direction, allowing the policy to be re-applied to imagined states. We combine the resulting rollout value with the predicted dual-bound progress and cost-to-go, and use the shared representation to order nodes and select the root Gomory cut. Because the learned components only select among valid branches, globally valid cuts, and open-node orderings, they do not alter feasibility or bound tests. We evaluate on 30 medium ($500\times1000$, 300\,s limit) and 15 hard ($1000\times2000$, 600\,s limit) Set Cover instances drawn from three generator seeds, against most-fractional and strong-branching rules in the same Python/HiGHS harness and against SCIP. No method, SCIP included, closes these instances within the budget, so we compare primal and proven gaps at equal time using paired statistical tests. Combining the learned policy with most-fractional ranking significantly improves on the imitation policy on both tiers (proven gap 19.1\% versus 23.3\% at medium scale and 31.7\% versus 35.5\% at hard scale) and comes within 0.1 percentage points of most-fractional branching at hard scale, while most-fractional remains the strongest rule in the harness. Model inference accounts for most of the per-node cost, and an ablation shows that the cut-selection rule has no significant effect on this cut pool. We report the full evaluation pipeline, including an independent feasibility check of every returned solution, and discuss what the results imply for latent planning in exact tree search.
@@ -600,7 +630,6 @@ ramped from 1 to 3 steps, and (4)~\emph{joint fine-tuning} under
   L = L_{\pi} + 0.5\,L_V + 0.1\,L_{\mathrm{int}} + 0.1\,L_{\mathrm{consist}}
       + 0.3\,L_S + 0.5\,L_C.
 \end{equation}
-Full hyperparameters are in Appendix~\ref{app:hyper}.
 
 \subsection{Ablation}
 
@@ -609,7 +638,7 @@ To isolate the contribution of the cut-selection rule, we fix policy branching a
 \subsection{Results}
 \label{sec:results}
 
-Tables~\ref{tab:main} and~\ref{tab:hard} report the medium and hard tiers. Figures from the preliminary benchmark, which preceded the correction described in the discussion below, are shown in Figures~\ref{fig:prelim_overview} and~\ref{fig:prelim_profiles} and described in Appendix~\ref{app:prelim}. Every result passed the integrity checks: all returned solutions are feasible, and no node was pruned without a certificate.
+Tables~\ref{tab:main} and~\ref{tab:hard} report the medium and hard tiers. Figures from the preliminary benchmark, which preceded the correction described in the discussion below, are shown in Figures~\ref{fig:prelim_overview} and~\ref{fig:prelim_profiles}. Every result passed the integrity checks: all returned solutions are feasible, and no node was pruned without a certificate.
 
 \begin{table*}[t]
 \caption{Medium tier ($500\times1000$ Set Cover, 30 instances from seeds 0, 2, 3, $300$\,s limit). No run closes an instance: all runs reached the 300\,s time limit, so methods are compared at equal time. \emph{SGM nodes}: nodes processed within the budget (shift $\delta_N{=}10$), a measure of throughput rather than tree size. \emph{Primal gap}: mean distance to the best solution found by any run on the instance, Eq.~\eqref{eq:primal-gap}. \emph{Proven gap}: mean distance between a run's solution and its own certified lower bound. \emph{Primal integral}: time-average of the primal gap (lower is better). $^\ast$Presolving and separation disabled, pseudocost branching.}
@@ -752,14 +781,14 @@ Figures~\ref{fig:prelim_overview} and~\ref{fig:prelim_profiles} show the prelimi
   \caption{Preliminary benchmark: node counts of the neural configurations at termination, which was affected in the same way.}
   \label{fig:prelim_ablation}
 \end{subfigure}
-\caption{Preliminary benchmark overview (superseded; see the text of this appendix).}
+\caption{Preliminary benchmark overview (superseded; see the evaluation-protocol discussion).}
 \label{fig:prelim_overview}
 \end{figure*}
 
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{plot3_performance_profiles}
-\caption{Preliminary benchmark: performance profiles over wall-clock time. The ``solved'' fractions of the neural configurations reflect the early termination described in this appendix; under the corrected harness no method solves any of these instances within the budget.}
+\caption{Preliminary benchmark: performance profiles over wall-clock time. The ``solved'' fractions of the neural configurations reflect the early termination described in the evaluation-protocol discussion; under the corrected harness no method solves any of these instances within the budget.}
 \label{fig:prelim_profiles}
 \end{figure*}
 
@@ -811,33 +840,7 @@ The following steps are needed to complete the project.
 \bibliographystyle{plainnat}
 
 % -----------------------------------------------------------------------
-\appendix
 
-\section{Hyperparameters}
-\label{app:hyper}
-
-Training configuration: hidden dimension 128; GNN layers~3, attention heads~4
-(head dimension 32, concatenated to 128); Transformer layers~4, heads~4, FFN
-width~512 ($4d$), max sequence length~512; optimizer AdamW, weight decay
-$10^{-4}$, gradient clipping at 1.0, cosine learning-rate schedule, automatic
-mixed precision on GPU; five-stage curriculum with per-stage learning rate,
-epoch cap, and patience as in Section~\ref{sec:training} (patience 6 for all
-stages except dynamics, patience 12). Planning rollout: top-$k=3$ candidates,
-lookahead depth $K=3$, discount $\gamma=0.95$,
-branching factor $b=2$ as configurable defaults. The evaluated Neural-Best
-configuration uses a depth-one rollout over the top-5 policy candidates (both
-branch directions), \texttt{size\_weight=1.0}, \texttt{ctg\_weight=0}, a
-policy/most-fractional rank blend of $\alpha=0.20$, the attention cut-selection
-rule, bound-based node ordering, and a primal heuristic invoked every 50 nodes
-and at the root. Training data:
-1{,}000 randomly generated Set Cover instances ($500\times1000$, constraint
-density $0.05$), split 80/10/10 into train/validation/test, with
-strong-branching trajectories collected using the HiGHS LP solver.
-
-\section{Preliminary Benchmark (Superseded)}
-\label{app:prelim}
-
-This appendix describes the preliminary benchmark (10 medium and 5 hard instances from generator seed~1), run before the correction to LP time-limit handling described in Section~\ref{sec:results}. In those runs, node LPs that reached the LP solver's cumulative time limit were treated as infeasible, which emptied the open-node queue early, so the neural configurations appeared to finish within the budget. Re-running the same instances with the corrected harness closes no instance for any method. The completion times, completed-tree node counts, and solved fractions in Figures~\ref{fig:prelim_overview} and~\ref{fig:prelim_profiles}, which show this benchmark, are therefore not valid measurements; they are kept only as a record of the preliminary study. All conclusions in this report rest on the corrected results in Tables~\ref{tab:main}--\ref{tab:cuts}.
 
 
 
