@@ -50,7 +50,7 @@ def _frac(y):
     return y - np.floor(y)
 
 
-def generate_root_gomory_cuts(A, b, c, highspy, max_cuts=50, tol=1e-6):
+def generate_root_gomory_cuts(A, b, c, highspy, max_cuts=50, tol=1e-6, time_limit=60.0):
     """
     Generate globally valid Gomory fractional cuts at the root.
 
@@ -96,7 +96,8 @@ def generate_root_gomory_cuts(A, b, c, highspy, max_cuts=50, tol=1e-6):
 
     # ---- solve the standard-form LP with highspy, read the basis -----------
     try:
-        basic_cols, zval = _solve_standard_form(highspy, E, d, cost, N, M, tol)
+        basic_cols, zval = _solve_standard_form(highspy, E, d, cost, N, M, tol,
+                                                time_limit=time_limit)
     except Exception:
         return []
     if basic_cols is None:
@@ -162,7 +163,7 @@ def generate_root_gomory_cuts(A, b, c, highspy, max_cuts=50, tol=1e-6):
     return cuts
 
 
-def _solve_standard_form(highspy, E, d, cost, N, M, tol):
+def _solve_standard_form(highspy, E, d, cost, N, M, tol, time_limit=60.0):
     """
     Solve  min cost^T z  s.t.  E z = d,  z >= 0  with highspy, and return
     (basic_column_indices, z_values). Returns (None, None) if not solved.
@@ -201,6 +202,7 @@ def _solve_standard_form(highspy, E, d, cost, N, M, tol):
 
     h = highspy.Highs()
     h.setOptionValue("output_flag", False)
+    h.setOptionValue("time_limit", float(time_limit))
     if h.passModel(lp) != highspy.HighsStatus.kOk:
         return None, None
     h.run()
