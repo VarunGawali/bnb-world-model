@@ -1,5 +1,9 @@
-\documentclass{article}
-\usepackage{iclr2027_conference,times}
+\documentclass[11pt,a4paper]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{times}
+\usepackage[round]{natbib}
+\usepackage{setspace}
+\onehalfspacing
 
 \usepackage{hyperref}
 \usepackage{url}
@@ -28,21 +32,29 @@
 \newcommand{\R}{\mathbb{R}}
 
 % -----------------------------------------------------------------------
-\title{CutWorld: A Latent Dynamics Model for Unified Branch-and-Cut Control}
+\title{\textbf{CutWorld: A Latent Dynamics Model for Unified Branch-and-Cut Control}\\[1.5em]
+\large M.Tech Project Report}
 
-% Authors must not appear in the submitted version.
-% \author{...}
+% Fill in your details below.
+\author{[Student Name] \\ [Roll Number] \\[1em]
+Supervisor: [Supervisor Name] \\[1em]
+[Department] \\ [Institute]}
 
-% \iclrfinalcopy  % Uncomment for camera-ready version only
+\date{\today}
 % -----------------------------------------------------------------------
 
 \begin{document}
 
 \maketitle
+\thispagestyle{empty}
 
 \begin{abstract}
 Branch-and-Cut solvers repeatedly choose a branching variable, a cutting plane, and an open search node. These choices reshape an exponentially large search tree, but standard learned branching rules score candidates only from the current relaxation. We present \CutWorld{}, a latent decision-dynamics model that plans over candidate branching actions without solving their child linear programs. A bipartite GATv2 encoder maps the current relaxation to a global latent and per-variable embeddings. A causal Transformer then predicts the latent successor and its variable embeddings conditioned on a candidate and branch direction, allowing the policy to be re-applied to imagined states. We combine the resulting rollout value with the predicted dual-bound progress and cost-to-go, and use the shared representation to order nodes and select the root Gomory cut. Because the learned components only select among valid branches, globally valid cuts, and open-node orderings, they do not alter feasibility or bound tests. We evaluate on 30 medium ($500\times1000$, 300\,s limit) and 15 hard ($1000\times2000$, 600\,s limit) Set Cover instances drawn from three generator seeds, against most-fractional and strong-branching rules in the same Python/HiGHS harness and against SCIP. No method, SCIP included, closes these instances within the budget, so we compare primal and proven gaps at equal time using paired statistical tests. Combining the learned policy with most-fractional ranking significantly improves on the imitation policy on both tiers (proven gap 19.1\% versus 23.3\% at medium scale and 31.7\% versus 35.5\% at hard scale) and comes within 0.1 percentage points of most-fractional branching at hard scale, while most-fractional remains the strongest rule in the harness. Model inference accounts for most of the per-node cost, and an ablation shows that the cut-selection rule has no significant effect on this cut pool. We report the full evaluation pipeline, including an independent feasibility check of every returned solution, and discuss what the results imply for latent planning in exact tree search.
 \end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
 
 % -----------------------------------------------------------------------
 \section{Introduction}
@@ -600,7 +612,7 @@ To isolate the contribution of the cut-selection rule, we fix policy branching a
 Tables~\ref{tab:main} and~\ref{tab:hard} report the medium and hard tiers. Every result passed the integrity checks: all returned solutions are feasible, and no node was pruned without a certificate.
 
 \begin{table*}[t]
-\caption{Medium tier ($500\times1000$ Set Cover, 30 instances from seeds 0, 2, 3, $300$\,s limit). No run closes an instance, so all runs use the full budget and methods are compared at equal time. \emph{SGM nodes}: nodes processed within the budget (shift $\delta_N{=}10$), a measure of throughput rather than tree size. \emph{Primal gap}: mean distance to the best solution found by any run on the instance, Eq.~\eqref{eq:primal-gap}. \emph{Proven gap}: mean distance between a run's solution and its own certified lower bound. \emph{Primal integral}: time-average of the primal gap (lower is better). $^\ast$Presolving and separation disabled, pseudocost branching.}
+\caption{Medium tier ($500\times1000$ Set Cover, 30 instances from seeds 0, 2, 3, $300$\,s limit). No run closes an instance: all runs reached the 300\,s time limit, so methods are compared at equal time. \emph{SGM nodes}: nodes processed within the budget (shift $\delta_N{=}10$), a measure of throughput rather than tree size. \emph{Primal gap}: mean distance to the best solution found by any run on the instance, Eq.~\eqref{eq:primal-gap}. \emph{Proven gap}: mean distance between a run's solution and its own certified lower bound. \emph{Primal integral}: time-average of the primal gap (lower is better). $^\ast$Presolving and separation disabled, pseudocost branching.}
 \label{tab:main}
 \begin{center}
 \begin{tabular}{lccccc}
@@ -630,7 +642,7 @@ Policy (imitation)     & 0\% & 2{,}711 & 6.11\% & 23.25\% & 0.066 \\
 \end{table*}
 
 \begin{table}[t]
-\caption{Hard tier ($1000\times2000$ Set Cover, 15 instances from seeds 0, 2, 3, $600$\,s limit). Columns as in Table~\ref{tab:main}; no run closes an instance. $^\ast$Presolving and separation disabled, pseudocost branching.}
+\caption{Hard tier ($1000\times2000$ Set Cover, 15 instances from seeds 0, 2, 3, $600$\,s limit). Columns as in Table~\ref{tab:main}. No run closes an instance: all runs reached the 600\,s time limit. $^\ast$Presolving and separation disabled, pseudocost branching.}
 \label{tab:hard}
 \begin{center}
 \small
@@ -683,7 +695,7 @@ At equal time, the rollout configurations do not change the final gaps relative 
 Table~\ref{tab:cuts} isolates the cut-selection rule. On this pool, the three rules are statistically indistinguishable from each other and from branching without cuts: no comparison reaches significance in either primal or proven gap, and all ratios to the policy lie within a few percent of one. Adding the attention-selected cut pool to the policy likewise leaves the main-table gaps unchanged on both tiers (Tables~\ref{tab:main} and~\ref{tab:hard}). The root LP of these Set Cover instances is already relatively tight, and a small number of root cuts moves the bound only slightly, so on this benchmark the choice of rule matters less than whether the pool contains cuts that tighten the relaxation substantially.
 
 \begin{table}[t]
-\caption{Cut-selection ablation: 10 medium instances (seed 0), 300\,s limit. Policy branching with the same certified root Gomory pool, cut gates, and budget; only the selection rule changes. \emph{Ratio}: proven gap relative to the policy without cuts (ratio of shifted geometric means; above 1 is worse), with a bootstrap 95\% confidence interval. \emph{W/L}: instances where the rule's proven gap is lower/higher than the policy's. $p$: Wilcoxon signed-rank test on proven and primal gap.}
+\caption{Cut-selection ablation: 10 medium instances (seed 0), 300\,s limit. All runs reached the 300\,s time limit. Policy branching with the same certified root Gomory pool, cut gates, and budget; only the selection rule changes. \emph{Ratio}: proven gap relative to the policy without cuts (ratio of shifted geometric means; above 1 is worse), with a bootstrap 95\% confidence interval. \emph{W/L}: instances where the rule's proven gap is lower/higher than the policy's. $p$: Wilcoxon signed-rank test on proven and primal gap.}
 \label{tab:cuts}
 \begin{center}
 \small
@@ -736,13 +748,13 @@ This work presents a computational method for Branch-and-Cut optimization and ev
 
 \section*{Reproducibility Statement}
 
-We have taken several steps to support reproducibility of our work. An anonymized version of the code, together with the instance-generation scripts, training scripts, and random seeds used in the experiments, is provided as supplementary material. The main paper describes the proposed method, experimental setup, and evaluation protocol, while the supplementary material provides the full hyperparameter configuration, data generation procedure, and additional implementation details. The computational environment used for the experiments is also reported to facilitate the reproduction of the results.
+We have taken several steps to support reproducibility of our work. The code, together with the instance-generation scripts, training scripts, and random seeds used in the experiments, is available in the project repository. This report describes the proposed method, experimental setup, and evaluation protocol, while the repository provides the full hyperparameter configuration, data generation procedure, and additional implementation details. The computational environment used for the experiments is also reported to facilitate the reproduction of the results.
 
 
 
 % -----------------------------------------------------------------------
 \bibliography{references}
-\bibliographystyle{iclr2027_conference}
+\bibliographystyle{plainnat}
 
 % -----------------------------------------------------------------------
 \appendix
@@ -772,10 +784,7 @@ strong-branching trajectories collected using the HiGHS LP solver.
 \label{app:features}
 
 Variable and constraint node feature descriptions for the HiGHS bipartite graph
-representation to be included in the camera-ready version.
+representation to be included in the final version.
 
-% The ICLR Paper Checklist from the conference submission is omitted from this
-% report: it is specific to the ICLR submission, and several of its answers
-% described the preliminary benchmark.
 
 \end{document}
