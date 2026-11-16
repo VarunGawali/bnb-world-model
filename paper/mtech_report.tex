@@ -609,7 +609,7 @@ To isolate the contribution of the cut-selection rule, we fix policy branching a
 \subsection{Results}
 \label{sec:results}
 
-Tables~\ref{tab:main} and~\ref{tab:hard} report the medium and hard tiers. Every result passed the integrity checks: all returned solutions are feasible, and no node was pruned without a certificate.
+Tables~\ref{tab:main} and~\ref{tab:hard} report the medium and hard tiers, and Figures~\ref{fig:gap_nodes}--\ref{fig:anytime} show the same runs per instance, per method, and over time. Every result passed the integrity checks: all returned solutions are feasible, and no node was pruned without a certificate.
 
 \begin{table*}[t]
 \caption{Medium tier ($500\times1000$ Set Cover, 30 instances from seeds 0, 2, 3, $300$\,s limit). No run closes an instance: all runs reached the 300\,s time limit, so methods are compared at equal time. \emph{SGM nodes}: nodes processed within the budget (shift $\delta_N{=}10$), a measure of throughput rather than tree size. \emph{Primal gap}: mean distance to the best solution found by any run on the instance, Eq.~\eqref{eq:primal-gap}. \emph{Proven gap}: mean distance between a run's solution and its own certified lower bound. \emph{Primal integral}: time-average of the primal gap (lower is better). $^\ast$Presolving and separation disabled, pseudocost branching.}
@@ -672,11 +672,26 @@ Rollout+Size ($K{=}1$) & 0\% & 2{,}191 & 3.82\% & 35.70\% & 0.042 \\
 \end{center}
 \end{table}
 
-% Figures from the preliminary benchmark (plot1_nodes_vs_time,
-% plot2_neural_ablation, plot3_performance_profiles) show completion times
-% and completed-tree node counts that the corrected evaluation does not
-% reproduce, so they are omitted here. Regenerate them from the corrected
-% results before including them again.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{plot1_gap_vs_nodes}
+\caption{Proven gap at the time limit against the number of nodes explored, one point per run, on the medium (left) and hard (right) tiers. All runs reached the time limit, so the horizontal axis measures search throughput rather than tree size. Neural configurations explore fewer nodes because model inference adds to the cost of every node; the configurations that blend the policy with fractionality (MF-blend, Neural-Best) come close to the gaps of the classical rules despite this. SCIP node counts come from a different solver and are not directly comparable.}
+\label{fig:gap_nodes}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{plot2_gap_by_method}
+\caption{Mean gap at the time limit per method on the medium (left) and hard (right) tiers. Light bars: proven gap, against each run's own certified lower bound. Dark bars: primal gap, against the best solution found by any run on the instance. Lower is better. The values match Tables~\ref{tab:main} and~\ref{tab:hard}.}
+\label{fig:gap_methods}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{plot3_anytime_gap}
+\caption{Mean primal gap over time on the medium (left) and hard (right) tiers, computed from the anytime trace of every run (incumbent recorded every 5\,s and at each improvement). Before a run's first solution its gap is counted at the 10\% cap. SCIP records no trace and is not shown. The area under each curve corresponds to the primal integral in Tables~\ref{tab:main} and~\ref{tab:hard}.}
+\label{fig:anytime}
+\end{figure*}
 
 \paragraph{Most-fractional is the strongest rule in the harness.}
 On the hard tier, most-fractional branching has the smallest primal gap (0.81\%), proven gap (31.64\%), and primal integral of all methods, including SCIP. On the medium tier, SCIP finds the best solutions (primal gap 0.73\%), while most-fractional has the best primal integral among the methods for which we record it and a proven gap within 0.3 percentage points of the best strong-branching rule. Spending LP solves on strong-branching probes reduces throughput on these instances without improving the final gaps.
