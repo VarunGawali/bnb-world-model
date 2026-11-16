@@ -782,18 +782,27 @@ We evaluated the system on 45 Set Cover instances from three generator seeds, ag
 These results point to concrete next steps: cheaper inference through batched or incremental encoding, evaluation at equal node counts and on instances small enough to solve to optimality, retraining the dynamics model on a broader instance distribution, and richer cut pools in which selection matters. More broadly, we view CutWorld as a step toward learned dynamics models for optimization, in which a solver's sequential decisions can be planned in imagination rather than resolved by fixed heuristics. Exact tree search is a demanding setting for this idea, and the evaluation infrastructure developed here provides a sound basis for measuring progress toward it.
 
 
-\section*{AI Use Statement}
+% -----------------------------------------------------------------------
+\section{Future Scope}
+\label{sec:future}
 
-We used generative AI tools for limited language-related assistance, including grammar correction, proofreading, improving clarity and readability, and minor suggestions for wording and presentation. Generative AI tools were not used to generate the core technical ideas, methodology, experimental design, results, or conclusions of this work. All AI-assisted content was reviewed and edited by the authors, and the final manuscript was checked for correctness and consistency. The authors take full responsibility for the final content of the work, including all claims, text, and other artifacts produced with the aid of generative AI.
+The following steps are needed to complete the project.
 
-
-\section*{Ethics Statement}
-
-This work presents a computational method for Branch-and-Cut optimization and evaluates it using synthetically generated Set Cover instances. The study does not involve human subjects, personal data, or sensitive data. The authors are not aware of any additional ethical concerns arising from the methods, data, or experiments presented in this work.
-
-\section*{Reproducibility Statement}
-
-We have taken several steps to support reproducibility of our work. The code, together with the instance-generation scripts, training scripts, and random seeds used in the experiments, is available in the project repository. This report describes the proposed method, experimental setup, and evaluation protocol, while the repository provides the full hyperparameter configuration, data generation procedure, and additional implementation details. The computational environment used for the experiments is also reported to facilitate the reproduction of the results.
+\begin{itemize}
+  \item \textbf{Corrected figures.} Generate the figures from the corrected benchmark (the plotting script is ready) and replace the preliminary-benchmark figures.
+  \item \textbf{Solvable instances.} Evaluate on smaller instances ($200\times400$) that every method can solve to optimality, to measure tree size and time to optimality directly.
+  \item \textbf{Decision quality per node.} Compare methods at equal node counts using the recorded anytime traces, separating decision quality from inference speed.
+  \item \textbf{Dynamics validation.} Measure one-step and multi-step prediction error of the latent and per-variable transitions, and how often rollout ranks branching candidates like real strong branching.
+  \item \textbf{Model consistency.} Restore the constraint-context projection in the dynamics model, or retrain without it, so the evaluated model matches the trained one.
+  \item \textbf{Dynamics retraining.} Retrain the dynamics stage with the corrected sequence targets, so the per-variable transition and reward heads receive full supervision.
+  \item \textbf{Faster inference.} Reduce per-node model cost below the LP solve time through incremental re-encoding, batched rollout of candidates, and caching of constant features.
+  \item \textbf{Method--implementation alignment.} Implement and evaluate policy-anchored score blending (Eq.~\eqref{eq:anchored-policy}), cost-to-go node ordering, and the cut score of Eq.~\eqref{eq:cut-score} as described.
+  \item \textbf{Richer cut pools.} Add multi-round, node-level, and additional cut families, where the choice of selection rule can matter.
+  \item \textbf{Broader benchmarks.} Extend to combinatorial auctions, facility location, and maximum independent set, varied densities and sizes, and a MIPLIB subset.
+  \item \textbf{Stronger baselines.} Compare with a GCNN imitation baseline, recent model-based branching methods such as PlanB\&B, and a tuned SCIP configuration.
+  \item \textbf{Robustness.} Train several checkpoints with different seeds, report variance across them, and measure peak memory and timing on a dedicated machine.
+  \item \textbf{Artifacts.} Release the checkpoint, raw results, instance hashes, and exact commands for full reproducibility.
+\end{itemize}
 
 
 
@@ -830,12 +839,6 @@ strong-branching trajectories collected using the HiGHS LP solver.
 
 This appendix describes the preliminary benchmark (10 medium and 5 hard instances from generator seed~1), run before the correction to LP time-limit handling described in Section~\ref{sec:results}. In those runs, node LPs that reached the LP solver's cumulative time limit were treated as infeasible, which emptied the open-node queue early, so the neural configurations appeared to finish within the budget. Re-running the same instances with the corrected harness closes no instance for any method. The completion times, completed-tree node counts, and solved fractions in Figures~\ref{fig:prelim_overview} and~\ref{fig:prelim_profiles}, which show this benchmark, are therefore not valid measurements; they are kept only as a record of the preliminary study. All conclusions in this report rest on the corrected results in Tables~\ref{tab:main}--\ref{tab:cuts}.
 
-
-\section{Feature Tables}
-\label{app:features}
-
-Variable and constraint node feature descriptions for the HiGHS bipartite graph
-representation to be included in the final version.
 
 
 \end{document}
