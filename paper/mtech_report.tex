@@ -609,7 +609,7 @@ To isolate the contribution of the cut-selection rule, we fix policy branching a
 \subsection{Results}
 \label{sec:results}
 
-Tables~\ref{tab:main} and~\ref{tab:hard} report the medium and hard tiers, and Figures~\ref{fig:gap_nodes}--\ref{fig:anytime} show the same runs per instance, per method, and over time. Every result passed the integrity checks: all returned solutions are feasible, and no node was pruned without a certificate.
+Tables~\ref{tab:main} and~\ref{tab:hard} report the medium and hard tiers. Figures from the preliminary benchmark, which preceded the correction described in the discussion below, are reproduced in Appendix~\ref{app:prelim} for reference. Every result passed the integrity checks: all returned solutions are feasible, and no node was pruned without a certificate.
 
 \begin{table*}[t]
 \caption{Medium tier ($500\times1000$ Set Cover, 30 instances from seeds 0, 2, 3, $300$\,s limit). No run closes an instance: all runs reached the 300\,s time limit, so methods are compared at equal time. \emph{SGM nodes}: nodes processed within the budget (shift $\delta_N{=}10$), a measure of throughput rather than tree size. \emph{Primal gap}: mean distance to the best solution found by any run on the instance, Eq.~\eqref{eq:primal-gap}. \emph{Proven gap}: mean distance between a run's solution and its own certified lower bound. \emph{Primal integral}: time-average of the primal gap (lower is better). $^\ast$Presolving and separation disabled, pseudocost branching.}
@@ -672,26 +672,31 @@ Rollout+Size ($K{=}1$) & 0\% & 2{,}191 & 3.82\% & 35.70\% & 0.042 \\
 \end{center}
 \end{table}
 
-\begin{figure*}[t]
-\centering
-\includegraphics[width=\textwidth]{plot1_gap_vs_nodes}
-\caption{Proven gap at the time limit against the number of nodes explored, one point per run, on the medium (left) and hard (right) tiers. All runs reached the time limit, so the horizontal axis measures search throughput rather than tree size. Neural configurations explore fewer nodes because model inference adds to the cost of every node; the configurations that blend the policy with fractionality (MF-blend, Neural-Best) come close to the gaps of the classical rules despite this. SCIP node counts come from a different solver and are not directly comparable.}
-\label{fig:gap_nodes}
-\end{figure*}
-
-\begin{figure*}[t]
-\centering
-\includegraphics[width=\textwidth]{plot2_gap_by_method}
-\caption{Mean gap at the time limit per method on the medium (left) and hard (right) tiers. Light bars: proven gap, against each run's own certified lower bound. Dark bars: primal gap, against the best solution found by any run on the instance. Lower is better. The values match Tables~\ref{tab:main} and~\ref{tab:hard}.}
-\label{fig:gap_methods}
-\end{figure*}
-
-\begin{figure*}[t]
-\centering
-\includegraphics[width=\textwidth]{plot3_anytime_gap}
-\caption{Mean primal gap over time on the medium (left) and hard (right) tiers, computed from the anytime trace of every run (incumbent recorded every 5\,s and at each improvement). Before a run's first solution its gap is counted at the 10\% cap. SCIP records no trace and is not shown. The area under each curve corresponds to the primal integral in Tables~\ref{tab:main} and~\ref{tab:hard}.}
-\label{fig:anytime}
-\end{figure*}
+% Figures from the corrected benchmark. Generate the image files with
+%   python paper/make_report_plots.py results/rebuttal/medium.jsonl \
+%     results/rebuttal/medium_ref.jsonl results/rebuttal/hard.jsonl \
+%     results/rebuttal/hard_ref.jsonl --out paper/
+% then uncomment the three figures below and the sentence referring to them.
+% \begin{figure*}[t]
+% \centering
+% \includegraphics[width=\textwidth]{plot1_gap_vs_nodes}
+% \caption{Proven gap at the time limit against the number of nodes explored, one point per run, on the medium (left) and hard (right) tiers. All runs reached the time limit, so the horizontal axis measures search throughput rather than tree size. Neural configurations explore fewer nodes because model inference adds to the cost of every node; the configurations that blend the policy with fractionality (MF-blend, Neural-Best) come close to the gaps of the classical rules despite this. SCIP node counts come from a different solver and are not directly comparable.}
+% \label{fig:gap_nodes}
+% \end{figure*}
+%
+% \begin{figure*}[t]
+% \centering
+% \includegraphics[width=\textwidth]{plot2_gap_by_method}
+% \caption{Mean gap at the time limit per method on the medium (left) and hard (right) tiers. Light bars: proven gap, against each run's own certified lower bound. Dark bars: primal gap, against the best solution found by any run on the instance. Lower is better. The values match Tables~\ref{tab:main} and~\ref{tab:hard}.}
+% \label{fig:gap_methods}
+% \end{figure*}
+%
+% \begin{figure*}[t]
+% \centering
+% \includegraphics[width=\textwidth]{plot3_anytime_gap}
+% \caption{Mean primal gap over time on the medium (left) and hard (right) tiers, computed from the anytime trace of every run (incumbent recorded every 5\,s and at each improvement). Before a run's first solution its gap is counted at the 10\% cap. SCIP records no trace and is not shown. The area under each curve corresponds to the primal integral in Tables~\ref{tab:main} and~\ref{tab:hard}.}
+% \label{fig:anytime}
+% \end{figure*}
 
 \paragraph{Most-fractional is the strongest rule in the harness.}
 On the hard tier, most-fractional branching has the smallest primal gap (0.81\%), proven gap (31.64\%), and primal integral of all methods, including SCIP. On the medium tier, SCIP finds the best solutions (primal gap 0.73\%), while most-fractional has the best primal integral among the methods for which we record it and a proven gap within 0.3 percentage points of the best strong-branching rule. Spending LP solves on strong-branching probes reduces throughput on these instances without improving the final gaps.
@@ -794,6 +799,35 @@ and at the root. Training data:
 1{,}000 randomly generated Set Cover instances ($500\times1000$, constraint
 density $0.05$), split 80/10/10 into train/validation/test, with
 strong-branching trajectories collected using the HiGHS LP solver.
+
+\section{Preliminary Benchmark (Superseded)}
+\label{app:prelim}
+
+The figures in this appendix come from the preliminary benchmark (10 medium and 5 hard instances from generator seed~1), run before the correction to LP time-limit handling described in Section~\ref{sec:results}. In those runs, node LPs that reached the LP solver's cumulative time limit were treated as infeasible, which emptied the open-node queue early, so the neural configurations appeared to finish within the budget. Re-running the same instances with the corrected harness closes no instance for any method. The completion times, completed-tree node counts, and solved fractions shown here are therefore not valid measurements; they are kept only as a record of the preliminary study. All conclusions in this report rest on the corrected results in Tables~\ref{tab:main}--\ref{tab:cuts}.
+
+\begin{figure*}[h]
+\centering
+\begin{subfigure}[t]{0.56\textwidth}
+  \includegraphics[width=\textwidth]{plot1_nodes_vs_time}
+  \caption{Preliminary benchmark: B\&B nodes against wall time. The neural finishing times reflect the early termination described above, not completed searches.}
+  \label{fig:prelim_nodes_time}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.41\textwidth}
+  \includegraphics[width=\textwidth]{plot2_neural_ablation}
+  \caption{Preliminary benchmark: node counts of the neural configurations at termination, which was affected in the same way.}
+  \label{fig:prelim_ablation}
+\end{subfigure}
+\caption{Preliminary benchmark overview (superseded; see the text of this appendix).}
+\label{fig:prelim_overview}
+\end{figure*}
+
+\begin{figure*}[h]
+\centering
+\includegraphics[width=\textwidth]{plot3_performance_profiles}
+\caption{Preliminary benchmark: performance profiles over wall-clock time. The ``solved'' fractions of the neural configurations reflect the early termination described in this appendix; under the corrected harness no method solves any of these instances within the budget.}
+\label{fig:prelim_profiles}
+\end{figure*}
 
 \section{Feature Tables}
 \label{app:features}
