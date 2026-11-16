@@ -609,7 +609,7 @@ To isolate the contribution of the cut-selection rule, we fix policy branching a
 \subsection{Results}
 \label{sec:results}
 
-Tables~\ref{tab:main} and~\ref{tab:hard} report the medium and hard tiers. Figures from the preliminary benchmark, which preceded the correction described in the discussion below, are reproduced in Appendix~\ref{app:prelim} for reference. Every result passed the integrity checks: all returned solutions are feasible, and no node was pruned without a certificate.
+Tables~\ref{tab:main} and~\ref{tab:hard} report the medium and hard tiers. Figures from the preliminary benchmark, which preceded the correction described in the discussion below, are shown in Figures~\ref{fig:prelim_overview} and~\ref{fig:prelim_profiles} and described in Appendix~\ref{app:prelim}. Every result passed the integrity checks: all returned solutions are feasible, and no node was pruned without a certificate.
 
 \begin{table*}[t]
 \caption{Medium tier ($500\times1000$ Set Cover, 30 instances from seeds 0, 2, 3, $300$\,s limit). No run closes an instance: all runs reached the 300\,s time limit, so methods are compared at equal time. \emph{SGM nodes}: nodes processed within the budget (shift $\delta_N{=}10$), a measure of throughput rather than tree size. \emph{Primal gap}: mean distance to the best solution found by any run on the instance, Eq.~\eqref{eq:primal-gap}. \emph{Proven gap}: mean distance between a run's solution and its own certified lower bound. \emph{Primal integral}: time-average of the primal gap (lower is better). $^\ast$Presolving and separation disabled, pseudocost branching.}
@@ -737,6 +737,31 @@ Attention (ours)   & 2{,}035 & 7.39\% & 23.43\% & 1.033 [0.997, 1.071] & 4/6  & 
 
 \textbf{Evaluation protocol.}
 A preliminary version of this benchmark reported that neural configurations exhausted their search trees within the budget. Auditing those runs showed that node LPs could stop at the LP solver's cumulative time limit and were then treated as infeasible, which emptied the open-node queue early. The harness now prunes only on certified infeasibility, integrality, or bounds; reports a run as optimal only when no open node remains; and checks every returned solution independently. On the original 10 medium instances, the corrected harness also closes no instance (proven gap 24.4\% for the policy, 19.7\% for Neural-Best, and 18.2\% for SCIP). All results in this report use the corrected harness and the larger, three-seed benchmark.
+Figures~\ref{fig:prelim_overview} and~\ref{fig:prelim_profiles} show the preliminary benchmark: the early finishing times of the neural configurations in those figures are the effect of this issue.
+
+\begin{figure*}[t]
+\centering
+\begin{subfigure}[t]{0.56\textwidth}
+  \includegraphics[width=\textwidth]{plot1_nodes_vs_time}
+  \caption{Preliminary benchmark: B\&B nodes against wall time. The neural finishing times reflect the early termination described above, not completed searches.}
+  \label{fig:prelim_nodes_time}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.41\textwidth}
+  \includegraphics[width=\textwidth]{plot2_neural_ablation}
+  \caption{Preliminary benchmark: node counts of the neural configurations at termination, which was affected in the same way.}
+  \label{fig:prelim_ablation}
+\end{subfigure}
+\caption{Preliminary benchmark overview (superseded; see the text of this appendix).}
+\label{fig:prelim_overview}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{plot3_performance_profiles}
+\caption{Preliminary benchmark: performance profiles over wall-clock time. The ``solved'' fractions of the neural configurations reflect the early termination described in this appendix; under the corrected harness no method solves any of these instances within the budget.}
+\label{fig:prelim_profiles}
+\end{figure*}
 
 \textbf{Where the learned components help.}
 The learned policy is most useful as a ranking signal combined with a simple structural prior. Blending it with fractionality improves significantly over imitation alone on both tiers and reaches the most-fractional rule on the hard tier in proven gap. The shared representation therefore carries information that is useful for branching, even though the imitation policy alone is not yet competitive with the classical rules.
@@ -803,31 +828,8 @@ strong-branching trajectories collected using the HiGHS LP solver.
 \section{Preliminary Benchmark (Superseded)}
 \label{app:prelim}
 
-The figures in this appendix come from the preliminary benchmark (10 medium and 5 hard instances from generator seed~1), run before the correction to LP time-limit handling described in Section~\ref{sec:results}. In those runs, node LPs that reached the LP solver's cumulative time limit were treated as infeasible, which emptied the open-node queue early, so the neural configurations appeared to finish within the budget. Re-running the same instances with the corrected harness closes no instance for any method. The completion times, completed-tree node counts, and solved fractions shown here are therefore not valid measurements; they are kept only as a record of the preliminary study. All conclusions in this report rest on the corrected results in Tables~\ref{tab:main}--\ref{tab:cuts}.
+This appendix describes the preliminary benchmark (10 medium and 5 hard instances from generator seed~1), run before the correction to LP time-limit handling described in Section~\ref{sec:results}. In those runs, node LPs that reached the LP solver's cumulative time limit were treated as infeasible, which emptied the open-node queue early, so the neural configurations appeared to finish within the budget. Re-running the same instances with the corrected harness closes no instance for any method. The completion times, completed-tree node counts, and solved fractions in Figures~\ref{fig:prelim_overview} and~\ref{fig:prelim_profiles}, which show this benchmark, are therefore not valid measurements; they are kept only as a record of the preliminary study. All conclusions in this report rest on the corrected results in Tables~\ref{tab:main}--\ref{tab:cuts}.
 
-\begin{figure*}[h]
-\centering
-\begin{subfigure}[t]{0.56\textwidth}
-  \includegraphics[width=\textwidth]{plot1_nodes_vs_time}
-  \caption{Preliminary benchmark: B\&B nodes against wall time. The neural finishing times reflect the early termination described above, not completed searches.}
-  \label{fig:prelim_nodes_time}
-\end{subfigure}
-\hfill
-\begin{subfigure}[t]{0.41\textwidth}
-  \includegraphics[width=\textwidth]{plot2_neural_ablation}
-  \caption{Preliminary benchmark: node counts of the neural configurations at termination, which was affected in the same way.}
-  \label{fig:prelim_ablation}
-\end{subfigure}
-\caption{Preliminary benchmark overview (superseded; see the text of this appendix).}
-\label{fig:prelim_overview}
-\end{figure*}
-
-\begin{figure*}[h]
-\centering
-\includegraphics[width=\textwidth]{plot3_performance_profiles}
-\caption{Preliminary benchmark: performance profiles over wall-clock time. The ``solved'' fractions of the neural configurations reflect the early termination described in this appendix; under the corrected harness no method solves any of these instances within the budget.}
-\label{fig:prelim_profiles}
-\end{figure*}
 
 \section{Feature Tables}
 \label{app:features}
