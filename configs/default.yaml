@@ -103,7 +103,7 @@ benchmark:
   n_instances: 10
   time_limit: 60        # seconds per instance
   problem: set_cover
-  lookahead_k: 5             # candidates for dynamics lookahead in benchmark
+  lookahead_k: 3             # candidates for dynamics lookahead in benchmark
   lookahead_depth: 3         # latent rollout steps per candidate
   lookahead_gamma: 0.95      # discount factor per lookahead step
   size_weight: 0.0           # gated off: non-DFS traces (see solver.size_weight)
